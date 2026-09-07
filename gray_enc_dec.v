@@ -1,0 +1,82 @@
+module gray_enc(b,g);
+input[1:0] b;
+output[1:0] g;
+
+assign g[1] = b[1];
+assign g[0] = b[1]^b[0];
+
+endmodule
+
+module tb_gray_enc();
+reg[1:0] B;
+wire[1:0] G;
+
+gray_enc uut0(B,G);
+
+initial begin
+#10 B = 2'b00; #1 check(2'b00);
+#10 B = 2'b01; #1 check(2'b01);
+#10 B = 2'b10; #1 check(2'b11);
+#10 B = 2'b11; #1 check(2'b10);
+$stop;
+end
+
+task check(input [1:0] expected);
+if (G !== expected)
+$display("FAIL: B=%b expected G=%b got G=%b", B, expected, G);
+else
+$display("PASS: B=%b G=%b", B, G);
+endtask
+
+endmodule
+
+module gray_dec(g,b);
+input[1:0] g;
+output[1:0] b;
+
+assign b[1] = g[1];
+assign b[0] = g[1]^g[0];
+
+endmodule
+
+module tb_gray_dec();
+reg[1:0] G;
+wire[1:0] B;
+
+gray_dec uut1(G,B);
+
+initial begin
+#10 G = 2'b00; #1 check(2'b00);
+#10 G = 2'b01; #1 check(2'b01);
+#10 G = 2'b11; #1 check(2'b10);
+#10 G = 2'b10; #1 check(2'b11);
+$stop;
+end
+
+task check(input [1:0] expected);
+if (B !== expected)
+$display("FAIL: G=%b expected B=%b got B=%b", G, expected, B);
+else
+$display("PASS: G=%b B=%b", G, B);
+endtask
+
+endmodule
+
+module formal_gray_inverse (
+input [1:0] b_in
+);
+wire [1:0] g_mid;
+wire [1:0] b_out;
+
+gray_enc enc (.b(b_in), .g(g_mid));
+gray_dec dec (.g(g_mid), .b(b_out));
+
+`ifdef FORMAL
+always @(*) begin
+assert(b_in == b_out);
+end
+`endif
+endmodule
+
+
+

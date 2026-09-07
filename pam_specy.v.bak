@@ -1,0 +1,42 @@
+module pam4_spec_checker (
+ input clk,
+ input rst_n,
+ // TX side
+ input [1:0] tx_gray_in,
+ input signed [2:0] tx_level_out,
+ // RX side
+ input signed [2:0] rx_level_in,
+ input [1:0] rx_gray_out
+);
+
+ // ---------------------------------------------------------
+ // TX MAPPER: Assertions against the hardcoded spec
+ // ---------------------------------------------------------
+ tx_map_00: assert property (@(posedge clk) disable iff (!rst_n) 
+(tx_gray_in == 2'b00) |-> (tx_level_out == -3));
+ 
+ tx_map_01: assert property (@(posedge clk) disable iff (!rst_n) 
+(tx_gray_in == 2'b01) |-> (tx_level_out == -1));
+ 
+ tx_map_11: assert property (@(posedge clk) disable iff (!rst_n) 
+(tx_gray_in == 2'b11) |-> (tx_level_out ==1));
+ 
+ tx_map_10: assert property (@(posedge clk) disable iff (!rst_n) 
+(tx_gray_in == 2'b10) |-> (tx_level_out ==3));
+
+ // ---------------------------------------------------------
+ // RX DEMAPPER: Assertions against the hardcoded spec
+ // ---------------------------------------------------------
+ rx_demap_n3: assert property (@(posedge clk) disable iff (!rst_n) 
+(rx_level_in == -3) |-> (rx_gray_out == 2'b00));
+ 
+ rx_demap_n1: assert property (@(posedge clk) disable iff (!rst_n) 
+(rx_level_in == -1) |-> (rx_gray_out == 2'b01));
+ 
+ rx_demap_p1: assert property (@(posedge clk) disable iff (!rst_n) 
+(rx_level_in ==1) |-> (rx_gray_out == 2'b11));
+ 
+ rx_demap_p3: assert property (@(posedge clk) disable iff (!rst_n) 
+(rx_level_in ==3) |-> (rx_gray_out == 2'b10));
+
+endmodule
