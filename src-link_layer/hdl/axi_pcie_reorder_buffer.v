@@ -2,49 +2,45 @@
 
 module axi_pcie_reorder_buffer #(
     parameter NUM_SLOTS      = 8,
-    parameter TAG_WIDTH      = 10,  // Extended tag support
-    parameter MAX_DW_PER_REQ = 16,  // Max Read Request Size (in DW)
+    parameter TAG_WIDTH      = 10,
+    parameter MAX_DW_PER_REQ = 16,
     parameter TIMEOUT_CYCLES = 64
 )(
     input  wire                   clk,
     input  wire                   rst_n,
 
-    // Request Allocation Interface
     input  wire                   req_valid,
     input  wire [TAG_WIDTH-1:0]   req_tag,
     input  wire [9:0]             req_len_dw,
     output wire                   req_ready,
 
-    // RX CplD Ingress Interface
     input  wire                   rx_cpld_valid,
-    input  wire                   rx_cpld_sof,      // High on first DW of CplD TLP
-    input  wire [9:0]             rx_cpld_offset,   // DW offset of fragment
+    input  wire                   rx_cpld_sof,
+    input  wire [9:0]             rx_cpld_offset,
     input  wire [TAG_WIDTH-1:0]   rx_cpld_tag,
     input  wire [31:0]            rx_cpld_data,
     input  wire                   rx_cpld_dvalid,
     input  wire [2:0]             rx_cpld_status,
     input  wire                   rx_cpld_last_dw,
 
-    // Outbound AXI4-Stream Interface
     output reg                    m_axis_tvalid,
     output reg  [31:0]            m_axis_tdata,
     output reg                    m_axis_tlast,
     output reg  [3:0]             m_axis_tkeep,
-    output reg                    m_axis_tuser,     // 1 = UR/Completer Abort Error
+    output reg                    m_axis_tuser,
     input  wire                   m_axis_tready
 );
 
-    localparam SLOT_BITS = $clog2(NUM_SLOTS);
+    localparam SLOT_BITS = 3; // log2(8)
 
-    // Slot tracking tables
     reg [TAG_WIDTH-1:0] slot_tag    [0:NUM_SLOTS-1];
     reg [9:0]           slot_len    [0:NUM_SLOTS-1];
     reg [9:0]           slot_rx_cnt [0:NUM_SLOTS-1]; 
     reg                 slot_valid  [0:NUM_SLOTS-1];
     reg                 slot_done   [0:NUM_SLOTS-1];
     
-    // Internal Memory
-    reg [31:0]          buffer_data [0:NUM_SLOTS-1][0:MAX_DW_PER_REQ-1];
+    // Flattened 1D array for strict Verilog compliance
+    reg [31:0]          buffer_data [0:(NUM_SLOTS * MAX_DW_PER_REQ)-1];
 
     reg [SLOT_BITS-1:0] head_ptr;
     reg [SLOT_BITS-1:0] tail_ptr;
@@ -60,7 +56,6 @@ module axi_pcie_reorder_buffer #(
 
     assign req_ready = (occupancy < NUM_SLOTS);
 
-    // Combinatorial CAM Match for Ingress Data
     reg [SLOT_BITS-1:0] match_idx;
     reg                 match_found;
     integer i;
@@ -76,7 +71,6 @@ module axi_pcie_reorder_buffer #(
         end
     end
 
-    // Immediate offset calculation on SOF cycle
     reg [9:0] write_dw_offset;
     always @(*) begin
         if (rx_cpld_sof) begin
@@ -109,7 +103,6 @@ module axi_pcie_reorder_buffer #(
             end
         end else begin
             
-            // 1. Request Allocation
             if (alloc_en) begin
                 slot_valid[tail_ptr]  <= 1'b1;
                 slot_tag[tail_ptr]    <= req_tag;
@@ -119,11 +112,10 @@ module axi_pcie_reorder_buffer #(
                 tail_ptr              <= tail_ptr + 1;
             end
 
-            // 2. RX Data Ingress (Immediate Offset Calculation)
             if (rx_cpld_valid && match_found) begin
                 if (rx_cpld_dvalid) begin
                     if (write_dw_offset < MAX_DW_PER_REQ) begin
-                        buffer_data[match_idx][write_dw_offset] <= rx_cpld_data;
+                        buffer_data[(match_idx * MAX_DW_PER_REQ) + write_dw_offset] <= rx_cpld_data;
                         current_rx_offset <= write_dw_offset + 1;
                         
                         slot_rx_cnt[match_idx] <= slot_rx_cnt[match_idx] + 1;
@@ -135,12 +127,10 @@ module axi_pcie_reorder_buffer #(
                 end
             end
 
-            // 3. Occupancy Tracking
             if (alloc_en && retire_en) occupancy <= occupancy;
             else if (alloc_en)         occupancy <= occupancy + 1;
             else if (retire_en)        occupancy <= occupancy - 1;
 
-            // 4. AXI4-Stream Egress
             if (!drain_state) begin
                 m_axis_tvalid <= 0;
                 m_axis_tuser  <= 0;
@@ -153,7 +143,7 @@ module axi_pcie_reorder_buffer #(
                         timeout_timer <= 0;
                         
                         m_axis_tvalid <= 1;
-                        m_axis_tdata  <= buffer_data[head_ptr][0];
+                        m_axis_tdata  <= buffer_data[(head_ptr * MAX_DW_PER_REQ) + 0];
                         m_axis_tlast  <= (slot_len[head_ptr] == 1);
                         m_axis_tkeep  <= 4'hf;
                         m_axis_tuser  <= 0;
@@ -181,7 +171,7 @@ module axi_pcie_reorder_buffer #(
                         timeout_timer        <= 0;
                     end else begin
                         read_dw_cnt   <= read_dw_cnt + 1;
-                        m_axis_tdata  <= buffer_data[head_ptr][read_dw_cnt + 1];
+                        m_axis_tdata  <= buffer_data[(head_ptr * MAX_DW_PER_REQ) + read_dw_cnt + 1];
                         m_axis_tlast  <= ((read_dw_cnt + 1) == (slot_len[head_ptr] - 1));
                     end
                 end
