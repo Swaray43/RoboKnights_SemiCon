@@ -1,8 +1,29 @@
 `timescale 1ns/1ps
 
+/*
+ * Module: fec_encoder_decoder
+ *
+ * Bugfix: the original SEC-DED parity generator (calc_parity) and bit
+ * corrector (repair_data) were hardcoded for a 128-bit DATA_WIDTH (fixed
+ * 128-bit literal masks, a fixed 0..127 correction loop) no matter what
+ * DATA_WIDTH was set to. That made the module silently wrong the moment
+ * DATA_WIDTH != 128 -- e.g. instantiated at FLIT_WIDTH=2048 by a
+ * width-generalized flit_framer, it would still only generate/check parity
+ * over the low 128 bits and only ever correct bit positions 0..127.
+ *
+ * This version computes parity generically from DATA_WIDTH/FEC_WIDTH so it
+ * scales to any width, using the standard extended-Hamming construction:
+ *   - POS_BITS = FEC_WIDTH-1 position-parity bits: parity[k] covers every
+ *     data bit whose index has bit k set.
+ *   - 1 overall-parity bit (index POS_BITS) to distinguish a correctable
+ *     single-bit error from an uncorrectable double-bit error.
+ * This requires 2^(FEC_WIDTH-1) >= DATA_WIDTH (enough position codes to
+ * address every data bit); this is checked at elaboration time below.
+ * For example FLIT_WIDTH=2048 needs FEC_WIDTH >= 12.
+ */
 module fec_encoder_decoder #(
     parameter DATA_WIDTH = 128,
-    parameter FEC_WIDTH  = 8
+    parameter FEC_WIDTH  = 8    // must satisfy 2^(FEC_WIDTH-1) >= DATA_WIDTH
 )(
     input  wire                  clk,
     input  wire                  rst_n,
@@ -22,24 +43,40 @@ module fec_encoder_decoder #(
     output reg                   rx_corrected_err
 );
 
-    // SEC-DED Parity Generator Function
-    function [7:0] calc_parity;
-        input [127:0] d;
+    localparam integer POS_BITS = FEC_WIDTH - 1;
+
+    // synthesis translate_off
+    initial begin
+        if ((1 << POS_BITS) < DATA_WIDTH) begin
+            $display("ERROR: fec_encoder_decoder: FEC_WIDTH=%0d cannot cover DATA_WIDTH=%0d (need 2^(FEC_WIDTH-1) >= DATA_WIDTH)",
+                      FEC_WIDTH, DATA_WIDTH);
+            $finish;
+        end
+    end
+    // synthesis translate_on
+
+    // Generic SEC-DED parity generator: parity[k] = XOR of every data bit
+    // whose bit index has bit k set; parity[POS_BITS] is the overall
+    // (whole-word) parity bit.
+    function [FEC_WIDTH-1:0] calc_parity;
+        input [DATA_WIDTH-1:0] d;
+        integer i, k;
         begin
-            calc_parity[0] = ^(d & 128'h0000000000000000FFFFFFFFFFFFFFFF);
-            calc_parity[1] = ^(d & 128'h00000000FFFFFFFF00000000FFFFFFFF);
-            calc_parity[2] = ^(d & 128'h0000FFFF0000FFFF0000FFFF0000FFFF);
-            calc_parity[3] = ^(d & 128'h00FF00FF00FF00FF00FF00FF00FF00FF);
-            calc_parity[4] = ^(d & 128'h0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F);
-            calc_parity[5] = ^(d & 128'h33333333333333333333333333333333);
-            calc_parity[6] = ^(d & 128'h55555555555555555555555555555555);
-            calc_parity[7] = ^d; // Overall Parity Bit
+            calc_parity = {FEC_WIDTH{1'b0}};
+            for (k = 0; k < POS_BITS; k = k + 1) begin
+                for (i = 0; i < DATA_WIDTH; i = i + 1) begin
+                    if (i[k])
+                        calc_parity[k] = calc_parity[k] ^ d[i];
+                end
+            end
+            calc_parity[POS_BITS] = ^d;
         end
     endfunction
 
-    wire [7:0] generated_tx_fec = calc_parity(tx_data);
-    wire [7:0] expected_rx_fec  = calc_parity(rx_fec_data);
-    wire [7:0] syndrome         = rx_fec_code ^ expected_rx_fec;
+    wire [FEC_WIDTH-1:0] generated_tx_fec = calc_parity(tx_data);
+    wire [FEC_WIDTH-1:0] expected_rx_fec  = calc_parity(rx_fec_data);
+    wire [FEC_WIDTH-1:0] syndrome         = rx_fec_code ^ expected_rx_fec;
+    wire [POS_BITS-1:0]  err_pos          = syndrome[POS_BITS-1:0];
 
     // TX Encoding Register Pipeline
     always @(posedge clk or negedge rst_n) begin
@@ -52,18 +89,14 @@ module fec_encoder_decoder #(
         end
     end
 
-    // Real-Time Bit Repair Helper Function
-    function [127:0] repair_data;
-        input [127:0] data;
-        input [7:0]   syn;
-        integer i;
+    // Real-Time Bit Repair Helper Function (generic width)
+    function [DATA_WIDTH-1:0] repair_data;
+        input [DATA_WIDTH-1:0] data;
+        input [POS_BITS-1:0]   pos;
         begin
             repair_data = data;
-            for (i = 0; i < 128; i = i + 1) begin
-                if (syn[6:0] == (7'd127 - i[6:0])) begin
-                    repair_data[i] = ~data[i];
-                end
-            end
+            if (pos < DATA_WIDTH)
+                repair_data[pos] = ~data[pos];
         end
     endfunction
 
@@ -74,14 +107,14 @@ module fec_encoder_decoder #(
             rx_uncorrectable_err <= 1'b0;
             rx_corrected_err     <= 1'b0;
         end else if (rx_val) begin
-            if (syndrome == 8'h00) begin
+            if (syndrome == {FEC_WIDTH{1'b0}}) begin
                 // No Error
                 rx_corr_data         <= rx_fec_data;
                 rx_uncorrectable_err <= 1'b0;
                 rx_corrected_err     <= 1'b0;
-            end else if (syndrome[7] == 1'b1) begin
+            end else if (syndrome[POS_BITS] == 1'b1) begin
                 // Single-Bit Correctable Error
-                rx_corr_data         <= repair_data(rx_fec_data, syndrome);
+                rx_corr_data         <= repair_data(rx_fec_data, err_pos);
                 rx_uncorrectable_err <= 1'b0;
                 rx_corrected_err     <= 1'b1;
             end else begin

@@ -1,5 +1,43 @@
 `timescale 1ns/1ps
 
+/*
+ * Module: flit_framer
+ *
+ * Bugfix: this module used to hardcode its framing math for exactly
+ * FLIT_WIDTH=128 (a fixed 3-payload-DW layout, manual case 0/1/else blocks,
+ * fixed 2-bit EOF-position/word-count fields, a fixed 17-bit reserved
+ * field) even though FLIT_WIDTH was a parameter. Instantiating it at the
+ * architecture's real FLIT width (e.g. 2048 bits) produced a module that
+ * still only ever framed 3 DWs of payload per flit and left the remaining
+ * bits meaningless -- i.e. it was architecturally disconnected from any
+ * width other than 128.
+ *
+ * This version derives the header layout and DW packing/unpacking
+ * generically from FLIT_WIDTH, so the same RTL is correct at 128 bits,
+ * 2048 bits, or any other FLIT_WIDTH that is a multiple of 32 (and at
+ * least 64, i.e. header + >=1 payload DW).
+ *
+ * Flit layout (MSB-first), unchanged in spirit from the original 128-bit
+ * framing, generalized to any width:
+ *   [FLIT_WIDTH-1        -: 8]         sync marker
+ *   [FLIT_WIDTH-9        -: 3]         reserved
+ *   [FLIT_WIDTH-12]                    sof
+ *   [FLIT_WIDTH-13]                    eof
+ *   [EOFPOS_MSB:EOFPOS_LSB]            eof DW-position index (EOF_POS_W bits)
+ *   [.. down to PAYLOAD_W]             reserved header padding
+ *   [PAYLOAD_W-1:0]                    payload (NUM_PAYLOAD_DW x 32-bit DWs,
+ *                                       DW0 at the MSB end of the payload
+ *                                       field down to the last DW at the LSB
+ *                                       end; unused trailing DW slots zero)
+ *
+ * NOTE: FEC_WIDTH must be large enough for fec_encoder_decoder to cover
+ * FLIT_WIDTH bits (2^(FEC_WIDTH-1) >= FLIT_WIDTH) -- e.g. FLIT_WIDTH=2048
+ * needs FEC_WIDTH >= 12. See fec_encoder_decoder.v.
+ *
+ * To use this as the FLIT-level framing/FEC sub-block of a wider link
+ * layer, instantiate with FLIT_WIDTH set to that layer's real flit width
+ * and an adequately sized FEC_WIDTH.
+ */
 module flit_framer #(
     parameter FLIT_WIDTH = 128,
     parameter FEC_WIDTH  = 8
@@ -32,12 +70,44 @@ module flit_framer #(
     output wire                  rx_flit_err
 );
 
+    // ------------------------------------------------------------------
+    // Generic header/payload layout derived from FLIT_WIDTH
+    // ------------------------------------------------------------------
+    localparam integer HDR_W          = 32;                 // 1 DW of header
+    localparam integer PAYLOAD_W      = FLIT_WIDTH - HDR_W;
+    localparam integer NUM_PAYLOAD_DW = PAYLOAD_W / 32;
+    localparam integer WORD_CNT_W     = (NUM_PAYLOAD_DW <= 1) ? 1 : $clog2(NUM_PAYLOAD_DW);
+    localparam integer EOF_POS_W      = WORD_CNT_W;
+    localparam integer RESERVED_W     = HDR_W - 8 - 3 - 1 - 1 - EOF_POS_W;
+
+    localparam integer SYNC_LSB   = FLIT_WIDTH - 8;
+    localparam integer RSVD1_LSB  = SYNC_LSB - 3;
+    localparam integer SOF_BIT    = RSVD1_LSB - 1;
+    localparam integer EOF_BIT    = SOF_BIT - 1;
+    localparam integer EOFPOS_MSB = EOF_BIT - 1;
+    localparam integer EOFPOS_LSB = EOFPOS_MSB - EOF_POS_W + 1;
+
+    // synthesis translate_off
+    initial begin
+        if ((FLIT_WIDTH % 32) != 0 || FLIT_WIDTH < 64) begin
+            $display("ERROR: flit_framer: FLIT_WIDTH=%0d must be a multiple of 32 and >= 64 (32-bit header + >=1 payload DW)", FLIT_WIDTH);
+            $finish;
+        end
+        if (RESERVED_W < 0) begin
+            $display("ERROR: flit_framer: FLIT_WIDTH=%0d leaves no room for the fixed header fields (sync/reserved/sof/eof/eof_pos)", FLIT_WIDTH);
+            $finish;
+        end
+    end
+    // synthesis translate_on
+
     assign tx_tlp_ready = 1'b1;
 
     // Internal Registers for TX Accumulation
-    reg [31:0] tx_buf [0:1];
-    reg [1:0]  tx_word_cnt;
-    reg        has_sof;
+    // NUM_PAYLOAD_DW-1 buffered DWs; the final DW of a flit is taken
+    // directly from tx_tlp_data at the moment the flit is finalized.
+    reg [31:0] tx_buf [0:(NUM_PAYLOAD_DW > 1 ? NUM_PAYLOAD_DW-2 : 0)];
+    reg [WORD_CNT_W-1:0] tx_word_cnt;
+    reg                  has_sof;
 
     // Intermediate Signals for FEC Submodule
     reg                   fec_tx_en;
@@ -70,10 +140,30 @@ module flit_framer #(
 
     assign rx_flit_err = fec_rx_uncorrectable;
 
+    // ------------------------------------------------------------------
+    // Generic payload assembly: place the buffered DWs (indices
+    // 0..tx_word_cnt-1) and the incoming DW (at index tx_word_cnt) from
+    // the MSB end of the payload field downward; any remaining trailing
+    // DW slots stay zero. This is the width-generic replacement for the
+    // old fixed {DW0,DW1,DW2} concatenation.
+    // ------------------------------------------------------------------
+    reg [PAYLOAD_W-1:0] payload_next;
+    integer j;
+    always @(*) begin
+        payload_next = {PAYLOAD_W{1'b0}};
+        for (j = 0; j < NUM_PAYLOAD_DW; j = j + 1) begin
+            if (j < tx_word_cnt)
+                payload_next[(NUM_PAYLOAD_DW-1-j)*32 +: 32] = tx_buf[j];
+            else if (j == tx_word_cnt)
+                payload_next[(NUM_PAYLOAD_DW-1-j)*32 +: 32] = tx_tlp_data;
+            // else: trailing unused DW slot, stays zero
+        end
+    end
+
     // TX FLIT Framing Logic
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            tx_word_cnt     <= 2'd0;
+            tx_word_cnt     <= {WORD_CNT_W{1'b0}};
             has_sof         <= 1'b0;
             fec_tx_en       <= 1'b0;
             fec_tx_in       <= {FLIT_WIDTH{1'b0}};
@@ -86,64 +176,24 @@ module flit_framer #(
             if (tx_tlp_valid && tx_tlp_ready) begin
                 if (tx_tlp_sof) has_sof <= 1'b1;
 
-                if (tx_word_cnt == 2'd0) begin
-                    if (tx_tlp_eof) begin
-                        // Single-DW TLP Packet Boundary
-                        fec_tx_en <= 1'b1;
-                        fec_tx_in <= {
-                            8'h5A,                // Sync Marker [127:120]
-                            3'b000,               // Reserved [119:117]
-                            has_sof | tx_tlp_sof, // SOF [116]
-                            1'b1,                 // EOF [115]
-                            2'd0,                 // EOF Position Index (DW0) [114:113]
-                            17'd0,                // Reserved Header Bits [112:96]
-                            tx_tlp_data,          // DW0 Payload [95:64]
-                            32'd0,                // DW1 Padding [63:32]
-                            32'd0                 // DW2 Padding [31:0]
-                        };
-                        tx_word_cnt <= 2'd0;
-                        has_sof     <= 1'b0;
-                    end else begin
-                        tx_buf[0]   <= tx_tlp_data;
-                        tx_word_cnt <= 2'd1;
-                    end
-                end else if (tx_word_cnt == 2'd1) begin
-                    if (tx_tlp_eof) begin
-                        // 2-DW TLP Packet Boundary
-                        fec_tx_en <= 1'b1;
-                        fec_tx_in <= {
-                            8'h5A,
-                            3'b000,
-                            has_sof | tx_tlp_sof,
-                            1'b1,
-                            2'd1,                 // EOF Position Index (DW1) [114:113]
-                            17'd0,
-                            tx_buf[0],            // DW0 Payload [95:64]
-                            tx_tlp_data,          // DW1 Payload [63:32]
-                            32'd0                 // DW2 Padding [31:0]
-                        };
-                        tx_word_cnt <= 2'd0;
-                        has_sof     <= 1'b0;
-                    end else begin
-                        tx_buf[1]   <= tx_tlp_data;
-                        tx_word_cnt <= 2'd2;
-                    end
-                end else begin
-                    // Full 3-DW FLIT Frame Boundary
+                if (tx_tlp_eof || (tx_word_cnt == NUM_PAYLOAD_DW-1)) begin
+                    // Flit boundary: either the TLP ends here, or the
+                    // payload is full and must be flushed regardless.
                     fec_tx_en <= 1'b1;
                     fec_tx_in <= {
-                        8'h5A,
-                        3'b000,
-                        has_sof | tx_tlp_sof,
-                        tx_tlp_eof,
-                        2'd2,                     // EOF Position Index (DW2) [114:113]
-                        17'd0,
-                        tx_buf[0],                // DW0 Payload [95:64]
-                        tx_buf[1],                // DW1 Payload [63:32]
-                        tx_tlp_data               // DW2 Payload [31:0]
+                        8'h5A,                     // Sync Marker
+                        3'b000,                     // Reserved
+                        has_sof | tx_tlp_sof,       // SOF
+                        tx_tlp_eof,                 // EOF
+                        tx_word_cnt,                // EOF/last-DW position index
+                        {RESERVED_W{1'b0}},          // Reserved header padding
+                        payload_next                // Packed payload DWs
                     };
-                    tx_word_cnt <= 2'd0;
+                    tx_word_cnt <= {WORD_CNT_W{1'b0}};
                     has_sof     <= 1'b0;
+                end else begin
+                    tx_buf[tx_word_cnt] <= tx_tlp_data;
+                    tx_word_cnt         <= tx_word_cnt + 1'b1;
                 end
             end
 
@@ -154,10 +204,16 @@ module flit_framer #(
         end
     end
 
-    // RX FLIT Deframing Logic
-    reg [1:0]   rx_word_cnt;
-    reg [127:0] rx_flit_reg;
-    reg         rx_active;
+    // ------------------------------------------------------------------
+    // RX FLIT Deframing Logic (generic width)
+    // ------------------------------------------------------------------
+    reg [WORD_CNT_W-1:0] rx_word_cnt;
+    reg [FLIT_WIDTH-1:0] rx_flit_reg;
+    reg                  rx_active;
+
+    wire rx_hdr_eof                       = rx_flit_reg[EOF_BIT];
+    wire [EOF_POS_W-1:0] rx_hdr_eof_pos   = rx_flit_reg[EOFPOS_MSB:EOFPOS_LSB];
+    wire rx_is_eof_word                   = rx_hdr_eof && (rx_hdr_eof_pos == rx_word_cnt);
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -165,57 +221,31 @@ module flit_framer #(
             rx_tlp_data  <= 32'd0;
             rx_tlp_sof   <= 1'b0;
             rx_tlp_eof   <= 1'b0;
-            rx_word_cnt  <= 2'd0;
+            rx_word_cnt  <= {WORD_CNT_W{1'b0}};
             rx_active    <= 1'b0;
-            rx_flit_reg  <= 128'd0;
+            rx_flit_reg  <= {FLIT_WIDTH{1'b0}};
         end else begin
             if (s_flit_rx_valid && !fec_rx_uncorrectable) begin
                 rx_flit_reg <= fec_rx_corr_data;
                 rx_active   <= 1'b1;
-                rx_word_cnt <= 2'd0;
+                rx_word_cnt <= {WORD_CNT_W{1'b0}};
             end
 
             if (rx_active) begin
-                case (rx_word_cnt)
-                    2'd0: begin
-                        rx_tlp_valid <= 1'b1;
-                        rx_tlp_data  <= rx_flit_reg[95:64];
-                        rx_tlp_sof   <= rx_flit_reg[116];
-                        rx_tlp_eof   <= rx_flit_reg[115] && (rx_flit_reg[114:113] == 2'd0);
-                        
-                        if (rx_flit_reg[115] && (rx_flit_reg[114:113] == 2'd0)) begin
-                            rx_active <= 1'b0;
-                        end else begin
-                            rx_word_cnt <= 2'd1;
-                        end
-                    end
+                rx_tlp_valid <= 1'b1;
+                rx_tlp_data  <= rx_flit_reg[(NUM_PAYLOAD_DW-1-rx_word_cnt)*32 +: 32];
+                rx_tlp_sof   <= (rx_word_cnt == {WORD_CNT_W{1'b0}}) ? rx_flit_reg[SOF_BIT] : 1'b0;
+                rx_tlp_eof   <= rx_is_eof_word;
 
-                    2'd1: begin
-                        rx_tlp_valid <= 1'b1;
-                        rx_tlp_data  <= rx_flit_reg[63:32];
-                        rx_tlp_sof   <= 1'b0;
-                        rx_tlp_eof   <= rx_flit_reg[115] && (rx_flit_reg[114:113] == 2'd1);
-
-                        if (rx_flit_reg[115] && (rx_flit_reg[114:113] == 2'd1)) begin
-                            rx_active <= 1'b0;
-                        end else begin
-                            rx_word_cnt <= 2'd2;
-                        end
-                    end
-
-                    2'd2: begin
-                        rx_tlp_valid <= 1'b1;
-                        rx_tlp_data  <= rx_flit_reg[31:0];
-                        rx_tlp_sof   <= 1'b0;
-                        rx_tlp_eof   <= rx_flit_reg[115] && (rx_flit_reg[114:113] == 2'd2);
-                        rx_active    <= 1'b0;
-                    end
-
-                    default: begin
-                        rx_tlp_valid <= 1'b0;
-                        rx_active    <= 1'b0;
-                    end
-                endcase
+                if (rx_is_eof_word || (rx_word_cnt == NUM_PAYLOAD_DW-1)) begin
+                    // Either the signaled EOF landed on this DW, or this is
+                    // simply the last DW slot in the flit (a full flit that
+                    // continues the TLP with no EOF yet) -- either way this
+                    // flit is done; the DW is still valid data either way.
+                    rx_active <= 1'b0;
+                end else begin
+                    rx_word_cnt <= rx_word_cnt + 1'b1;
+                end
             end else begin
                 rx_tlp_valid <= 1'b0;
                 rx_tlp_sof   <= 1'b0;

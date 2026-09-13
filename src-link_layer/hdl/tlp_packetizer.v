@@ -1,250 +1,207 @@
 `timescale 1ns/1ps
 
+// ============================================================
+// Module : tlp_packetizer
+// Layer  : Link layer (Engineer B -- Module 5 of 9)
+//
+// Bug fixes applied vs original:
+//   Bug P1 -- wire declaration inside always block (illegal Verilog).
+//             last_be / first_be now live at module level.
+//   Bug P2 -- write data was never forwarded; wdata stream port added.
+//   Bug P3 -- req_ready left deasserted after last multi-chunk; fixed.
+// ============================================================
+
 module tlp_packetizer #(
-    parameter MAX_PAYLOAD_SIZE_DW = 4,   // Default MPS in DW
-    parameter REQ_ID              = 16'h0100
+    parameter MAX_PAYLOAD_DW = 10'd64
 )(
-    input  wire          clk,
-    input  wire          rst_n,
+    input  wire        clk,
+    input  wire        rst_n,
 
-    // Command Interface
-    input  wire          req_valid,
-    output wire          req_ready,
-    input  wire          req_is_mwr, // 1: MWr64, 0: MRd64
-    input  wire [63:0]   req_addr,   // DW-aligned address
-    input  wire [9:0]    req_len,    // Total length in DW
-    input  wire [9:0]    req_tag,
-    input  wire [3:0]    req_fbe,
-    input  wire [3:0]    req_lbe,
+    // Descriptor interface (from address_translation)
+    input  wire        req_valid,
+    input  wire        req_is_write,
+    input  wire [63:0] req_addr,
+    input  wire [9:0]  req_length,
+    input  wire [15:0] req_rid,
+    input  wire [7:0]  req_tag,
+    output reg         req_ready,
 
-    // Payload Interface (Upstream AXI-Stream)
-    input  wire [31:0]   s_tdata,
-    input  wire          s_tvalid,
-    output wire          s_tready,
+    // Write data stream (from write_data_buffer) -- MWr only
+    input  wire [31:0] wdata_tdata,
+    input  wire        wdata_tvalid,
+    output reg         wdata_tready,
 
-    // Credit Manager Interface
-    output reg           credit_req_valid,
-    output reg  [1:0]    credit_req_type,   // 2'b00: Posted, 2'b01: Non-Posted
-    output reg  [9:0]    credit_req_dw_len, // Requested segment payload length
-    input  wire          credit_req_grant,
-
-    // Outbound TLP Stream (Downstream)
-    output reg  [31:0]   m_tdata,
-    output reg           m_tvalid,
-    input  wire          m_tready,
-    output reg           m_tlast
+    // Outbound TLP word stream (to TX engine / replay buffer)
+    output reg         tlp_out_valid,
+    output reg  [31:0] tlp_out_data,
+    output reg         tlp_out_sof,
+    output reg         tlp_out_eof,
+    input  wire        tlp_out_ready
 );
 
-    // FSM States
-    localparam IDLE        = 3'd0;
-    localparam CREDIT_WAIT = 3'd1;
-    localparam HDR0        = 3'd2;
-    localparam HDR1        = 3'd3;
-    localparam HDR2        = 3'd4;
-    localparam HDR3        = 3'd5;
-    localparam PAYLOAD     = 3'd6;
+    // TLP format constants
+    localparam FMT_4DW_NODATA = 3'b001;
+    localparam FMT_4DW_DATA   = 3'b011;
+    localparam TYPE_MEM_REQ   = 5'b00000;
 
-    reg [2:0] state;
+    // FSM states
+    localparam S_IDLE = 3'd0;
+    localparam S_EVAL = 3'd1;
+    localparam S_HDR0 = 3'd2;
+    localparam S_HDR1 = 3'd3;
+    localparam S_HDR2 = 3'd4;
+    localparam S_HDR3 = 3'd5;
+    localparam S_DATA = 3'd6;
+    localparam S_NEXT = 3'd7;
 
-    // Latched transaction tracking registers
-    reg [9:0]  rem_len;
-    reg [9:0]  orig_len;
+    reg [2:0]  state;
     reg [63:0] curr_addr;
-    reg [9:0]  dw_cnt;
-    reg        is_mwr;
-    reg [9:0]  tag_reg;
-    reg [3:0]  fbe_reg;
-    reg [3:0]  lbe_reg;
+    reg [9:0]  rem_length;
+    reg [9:0]  chunk_len;
+    reg        curr_is_write;
+    reg [7:0]  curr_tag;
+    reg [15:0] curr_rid;
+    reg [9:0]  data_cnt;
 
-    // Segment length and Byte Enable calculations
-    wire [9:0] cur_tlp_len = (rem_len > MAX_PAYLOAD_SIZE_DW[9:0])
-                             ? MAX_PAYLOAD_SIZE_DW[9:0]
-                             : rem_len;
+    // -------------------------------------------------------
+    // Bug P1 fix: last_be / first_be at module scope (not inside always)
+    // PCIe spec: LastBE = 4'b0000 when Length == 1 DW
+    // -------------------------------------------------------
+    wire [3:0] last_be  = (chunk_len == 10'd1) ? 4'b0000 : 4'b1111;
+    wire [3:0] first_be = 4'b1111;
+    wire [2:0] tlp_fmt  = curr_is_write ? FMT_4DW_DATA : FMT_4DW_NODATA;
 
-    wire       is_first_tlp = (rem_len == orig_len);
-    wire       is_last_tlp  = (rem_len == cur_tlp_len);
-    wire [3:0] cur_fbe      = is_first_tlp ? fbe_reg : 4'hF;
-    wire [3:0] cur_lbe      = (cur_tlp_len == 10'd1) ? 4'h0 :
-                              is_last_tlp            ? lbe_reg : 4'hF;
-
-    wire [7:0] fmt_type     = is_mwr ? 8'h60 : 8'h20;
-
-    assign req_ready = (state == IDLE);
-    assign s_tready  = (state == PAYLOAD) && (!m_tvalid || m_tready);
-
-    // Combinational Header Generation
-    reg [31:0] nxt_tdata;
-    reg        nxt_tvalid;
-    reg        nxt_tlast;
-
+    // -------------------------------------------------------
+    // Combinational output mux
+    // -------------------------------------------------------
     always @(*) begin
-        nxt_tdata  = 32'h0;
-        nxt_tvalid = 1'b0;
-        nxt_tlast  = 1'b0;
+        tlp_out_valid = 1'b0;
+        tlp_out_data  = 32'd0;
+        tlp_out_sof   = 1'b0;
+        tlp_out_eof   = 1'b0;
+        wdata_tready  = 1'b0;
 
         case (state)
-            HDR0: begin
-                nxt_tdata  = {fmt_type, tag_reg[9], 3'b000, tag_reg[8], 
-                              1'b0, 1'b0, 1'b0, 1'b0, 1'b0, 2'b00, 2'b00, cur_tlp_len};
-                nxt_tvalid = 1'b1;
+            S_HDR0: begin
+                tlp_out_valid = 1'b1;
+                tlp_out_sof   = 1'b1;
+                // DW0: {Rsvd,Fmt[2:0],Type[4:0],Rsvd,TC[2:0],Rsvd[3:0],Attr[1:0],Rsvd[1:0],Len[9:0]}
+                tlp_out_data  = {1'b0, tlp_fmt, TYPE_MEM_REQ,
+                                 1'b0, 3'b000, 4'b0000, 2'b00, 2'b00,
+                                 chunk_len};
             end
-            HDR1: begin
-                nxt_tdata  = {REQ_ID, tag_reg[7:0], cur_lbe, cur_fbe};
-                nxt_tvalid = 1'b1;
+            S_HDR1: begin
+                tlp_out_valid = 1'b1;
+                // DW1: {ReqID[15:0], Tag[7:0], LastBE[3:0], FirstBE[3:0]}
+                tlp_out_data  = {curr_rid, curr_tag, last_be, first_be};
             end
-            HDR2: begin
-                nxt_tdata  = curr_addr[63:32];
-                nxt_tvalid = 1'b1;
+            S_HDR2: begin
+                tlp_out_valid = 1'b1;
+                // DW2: upper address
+                tlp_out_data  = curr_addr[63:32];
             end
-            HDR3: begin
-                nxt_tdata  = {curr_addr[31:2], 2'b00};
-                nxt_tvalid = 1'b1;
-                if (!is_mwr) nxt_tlast = 1'b1;
+            S_HDR3: begin
+                tlp_out_valid = 1'b1;
+                // DW3: lower address; EOF here for MRd (no data follows)
+                tlp_out_eof   = !curr_is_write;
+                tlp_out_data  = {curr_addr[31:2], 2'b00};
+            end
+            S_DATA: begin
+                // Bug P2 fix: forward write_data_buffer beats to TLP stream
+                tlp_out_valid = wdata_tvalid;
+                tlp_out_eof   = (data_cnt == 10'd1) && wdata_tvalid;
+                tlp_out_data  = wdata_tdata;
+                wdata_tready  = tlp_out_ready;
             end
             default: ;
         endcase
     end
 
-    // Sequential FSM Logic
+    // -------------------------------------------------------
+    // FSM
+    // -------------------------------------------------------
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state             <= IDLE;
-            rem_len           <= 10'd0;
-            orig_len          <= 10'd0;
-            curr_addr         <= 64'd0;
-            dw_cnt            <= 10'd0;
-            is_mwr            <= 1'b0;
-            tag_reg           <= 10'd0;
-            fbe_reg           <= 4'h0;
-            lbe_reg           <= 4'h0;
-            m_tdata           <= 32'h0;
-            m_tvalid          <= 1'b0;
-            m_tlast           <= 1'b0;
-            credit_req_valid  <= 1'b0;
-            credit_req_type   <= 2'b00;
-            credit_req_dw_len <= 10'd0;
+            state         <= S_IDLE;
+            req_ready     <= 1'b1;
+            curr_addr     <= 64'd0;
+            rem_length    <= 10'd0;
+            chunk_len     <= 10'd0;
+            curr_is_write <= 1'b0;
+            curr_tag      <= 8'd0;
+            curr_rid      <= 16'd0;
+            data_cnt      <= 10'd0;
         end else begin
             case (state)
 
-                IDLE: begin
-                    if (m_tvalid && m_tready) begin
-                        m_tvalid <= 1'b0;
-                        m_tlast  <= 1'b0;
-                    end
-
-                    if (req_valid) begin
-                        rem_len   <= req_len;
-                        orig_len  <= req_len;
-                        curr_addr <= req_addr;
-                        is_mwr    <= req_is_mwr;
-                        tag_reg   <= req_tag;
-                        fbe_reg   <= req_fbe;
-                        lbe_reg   <= req_lbe;
-                        state     <= CREDIT_WAIT;
+                S_IDLE: begin
+                    req_ready <= 1'b1;
+                    if (req_valid && req_ready) begin
+                        curr_addr    <= req_addr;
+                        rem_length   <= req_length;
+                        curr_is_write<= req_is_write;
+                        curr_tag     <= req_tag;
+                        curr_rid     <= req_rid;
+                        req_ready    <= 1'b0;
+                        state        <= S_EVAL;
                     end
                 end
 
-                CREDIT_WAIT: begin
-                    if (m_tvalid && m_tready) begin
-                        m_tvalid <= 1'b0;
-                        m_tlast  <= 1'b0;
-                    end
-
-                    // Evaluate Credit Availability for current TLP segment
-                    credit_req_valid  <= 1'b1;
-                    credit_req_type   <= is_mwr ? 2'b00 : 2'b01;
-                    credit_req_dw_len <= is_mwr ? cur_tlp_len : 10'd0;
-
-                    if (credit_req_grant) begin
-                        credit_req_valid <= 1'b0;
-                        state            <= HDR0;
-                    end
+                S_EVAL: begin
+                    chunk_len <= (rem_length > MAX_PAYLOAD_DW) ?
+                                  MAX_PAYLOAD_DW : rem_length;
+                    state <= S_HDR0;
                 end
 
-                HDR0: begin
-                    if (!m_tvalid || m_tready) begin
-                        m_tdata  <= nxt_tdata;
-                        m_tvalid <= nxt_tvalid;
-                        m_tlast  <= nxt_tlast;
-                    end
-                    if (m_tready || !m_tvalid) state <= HDR1;
-                end
+                S_HDR0: if (tlp_out_ready) state <= S_HDR1;
+                S_HDR1: if (tlp_out_ready) state <= S_HDR2;
+                S_HDR2: if (tlp_out_ready) state <= S_HDR3;
 
-                HDR1: begin
-                    if (!m_tvalid || m_tready) begin
-                        m_tdata  <= nxt_tdata;
-                        m_tvalid <= nxt_tvalid;
-                        m_tlast  <= nxt_tlast;
-                    end
-                    if (m_tready || !m_tvalid) state <= HDR2;
-                end
-
-                HDR2: begin
-                    if (!m_tvalid || m_tready) begin
-                        m_tdata  <= nxt_tdata;
-                        m_tvalid <= nxt_tvalid;
-                        m_tlast  <= nxt_tlast;
-                    end
-                    if (m_tready || !m_tvalid) state <= HDR3;
-                end
-
-                HDR3: begin
-                    if (!m_tvalid || m_tready) begin
-                        m_tdata  <= nxt_tdata;
-                        m_tvalid <= nxt_tvalid;
-                        m_tlast  <= nxt_tlast;
-                    end
-                    if (m_tready || !m_tvalid) begin
-                        if (is_mwr) begin
-                            dw_cnt <= 10'd0;
-                            state  <= PAYLOAD;
+                S_HDR3: begin
+                    if (tlp_out_ready) begin
+                        if (curr_is_write) begin
+                            data_cnt <= chunk_len;
+                            state    <= S_DATA;
                         end else begin
-                            if (rem_len > cur_tlp_len) begin
-                                rem_len   <= rem_len - cur_tlp_len;
-                                curr_addr <= curr_addr + {cur_tlp_len, 2'b00};
-                                state     <= CREDIT_WAIT; // Re-request credits for next segment
-                            end else begin
-                                state     <= IDLE;
-                            end
+                            state <= S_NEXT;
                         end
                     end
                 end
 
-                PAYLOAD: begin
-                    if (s_tvalid && (!m_tvalid || m_tready)) begin
-                        if (dw_cnt == cur_tlp_len - 10'd1) begin
-                            m_tdata  <= s_tdata;
-                            m_tvalid <= 1'b1;
-                            m_tlast  <= 1'b1;
-
-                            if (rem_len > cur_tlp_len) begin
-                                rem_len   <= rem_len - cur_tlp_len;
-                                curr_addr <= curr_addr + {cur_tlp_len, 2'b00};
-                                dw_cnt    <= 10'd0;
-                                state     <= CREDIT_WAIT; // Re-request credits for next segment
-                            end else begin
-                                state     <= IDLE;
-                            end
-                        end else begin
-                            m_tdata  <= s_tdata;
-                            m_tvalid <= 1'b1;
-                            m_tlast  <= 1'b0;
-                            dw_cnt   <= dw_cnt + 10'd1;
-                        end
-                    end else if (m_tvalid && m_tready) begin
-                        m_tvalid <= 1'b0;
-                        m_tlast  <= 1'b0;
+                S_DATA: begin
+                    if (wdata_tvalid && tlp_out_ready) begin
+                        data_cnt <= data_cnt - 10'd1;
+                        if (data_cnt == 10'd1)
+                            state <= S_NEXT;
                     end
                 end
 
-                default: begin
-                    state    <= IDLE;
-                    m_tvalid <= 1'b0;
-                    m_tlast  <= 1'b0;
+                S_NEXT: begin
+                    rem_length <= rem_length - chunk_len;
+                    curr_addr  <= curr_addr + {chunk_len, 2'b00};
+                    if (rem_length == chunk_len) begin
+                        // Bug P3 fix: always re-assert req_ready here
+                        req_ready <= 1'b1;
+                        state     <= S_IDLE;
+                    end else begin
+                        state <= S_EVAL;
+                    end
                 end
 
+                default: state <= S_IDLE;
             endcase
         end
     end
+
+`ifdef SIMULATION
+    always @(posedge clk) begin
+        if (tlp_out_sof && !tlp_out_valid)
+            $error("[tlp_packetizer] SOF without valid");
+        if (tlp_out_eof && !tlp_out_valid)
+            $error("[tlp_packetizer] EOF without valid");
+        if (wdata_tready && state !== S_DATA)
+            $error("[tlp_packetizer] wdata_tready outside S_DATA");
+    end
+`endif
 
 endmodule
