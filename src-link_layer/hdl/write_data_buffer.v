@@ -7,11 +7,17 @@
 //                        addr64[63:0], padding}
 //   NEW TUSER layout (see TUSER_W breakdown below):
 //     [0]           stream_id      — 0=SmartNIC, 1=ML
-//     [SOFF_HI:1]   session_offset — beat position in session
-//                                    (increments by 64 per beat)
-//     [TUSER_W-1]   tlast_flag     — copy of TLAST, carried in
-//                                    TUSER so descriptor is
-//                                    self-contained in FIFO
+//     [SOFF_HI:1]   session_offset — byte offset in session buffer
+//                                    (increments by 64 per beat;
+//                                     per-beat, NOT stable across beats)
+//     [TUSER_W-1]   tlast_flag     — REDUNDANT MIRROR of the TLAST wire.
+//                                    Carried in TUSER so that FIFO
+//                                    entries are self-contained.
+//                                    Downstream consumers connecting
+//                                    m_tuser to a 26-bit port will
+//                                    receive this bit; those that
+//                                    already use m_tlast may ignore
+//                                    bit TUSER_W-1.
 //   Dropped fields: addr64, TC, ATTR, reqtype
 //   (reqtype is always MWr for both AXI4-Stream use-cases;
 //    addr64 is now base_addr + session_offset, computed
@@ -19,11 +25,18 @@
 //    register in the config-space block.)
 //
 //   TUSER_W is now a parameter (default 26):
-//     1  stream_id
-//     24 session_offset  (covers sessions up to 16 MB;
-//                         widen SOFF_W if needed)
-//     1  tlast_flag
+//     1  stream_id        bit [0]
+//     24 session_offset   bits [SOFF_W:1]  (per-beat, not latched)
+//     1  tlast_flag       bit [TUSER_W-1]  (mirror of TLAST)
 //   Total = 26 bits.  Set TUSER_W and SOFF_W together.
+//
+//   INTERFACE NOTE for downstream integrators (Point 3):
+//   m_tuser is TUSER_W=26 bits wide.  If your block expects
+//   OFFSET_WIDTH+1 = 25 bits, bit 25 (tlast_flag) is a
+//   harmless redundant copy of m_tlast — either connect the
+//   full 26 bits or ignore/mask bit 25.  The stream_id and
+//   session_offset fields are in bits [0] and [SOFF_W:1]
+//   respectively, and are unaffected by this extra bit.
 //
 // ---- Bug fixes (bug report 2025) ----------------------------
 //   Bug 1 — fifo_occupancy port width is now parameterised
@@ -163,12 +176,32 @@ assign fifo_hwm       = (occupancy_r >= HWM[FIFO_AW:0]);
 // Latched burst descriptor
 //
 // The new TUSER carries {tlast_flag, session_offset, stream_id}.
-// stream_id and session_offset are stable for the whole burst
-// (session_offset increments per beat at the source, but is
-// stable by the time each beat reaches this buffer).
-// We latch TUSER on the first beat and use the latched value
-// for all subsequent beats.  A mid-burst TUSER change signals
-// an AXI4 protocol violation.
+//
+// session_offset IS NOT stable across beats — it increments by
+// 64 (one 512-bit beat = 64 bytes) for each successive beat from
+// the same stream.  Every beat therefore carries a different
+// session_offset, which is stored verbatim in the FIFO entry so
+// the downstream TLP packetizer can reconstruct the exact PCIe
+// host address for each DW segment without a separate counter.
+//
+// stream_id IS stable for the duration of one logical AXI4
+// burst — it identifies which use-case channel (0=SmartNIC,
+// 1=ML) generated the beat.  Changing stream_id mid-burst
+// without an intervening TLAST is an AXI4 interleave violation.
+//
+// Accordingly:
+//   latched_tuser[STREAM_ID_BIT] is captured from the first beat
+//     and compared on every subsequent beat of the same burst.
+//   The FULL s_tuser (including per-beat session_offset) is
+//     stored in each FIFO entry — latched_tuser is NOT replayed.
+//
+// NOTE on TUSER_W=26 (Point 3 — interface spec):
+//   Bit 25 (TUSER_W-1 = tlast_flag) is a redundant mirror of
+//   the TLAST wire.  It is carried in TUSER so that FIFO entries
+//   are self-contained (a downstream block can determine burst
+//   boundaries without a separate tlast entry).  Swaray's block
+//   (link_layer_tx) should connect all 26 bits; bit 25 may be
+//   ignored if m_tlast is already used for the same purpose.
 // ============================================================
 reg [TUSER_W-1:0]  latched_tuser;
 reg                burst_active;
@@ -261,10 +294,13 @@ always @(posedge clk or negedge rst_n) begin
                         // The burst is abandoned at the source side.
                         err_tkeep_gap <= 1'b1;
                     end else if (s_tready) begin
-                        // Latch TUSER from first beat.
-                        // For the new layout this captures stream_id
-                        // and session_offset (starting value for this
-                        // burst).
+                        // Latch TUSER from the first beat.
+                        // Only latched_tuser[STREAM_ID_BIT] is used
+                        // in subsequent cycles (to detect cross-stream
+                        // interleaving).  session_offset is per-beat
+                        // and is taken from s_tuser on every beat
+                        // individually — latched_tuser is never
+                        // replayed into the FIFO.
                         latched_tuser <= s_tuser;
                         burst_active  <= 1'b1;
 
@@ -287,29 +323,29 @@ always @(posedge clk or negedge rst_n) begin
             // ------------------------------------------------
             ST_BURST: begin
                 if (s_tvalid) begin
-                    // For the new TUSER:
-                    // stream_id (bit 0) must match throughout the burst.
-                    // session_offset will differ beat-to-beat (it
-                    // increments by 64 each beat) — so we compare
-                    // only the stream_id bit, not the full TUSER.
-                    // A different stream_id mid-burst is an AXI4
-                    // interleave violation.
+                    // STREAM_ID (bit 0) must be constant for all beats
+                    // of a single AXI4 burst.  session_offset (bits
+                    // [SOFF_W:1]) legitimately changes every beat —
+                    // it carries the per-beat byte offset and is stored
+                    // verbatim via s_tuser, NOT replayed from
+                    // latched_tuser.  Do NOT compare session_offset.
                     if (s_tuser[STREAM_ID_BIT] !== latched_tuser[STREAM_ID_BIT]) begin
                         err_burst_interleave <= 1'b1;
-                        // Drop the beat; stay in ST_BURST waiting
-                        // for the real TLAST from the original stream.
+                        // Drop the offending beat; stay in ST_BURST
+                        // waiting for TLAST from the original stream.
+                        // The FIFO entry for this beat is silently
+                        // discarded — the burst is corrupted but we
+                        // do not enter an undefined state.
                     end else if (gap_detected) begin
                         // Bug 5+6: gap_detected already gated by s_tready
-                        // and checks zero-TKEEP on non-last beats
+                        // and catches zero-TKEEP on non-last beats.
                         err_tkeep_gap <= 1'b1;
                         // Drop the beat; burst continues.
                     end else if (s_tready) begin
-                        // Write beat with the incoming TUSER
-                        // (session_offset is per-beat, so we store
-                        // s_tuser, not latched_tuser, for each beat).
-                        // We still use latched_tuser[STREAM_ID_BIT]
-                        // to protect against glitches; the rest of
-                        // TUSER (session_offset) comes from s_tuser.
+                        // Store the full incoming TUSER (including the
+                        // per-beat session_offset) in the FIFO entry.
+                        // latched_tuser is NOT used here — it only
+                        // provided the stream_id check above.
                         mem[wr_ptr] <= {s_tuser, s_tlast, s_tkeep, s_tdata};
                         wr_ptr      <= wr_ptr + 1'b1;
 
@@ -403,11 +439,14 @@ always @(posedge clk) begin
                 Beat written when FIFO was full. \
                 Back-pressure watermark logic has a bug.");
 
-    // stream_id changed without TLAST — interleave warning
+    // stream_id changed mid-burst without TLAST — cross-stream
+    // interleave attempt. session_offset changes every beat and
+    // is intentional; only stream_id is checked here.
     if (burst_active && s_tvalid &&
         (s_tuser[STREAM_ID_BIT] !== latched_tuser[STREAM_ID_BIT]))
         $warning("[write_data_buffer] AXI4 violation: stream_id changed \
-                  mid-burst without TLAST. Interleave attempt.");
+                  mid-burst without TLAST. Cross-stream interleave \
+                  attempt — beat will be dropped.");
 
     // Bug 6 check: zero TKEEP arriving on a non-last beat while
     // s_tready is high should have been caught by gap_detected,

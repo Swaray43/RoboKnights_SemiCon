@@ -1,3 +1,13 @@
+`timescale 1ns/1ps
+
+/*
+ * Module: tag_manager
+ * Function: 
+ *  1. Allocates unique Tags for Non-Posted requests (MRd).
+ *  2. Recycles Tags back into a free pool upon Completion (CplD).
+ *  3. Tracks timeouts for outstanding requests and escalates to Unsupported Request (UR).
+ *  4. Single-cycle arbitration ensures FIFO pointers are never corrupted by simultaneous updates.
+ */
 module tag_manager #(
     parameter N = 256, // Selectable at build: 32, 256, or 1024
     parameter TIMEOUT_CYCLES = 10000
@@ -33,7 +43,9 @@ module tag_manager #(
     // Active tag tracking
     reg active_tags [0:N-1];
     reg [$clog2(TIMEOUT_CYCLES)-1:0] timers [0:N-1];
+    
     integer i;
+    reg timeout_handled;
 
     // Gate new requests when empty
     assign s_tready = s_is_non_posted ? ~pool_empty : 1'b1;
@@ -52,6 +64,7 @@ module tag_manager #(
         end else begin
             m_tag_valid <= 0;
             ur_valid <= 0;
+            timeout_handled = 0;
 
             // 1. Tag Allocation
             if (s_valid && s_tready && s_is_non_posted) begin
@@ -62,24 +75,39 @@ module tag_manager #(
                 head <= head + 1;
             end
 
-            // 2. Completion Recycling
+            // 2. Recycling Arbitration (Completion vs. Timeout)
             if (cpl_valid && active_tags[cpl_tag]) begin
+                // Priority A: Incoming Completion
                 active_tags[cpl_tag] <= 0;
                 free_pool[tail[PTR_W-1:0]] <= cpl_tag;
                 tail <= tail + 1;
-            end
-
-            // 3. Timeout Management
-            for (i = 0; i < N; i = i + 1) begin
-                if (active_tags[i] && !cpl_valid && timers[i] > 0) begin
-                    timers[i] <= timers[i] - 1;
-                    if (timers[i] == 1) begin
-                        // Timeout hit: trigger UR and recycle
-                        active_tags[i] <= 0;
-                        ur_valid <= 1;
-                        ur_tag <= i;
-                        free_pool[tail[PTR_W-1:0]] <= i;
-                        tail <= tail + 1;
+                
+                // Decrement timers, but prevent any from hitting 0/recycling this cycle
+                for (i = 0; i < N; i = i + 1) begin
+                    if (active_tags[i] && timers[i] > 0 && i != cpl_tag) begin
+                        if (timers[i] == 1) timers[i] <= 1; // Stall timeout
+                        else                timers[i] <= timers[i] - 1;
+                    end
+                end
+            end else begin
+                // Priority B: Local Timeouts (Process max 1 per cycle)
+                for (i = 0; i < N; i = i + 1) begin
+                    if (active_tags[i] && timers[i] > 0) begin
+                        if (timers[i] == 1 && !timeout_handled) begin
+                            // Timeout hit: trigger UR and recycle
+                            active_tags[i] <= 0;
+                            ur_valid <= 1;
+                            ur_tag <= i;
+                            free_pool[tail[PTR_W-1:0]] <= i;
+                            tail <= tail + 1;
+                            timeout_handled = 1;
+                            timers[i] <= 0;
+                        end else if (timers[i] == 1 && timeout_handled) begin
+                            // Wait for next cycle if FIFO tail is busy
+                            timers[i] <= 1; 
+                        end else begin
+                            timers[i] <= timers[i] - 1;
+                        end
                     end
                 end
             end
