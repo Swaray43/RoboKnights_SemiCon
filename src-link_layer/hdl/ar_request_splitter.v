@@ -42,37 +42,6 @@
 //      reorder buffer still needs to know when one AXI
 //      write beat spawned two TLPs.
 //
-// ---- Bug fixes (bug report 2025) ----------------------------
-//   Bug 7 — Post-reset handshake violation: s_ready begins at
-//            0 after reset but ST_IDLE consumed descriptors
-//            before s_ready had risen.  Fixed by initialising
-//            s_ready to 1 in the reset branch (the module is
-//            ready to accept as soon as reset de-asserts).
-//
-//   Bug 8 — PAGE_MASK derived from a 64-bit literal.  Now
-//            computed from ADDR_W so it is correct for any
-//            address width without silent truncation.
-//
-//   Bug 9 — sub0_len_dw_w slice [LEN_W+1:2] could silently
-//            drop a bit if boundary arithmetic produces a value
-//            that requires more than LEN_W bits.  Widened
-//            intermediate to ADDR_W bits and added an
-//            elaboration-time assertion.
-//
-//   Bug 10 — Simulation assertions evaluated stale combinational
-//             wires (sub0_len_dw_w, sub1_len_dw_w) one cycle
-//             after stat_split_occurred fired.  Assertions now
-//             use the registered latched values (sub0_len_dw,
-//             sub1_len_dw) which are stable on that cycle.
-//
-//   Bug 11 — One idle bubble between back-to-back descriptors.
-//             ST_PASS and ST_SPLIT_1 now transition directly to
-//             ST_IDLE while simultaneously accepting the next
-//             descriptor if s_valid is already high, eliminating
-//             the one-cycle gap.  m_valid is gated in ST_IDLE
-//             based on whether a new descriptor arrives in the
-//             same cycle, preventing spurious m_valid=0 pulses.
-//
 // Parameters:
 //   ADDR_W   : host address width (default 64)
 //   LEN_W    : length field width in DW units (default 11)

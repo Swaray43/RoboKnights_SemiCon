@@ -6,22 +6,6 @@
 //   Data Link Layer (reliability + framing), and the
 //   Transaction Layer RX engine. Connects to the PHY SerDes.
 //
-// Bug fixes vs original:
-//   Bug T1 -- u_tx_engine used wrong parameter name DATA_WIDTH;
-//             tx_engine uses MAX_PAYLOAD_SIZE_DW + REQ_ID.
-//   Bug T2 -- u_rx_engine used wrong parameter name DATA_WIDTH;
-//             pcie_rx_engine uses TAG_WIDTH/MAX_DW_PER_REQ/etc.
-//   Bug T3 -- pcie_rx_engine has many ports that the original
-//             pcie_core_top left unconnected, causing elaboration
-//             failures. Stubs tied off / wired to loopback below.
-//   Bug T4 -- data_link_layer_top ports s_tx_axis_tuser and
-//             s_tx_axis_tready_ch were missing from the u_link_layer
-//             instantiation, causing an implicit-port elaboration
-//             error (or silent X-propagation in simulation).
-//             s_tx_axis_tuser is tied to zero (legacy tx_engine
-//             path has no stream_id/session_offset).
-//             s_tx_axis_tready_ch is wired to tlp_tx_tready_ch;
-//             tlp_tx_ready uses the existing combined-ready port.
 // ============================================================
 
 module pcie_core_top #(
@@ -98,7 +82,8 @@ module pcie_core_top #(
 
     // Status
     output wire        crc_err,
-    output wire        fec_err
+    output wire        fec_err,
+    output wire        malformed_tlp_err   // Gap fix X2 (pcie_rx_engine), surfaced to top
 );
 
     // ---- TLP stream: TX Engine -> Data Link Layer ----
@@ -113,6 +98,12 @@ module pcie_core_top #(
     // stream_id / session_offset from the legacy tx_engine path);
     // tready_ch[0] is the effective combined ready.
     wire [1:0]  tlp_tx_tready_ch;
+
+    // ---- Bug T6 fix: tx_engine's NP(MRd)-accepted pulse, used to
+    // drive pcie_rx_engine's req_alloc_* interface below ----
+    wire        np_accept_valid;
+    wire [9:0]  np_accept_tag;
+    wire [9:0]  np_accept_len;
 
     // ---- TLP stream: Data Link Layer -> RX chain ----
     wire [AXIS_DATA_W-1:0] tlp_rx_data_wide;
@@ -177,7 +168,12 @@ module pcie_core_top #(
         .m_tdata(tlp_tx_data),
         .m_tvalid(tlp_tx_valid),
         .m_tready(tlp_tx_ready),
-        .m_tlast(tlp_tx_last)
+        .m_tlast(tlp_tx_last),
+
+        .credit_stall(/* unused at this level */),
+        .np_accept_valid(np_accept_valid),
+        .np_accept_tag(np_accept_tag),
+        .np_accept_len(np_accept_len)
     );
 
     // ============================================================
@@ -224,8 +220,59 @@ module pcie_core_top #(
         .fec_err(fec_err)
     );
 
-    // Accept RX wide stream (always ready at this level)
-    assign tlp_rx_ready_wide = 1'b1;
+    // Accept RX wide stream only while the unpacker below has room
+    // (Bug T5 fix -- was previously tied to constant 1, which is no
+    // longer correct now that draining a beat takes multiple cycles).
+
+    // ============================================================
+    // RX wide-to-word unpacker (Bug T5 fix)
+    // See header note for the one-TLP-per-tlast-delimited-beat-group
+    // assumption this relies on.
+    // ============================================================
+    localparam RX_WORDS_PER_BEAT = AXIS_DATA_W / 32;
+    localparam RX_WIDX_W = (RX_WORDS_PER_BEAT <= 1) ? 1 : $clog2(RX_WORDS_PER_BEAT);
+
+    reg [AXIS_DATA_W-1:0] rx_unpack_shift;
+    reg                   rx_unpack_beat_last;
+    reg [RX_WIDX_W-1:0]   rx_unpack_idx;
+    reg                   rx_unpack_busy;
+    reg                   rx_next_is_new_tlp;
+
+    assign tlp_rx_ready_wide = !rx_unpack_busy;
+
+    wire rx_word_valid = rx_unpack_busy;
+    wire rx_word_sof   = rx_unpack_busy &&
+                          (rx_unpack_idx == {RX_WIDX_W{1'b0}}) &&
+                          rx_next_is_new_tlp;
+    wire rx_word_eof   = rx_unpack_busy &&
+                          (rx_unpack_idx == RX_WORDS_PER_BEAT[RX_WIDX_W-1:0] - 1'b1) &&
+                          rx_unpack_beat_last;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            rx_unpack_shift     <= {AXIS_DATA_W{1'b0}};
+            rx_unpack_beat_last <= 1'b0;
+            rx_unpack_idx       <= {RX_WIDX_W{1'b0}};
+            rx_unpack_busy      <= 1'b0;
+            rx_next_is_new_tlp  <= 1'b1;
+        end else if (rx_unpack_busy) begin
+            rx_unpack_shift <= rx_unpack_shift >> 32;
+            if (rx_unpack_idx == RX_WORDS_PER_BEAT[RX_WIDX_W-1:0] - 1'b1) begin
+                rx_unpack_busy <= 1'b0;
+                rx_unpack_idx  <= {RX_WIDX_W{1'b0}};
+                if (rx_unpack_beat_last)
+                    rx_next_is_new_tlp <= 1'b1;
+            end else begin
+                rx_unpack_idx      <= rx_unpack_idx + 1'b1;
+                rx_next_is_new_tlp <= 1'b0;
+            end
+        end else if (tlp_rx_valid_wide) begin
+            rx_unpack_shift     <= tlp_rx_data_wide;
+            rx_unpack_beat_last <= tlp_rx_last_wide;
+            rx_unpack_idx       <= {RX_WIDX_W{1'b0}};
+            rx_unpack_busy      <= 1'b1;
+        end
+    end
 
     // ============================================================
     // 3. TLP Header Parser
@@ -239,10 +286,10 @@ module pcie_core_top #(
         .clk(clk),
         .rst_n(rst_n),
 
-        .rx_tlp_valid(tlp_rx_valid_wide),
-        .rx_tlp_data(tlp_rx_data_wide[31:0]),
-        .rx_tlp_sof(1'b0),   // SOF/EOF not in wide stream; stubbed
-        .rx_tlp_eof(tlp_rx_last_wide),
+        .rx_tlp_valid(rx_word_valid),
+        .rx_tlp_data(rx_unpack_shift[31:0]),
+        .rx_tlp_sof(rx_word_sof),
+        .rx_tlp_eof(rx_word_eof),
 
         .parsed_rx_valid(parsed_rx_valid),
         .parsed_rx_sof(parsed_rx_sof),
@@ -281,12 +328,13 @@ module pcie_core_top #(
         .tlp_cpl_status(parsed_cpl_status),
         .tlp_addr(parsed_addr),
 
-        // Tag allocation from tag_manager would connect here;
-        // tied off until tag_manager is wired into top level.
-        .req_alloc_valid(1'b0),
-        .req_alloc_tag({TAG_WIDTH{1'b0}}),
-        .req_alloc_len(10'd0),
-        .req_alloc_ready(/* unused */),
+        // Bug T6 fix: previously hardwired to 0 (never allocated a
+        // slot for any outstanding MRd). Driven from tx_engine's
+        // np_accept_* pulse -- see header note.
+        .req_alloc_valid(np_accept_valid),
+        .req_alloc_tag(np_accept_tag),
+        .req_alloc_len(np_accept_len),
+        .req_alloc_ready(/* unused -- tx_engine does not backpressure on this */),
 
         .m_axis_cpl_tvalid(cpl_tvalid),
         .m_axis_cpl_tdata(cpl_tdata),
@@ -302,7 +350,19 @@ module pcie_core_top #(
 
         .cfg_window_base(cfg_window_base),
         .cfg_window_mask(cfg_window_mask),
-        .cfg_axi_base(cfg_axi_base)
+        .cfg_axi_base(cfg_axi_base),
+
+        // Gap fix X1: no config-space block exists yet in this
+        // project to route Cfg requests to -- left unconnected as a
+        // documented extension point (see pcie_rx_engine.v header).
+        .cfg_req_valid(/* unused */),
+        .cfg_req_type1(/* unused */),
+        .cfg_req_tag(/* unused */),
+        .cfg_req_len_dw(/* unused */),
+        .cfg_req_addr(/* unused */),
+
+        // Gap fix X2: surfaced to the top level alongside crc_err/fec_err.
+        .malformed_tlp_err(malformed_tlp_err)
     );
 
 endmodule

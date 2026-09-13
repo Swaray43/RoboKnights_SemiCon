@@ -3,19 +3,6 @@
 /*
  * Module: flit_framer
  *
- * Bugfix: this module used to hardcode its framing math for exactly
- * FLIT_WIDTH=128 (a fixed 3-payload-DW layout, manual case 0/1/else blocks,
- * fixed 2-bit EOF-position/word-count fields, a fixed 17-bit reserved
- * field) even though FLIT_WIDTH was a parameter. Instantiating it at the
- * architecture's real FLIT width (e.g. 2048 bits) produced a module that
- * still only ever framed 3 DWs of payload per flit and left the remaining
- * bits meaningless -- i.e. it was architecturally disconnected from any
- * width other than 128.
- *
- * This version derives the header layout and DW packing/unpacking
- * generically from FLIT_WIDTH, so the same RTL is correct at 128 bits,
- * 2048 bits, or any other FLIT_WIDTH that is a multiple of 32 (and at
- * least 64, i.e. header + >=1 payload DW).
  *
  * Flit layout (MSB-first), unchanged in spirit from the original 128-bit
  * framing, generalized to any width:

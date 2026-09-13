@@ -1,5 +1,6 @@
 `timescale 1ns/1ps
 
+
 module axi_pcie_reorder_buffer #(
     parameter NUM_SLOTS      = 8,
     parameter TAG_WIDTH      = 10,
@@ -38,6 +39,11 @@ module axi_pcie_reorder_buffer #(
     reg [9:0]           slot_rx_cnt [0:NUM_SLOTS-1]; 
     reg                 slot_valid  [0:NUM_SLOTS-1];
     reg                 slot_done   [0:NUM_SLOTS-1];
+
+    // Gap fix R1: per-slot (per-tag) timeout tracking, replacing the
+    // single head-only timeout_timer.
+    reg [31:0]          slot_timeout_timer [0:NUM_SLOTS-1];
+    reg                 slot_timeout_err   [0:NUM_SLOTS-1];
     
     // Flattened 1D array for strict Verilog compliance
     reg [31:0]          buffer_data [0:(NUM_SLOTS * MAX_DW_PER_REQ)-1];
@@ -47,7 +53,6 @@ module axi_pcie_reorder_buffer #(
     reg [SLOT_BITS:0]   occupancy;
 
     reg [9:0]           read_dw_cnt;
-    reg [31:0]          timeout_timer;
     reg                 drain_state;
     reg [9:0]           current_rx_offset;
 
@@ -86,7 +91,6 @@ module axi_pcie_reorder_buffer #(
             tail_ptr          <= 0;
             occupancy         <= 0;
             read_dw_cnt       <= 0;
-            timeout_timer     <= 0;
             drain_state       <= 0;
             current_rx_offset <= 0;
             
@@ -97,19 +101,23 @@ module axi_pcie_reorder_buffer #(
             m_axis_tuser      <= 0;
             
             for (i = 0; i < NUM_SLOTS; i = i + 1) begin
-                slot_valid[i]  <= 0;
-                slot_rx_cnt[i] <= 0;
-                slot_done[i]   <= 0;
+                slot_valid[i]         <= 0;
+                slot_rx_cnt[i]        <= 0;
+                slot_done[i]          <= 0;
+                slot_timeout_timer[i] <= 0;
+                slot_timeout_err[i]   <= 0;
             end
         end else begin
             
             if (alloc_en) begin
-                slot_valid[tail_ptr]  <= 1'b1;
-                slot_tag[tail_ptr]    <= req_tag;
-                slot_len[tail_ptr]    <= req_len_dw;
-                slot_rx_cnt[tail_ptr] <= 0;
-                slot_done[tail_ptr]   <= 0;
-                tail_ptr              <= tail_ptr + 1;
+                slot_valid[tail_ptr]         <= 1'b1;
+                slot_tag[tail_ptr]           <= req_tag;
+                slot_len[tail_ptr]           <= req_len_dw;
+                slot_rx_cnt[tail_ptr]        <= 0;
+                slot_done[tail_ptr]          <= 0;
+                slot_timeout_timer[tail_ptr] <= 0;
+                slot_timeout_err[tail_ptr]   <= 0;
+                tail_ptr                     <= tail_ptr + 1;
             end
 
             if (rx_cpld_valid && match_found) begin
@@ -131,6 +139,18 @@ module axi_pcie_reorder_buffer #(
             else if (alloc_en)         occupancy <= occupancy + 1;
             else if (retire_en)        occupancy <= occupancy - 1;
 
+            // Gap fix R1: every outstanding slot counts down toward
+            // timeout independently, not just whichever slot happens
+            // to be at head_ptr right now.
+            for (i = 0; i < NUM_SLOTS; i = i + 1) begin
+                if (slot_valid[i] && !slot_done[i] && !slot_timeout_err[i]) begin
+                    if (slot_timeout_timer[i] >= TIMEOUT_CYCLES - 1)
+                        slot_timeout_err[i] <= 1'b1;
+                    else
+                        slot_timeout_timer[i] <= slot_timeout_timer[i] + 1;
+                end
+            end
+
             if (!drain_state) begin
                 m_axis_tvalid <= 0;
                 m_axis_tuser  <= 0;
@@ -140,23 +160,23 @@ module axi_pcie_reorder_buffer #(
                     if (slot_done[head_ptr]) begin
                         drain_state   <= 1;
                         read_dw_cnt   <= 0;
-                        timeout_timer <= 0;
                         
                         m_axis_tvalid <= 1;
                         m_axis_tdata  <= buffer_data[(head_ptr * MAX_DW_PER_REQ) + 0];
                         m_axis_tlast  <= (slot_len[head_ptr] == 1);
                         m_axis_tkeep  <= 4'hf;
                         m_axis_tuser  <= 0;
-                    end else begin
-                        timeout_timer <= timeout_timer + 1;
-                        if (timeout_timer >= TIMEOUT_CYCLES - 1) begin
-                            drain_state   <= 1;
-                            read_dw_cnt   <= 0;
-                            m_axis_tvalid <= 1;
-                            m_axis_tdata  <= 32'hDEAD_DEAD; 
-                            m_axis_tlast  <= 1; 
-                            m_axis_tuser  <= 1; 
-                        end
+                    end else if (slot_timeout_err[head_ptr]) begin
+                        // Already flagged (possibly while this slot was
+                        // still behind others in the queue) -- emit the
+                        // error completion now rather than waiting out
+                        // another local countdown.
+                        drain_state   <= 1;
+                        read_dw_cnt   <= 0;
+                        m_axis_tvalid <= 1;
+                        m_axis_tdata  <= 32'hDEAD_DEAD; 
+                        m_axis_tlast  <= 1; 
+                        m_axis_tuser  <= 1; 
                     end
                 end
             end else begin
@@ -168,7 +188,6 @@ module axi_pcie_reorder_buffer #(
                         m_axis_tvalid        <= 0;
                         m_axis_tlast         <= 0;
                         m_axis_tuser         <= 0;
-                        timeout_timer        <= 0;
                     end else begin
                         read_dw_cnt   <= read_dw_cnt + 1;
                         m_axis_tdata  <= buffer_data[(head_ptr * MAX_DW_PER_REQ) + read_dw_cnt + 1];

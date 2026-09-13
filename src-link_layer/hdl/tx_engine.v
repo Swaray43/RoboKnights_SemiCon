@@ -1,5 +1,24 @@
 `timescale 1ns/1ps
 
+// ============================================================
+// Integration fix I1 (this session):
+//   credit_manager.v existed in the project but was never
+//   instantiated anywhere -- tx_engine kept its own duplicate
+//   set of credit limit/consumed registers driven straight off
+//   update_fc_*, so the shared credit_manager's `stall` output
+//   never gated anything.
+//
+//   tx_engine now instantiates credit_manager and issues a
+//   single-cycle alloc_req (asserted only while state==STATE_IDLE)
+//   for whichever request it is about to start (P has priority
+//   over NP, matching the original arbitration order). The local
+//   p_hdr_limit/p_data_limit/... registers and hand-rolled credit
+//   math are removed; can_start_p / can_start_np now come from
+//   credit_manager's alloc_req_grant. credit_manager's `stall`
+//   output is also exposed on a new `credit_stall` output port for
+//   visibility (unconnected == fine for existing instantiations).
+// ============================================================
+
 module tx_engine #(
     parameter MAX_PAYLOAD_SIZE_DW = 4,
     parameter [15:0] REQ_ID       = 16'h0200
@@ -38,7 +57,21 @@ module tx_engine #(
     output reg  [31:0] m_tdata,
     output reg         m_tvalid,
     input  wire        m_tready,
-    output reg         m_tlast
+    output reg         m_tlast,
+
+    // Credit status (Integration fix I1) -- mirrors credit_manager's
+    // stall output; not required to be connected.
+    output wire         credit_stall,
+
+    // Gap fix N1 (this session): pulses for exactly the cycle an NP
+    // (MRd) request is accepted out of STATE_IDLE, carrying that
+    // request's tag/length. Intended to drive pcie_rx_engine's
+    // req_alloc_* interface at the top level, so the reorder buffer
+    // actually knows to expect a completion for this tag (previously
+    // tied off to constant 0 in pcie_core_top.v).
+    output wire         np_accept_valid,
+    output wire [9:0]   np_accept_tag,
+    output wire [9:0]   np_accept_len
 );
 
     // FSM States
@@ -51,17 +84,6 @@ module tx_engine #(
     localparam STATE_DONE = 3'd6;
 
     reg [2:0] state;
-
-    // Credit Management Registers
-    reg [7:0]  p_hdr_limit;
-    reg [11:0] p_data_limit;
-    reg [7:0]  p_hdr_consumed;
-    reg [11:0] p_data_consumed;
-
-    reg [7:0]  np_hdr_limit;
-    reg [11:0] np_data_limit;
-    reg [7:0]  np_hdr_consumed;
-    reg [11:0] np_data_consumed;
 
     // Internal Registers for Active Packet
     reg        is_posted;
@@ -76,44 +98,48 @@ module tx_engine #(
     wire is_64bit = (active_addr[63:32] != 32'd0);
 
     // ------------------------------------------------------------------------
-    // Credit Update Accounting
+    // Credit gating via credit_manager (Integration fix I1)
     // ------------------------------------------------------------------------
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            p_hdr_limit   <= 8'd0;
-            p_data_limit  <= 12'd0;
-            np_hdr_limit  <= 8'd0;
-            np_data_limit <= 12'd0;
-        end else if (update_fc_valid) begin
-            if (update_fc_type == 2'b00) begin
-                p_hdr_limit  <= update_fc_hdr_limit;
-                p_data_limit <= update_fc_data_limit;
-            end else if (update_fc_type == 2'b01) begin
-                np_hdr_limit  <= update_fc_hdr_limit;
-                np_data_limit <= update_fc_data_limit;
-            end
-        end
-    end
+    // Candidate selection follows the original arbitration order: Posted
+    // has priority over Non-Posted. alloc_req is asserted for exactly one
+    // cycle per transaction start (only while state==STATE_IDLE), so
+    // credit_manager's internal *_consumed accounting increments once per
+    // accepted request, matching the original always-block timing.
+    wire want_p  = p_req_valid;
+    wire want_np = np_req_valid && !p_req_valid;
 
-    // ------------------------------------------------------------------------
-    // PCIe Credit Calculations (1 Data Credit = 4 DW)
-    // ------------------------------------------------------------------------
-    wire [11:0] p_req_data_credits = (p_req_len + 10'd3) >> 2;
+    wire        alloc_req_valid_w = (state == STATE_IDLE) && (want_p || want_np);
+    wire [1:0]  alloc_req_type_w  = want_p ? 2'b00 : 2'b01;         // MWr : MRd
+    wire [9:0]  alloc_req_dw_len_w = want_p ? p_req_len : 10'd0;    // 0 DW for MRd
 
-    wire [7:0]  p_hdr_diff  = p_hdr_limit - p_hdr_consumed;
-    wire [11:0] p_data_diff = p_data_limit - p_data_consumed;
-    wire [7:0]  np_hdr_diff = np_hdr_limit - np_hdr_consumed;
+    wire alloc_req_grant;
 
-    wire p_has_hdr_credit  = (p_hdr_diff  > 8'd0)                 && (p_hdr_diff  < 8'd128);
-    wire p_has_data_credit = (p_data_diff >= p_req_data_credits)  && (p_data_diff < 12'd2048);
-    wire np_has_hdr_credit = (np_hdr_diff > 8'd0)                 && (np_hdr_diff < 8'd128);
+    credit_manager u_credit_manager (
+        .clk                  (clk),
+        .rst_n                (rst_n),
 
-    wire p_has_credits  = p_has_hdr_credit && p_has_data_credit;
-    wire np_has_credits = np_has_hdr_credit;
+        .update_fc_valid      (update_fc_valid),
+        .update_fc_type       (update_fc_type),
+        .update_fc_hdr_limit  (update_fc_hdr_limit),
+        .update_fc_data_limit (update_fc_data_limit),
+
+        .alloc_req_valid      (alloc_req_valid_w),
+        .alloc_req_type       (alloc_req_type_w),
+        .alloc_req_dw_len     (alloc_req_dw_len_w),
+        .alloc_req_grant      (alloc_req_grant),
+        .stall                (credit_stall)
+    );
 
     // Ordering Rules
-    wire can_start_p  = p_req_valid && p_has_credits;
-    wire can_start_np = np_req_valid && np_has_credits && !p_req_valid;
+    wire can_start_p  = want_p  && alloc_req_grant;
+    wire can_start_np = want_np && alloc_req_grant;
+
+    // Gap fix N1: np_accept_* mirrors exactly the condition/values
+    // already used below in STATE_IDLE to capture an NP request --
+    // same single-cycle pulse timing as alloc_req_valid_w above.
+    assign np_accept_valid = can_start_np;
+    assign np_accept_tag   = np_req_tag;
+    assign np_accept_len   = np_req_len;
 
     // ------------------------------------------------------------------------
     // Sequential State Machine
@@ -121,10 +147,6 @@ module tx_engine #(
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state            <= STATE_IDLE;
-            p_hdr_consumed   <= 8'd0;
-            p_data_consumed  <= 12'd0;
-            np_hdr_consumed  <= 8'd0;
-            np_data_consumed <= 12'd0;
             is_posted        <= 1'b0;
             active_addr      <= 64'd0;
             active_len       <= 10'd0;
@@ -147,8 +169,6 @@ module tx_engine #(
                         active_tag      <= p_req_tag;
                         active_fbe      <= p_req_fbe;
                         active_lbe      <= p_req_lbe;
-                        p_hdr_consumed  <= p_hdr_consumed + 8'd1;
-                        p_data_consumed <= p_data_consumed + ((p_req_len + 10'd3) >> 2);
                         state           <= STATE_HDR0;
                     end else if (can_start_np) begin
                         is_posted       <= 1'b0;
@@ -157,7 +177,6 @@ module tx_engine #(
                         active_tag      <= np_req_tag;
                         active_fbe      <= np_req_fbe;
                         active_lbe      <= np_req_lbe;
-                        np_hdr_consumed <= np_hdr_consumed + 8'd1;
                         state           <= STATE_HDR0;
                     end
                 end

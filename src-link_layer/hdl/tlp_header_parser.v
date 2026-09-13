@@ -1,5 +1,17 @@
 `timescale 1ns/1ps
 
+// ============================================================
+// Gap fix H1 (this session):
+//   parsed_tag was assigned only rx_tlp_data[15:8] (8 bits) at
+//   header phase 1, zero-extended into the 10-bit parsed_tag reg.
+//   When Extended Tag Field is enabled, PCIe TLPs carry a 10-bit
+//   tag: the low 8 bits sit in DW1[15:8] as before, but bits 8 and
+//   9 (T8/T9) live in DW0 -- bit 19 (T8) and bit 23 (T9) -- not in
+//   DW1 at all. Those two bits are now latched at header phase 0
+//   (same cycle DW0 is captured) and combined with DW1[15:8] when
+//   parsed_tag is written at phase 1.
+// ============================================================
+
 module tlp_header_parser #(
     parameter TAG_WIDTH   = 10,
     parameter PCIE_ADDR_W = 64
@@ -30,6 +42,10 @@ module tlp_header_parser #(
     reg [1:0] header_phase;
     reg       is_4dw_header;
 
+    // Gap fix H1: Tag[9] (DW0 bit 23) and Tag[8] (DW0 bit 19),
+    // latched at phase 0 alongside the rest of DW0.
+    reg [1:0] tag_ext;
+
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             parsed_rx_valid   <= 0;
@@ -44,6 +60,7 @@ module tlp_header_parser #(
             parsed_addr       <= 0;
             header_phase      <= 0;
             is_4dw_header     <= 0;
+            tag_ext           <= 0;
         end else begin
             parsed_rx_valid <= rx_tlp_valid;
             parsed_rx_sof   <= rx_tlp_sof;
@@ -56,9 +73,10 @@ module tlp_header_parser #(
                     parsed_type      <= rx_tlp_data[28:24];
                     is_4dw_header    <= rx_tlp_data[29]; // Format bit indicates 4DW vs 3DW
                     parsed_length_dw <= rx_tlp_data[9:0];
+                    tag_ext          <= {rx_tlp_data[23], rx_tlp_data[19]}; // T9, T8
                 end else if (header_phase == 2'd1) begin
                     header_phase      <= 2'd2;
-                    parsed_tag        <= rx_tlp_data[15:8]; // Simplified for standard 8-bit tag mapping space
+                    parsed_tag        <= {tag_ext, rx_tlp_data[15:8]}; // {T9,T8,Tag[7:0]} -> 10-bit tag
                     parsed_cpl_status <= rx_tlp_data[15:13];
                     parsed_lower_addr <= rx_tlp_data[6:0];
                     if (!is_4dw_header) begin

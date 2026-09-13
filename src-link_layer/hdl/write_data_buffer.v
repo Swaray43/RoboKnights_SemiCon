@@ -82,6 +82,28 @@
 //             Must satisfy: 0 < HWM < FIFO_D
 // ============================================================
 
+// ---- Gap fix W1 (this session) -------------------------------
+//   The single shared fsm_state/latched_tuser/burst_active tracked
+//   ONE "current burst" globally and flagged err_burst_interleave
+//   (dropping the beat) whenever stream_id changed before a TLAST.
+//   That assumption is invalid for this architecture: the upstream
+//   arbiter is NOT session/burst-based -- it makes a fresh grant
+//   every cycle, so with both channels streaming, beats interleave
+//   almost every cycle (C0,C1,C0,C1...) with no burst-length
+//   locality (confirmed in the architecture disclaimer). Under the
+//   old logic, nearly every beat from whichever channel wasn't
+//   "holding" the shared FSM would have been misdetected as an
+//   interleave violation and silently dropped.
+//   Fixed the same way link_layer_tx.v was: burst-in-progress state
+//   is now tracked per channel (burst_active_ch[0:1]), indexed by
+//   the beat's own stream_id, so a channel-1 beat arriving between
+//   two not-yet-terminated channel-0 beats no longer corrupts
+//   anything. err_burst_interleave no longer has a legitimate
+//   trigger condition under this architecture (stream_id changing
+//   beat-to-beat is now normal, not a violation), so the port is
+//   kept for interface compatibility but is tied to 0.
+// ----------------------------------------------------------------
+//
 module write_data_buffer #(
     parameter DATA_W  = 512,
     parameter KEEP_W  = DATA_W / 8,
@@ -173,9 +195,9 @@ assign fifo_full      = (occupancy_r == FIFO_D[FIFO_AW:0]);
 assign fifo_hwm       = (occupancy_r >= HWM[FIFO_AW:0]);
 
 // ============================================================
-// Latched burst descriptor
+// Per-beat TUSER
 //
-// The new TUSER carries {tlast_flag, session_offset, stream_id}.
+// The TUSER carries {tlast_flag, session_offset, stream_id}.
 //
 // session_offset IS NOT stable across beats — it increments by
 // 64 (one 512-bit beat = 64 bytes) for each successive beat from
@@ -184,16 +206,12 @@ assign fifo_hwm       = (occupancy_r >= HWM[FIFO_AW:0]);
 // the downstream TLP packetizer can reconstruct the exact PCIe
 // host address for each DW segment without a separate counter.
 //
-// stream_id IS stable for the duration of one logical AXI4
-// burst — it identifies which use-case channel (0=SmartNIC,
-// 1=ML) generated the beat.  Changing stream_id mid-burst
-// without an intervening TLAST is an AXI4 interleave violation.
-//
-// Accordingly:
-//   latched_tuser[STREAM_ID_BIT] is captured from the first beat
-//     and compared on every subsequent beat of the same burst.
-//   The FULL s_tuser (including per-beat session_offset) is
-//     stored in each FIFO entry — latched_tuser is NOT replayed.
+// stream_id identifies which use-case channel (0=SmartNIC, 1=ML)
+// generated the beat. Gap fix W1 (see header note): stream_id is
+// NOT required to stay constant between TLASTs — the upstream
+// arbiter interleaves channels beat-by-beat with no burst-length
+// locality, so a channel is picked back up correctly via its own
+// stream_id on each beat, not via a single latched "current burst".
 //
 // NOTE on TUSER_W=26 (Point 3 — interface spec):
 //   Bit 25 (TUSER_W-1 = tlast_flag) is a redundant mirror of
@@ -203,8 +221,13 @@ assign fifo_hwm       = (occupancy_r >= HWM[FIFO_AW:0]);
 //   (link_layer_tx) should connect all 26 bits; bit 25 may be
 //   ignored if m_tlast is already used for the same purpose.
 // ============================================================
-reg [TUSER_W-1:0]  latched_tuser;
-reg                burst_active;
+// Gap fix W1: per-channel burst-in-progress tracking, replacing
+// the single shared latched_tuser/burst_active. Indexed by the
+// beat's own stream_id (s_tuser[STREAM_ID_BIT]) -- see header note.
+// session_offset is still stored per-beat, verbatim, straight from
+// s_tuser into each FIFO entry; nothing here replays it.
+// ============================================================
+reg burst_active_ch [0:1];
 
 // ============================================================
 // TKEEP contiguous checker — Bug 2 fix
@@ -245,14 +268,6 @@ function automatic tkeep_has_gap;
 endfunction
 
 // ============================================================
-// FSM states
-// ============================================================
-localparam ST_IDLE  = 1'b0;
-localparam ST_BURST = 1'b1;
-
-reg fsm_state;
-
-// ============================================================
 // Write side combinational signals
 //
 // Bug 5 fix: gap_detected gated by s_tready.
@@ -265,99 +280,40 @@ reg fsm_state;
 wire gap_detected = s_tvalid && s_tready &&
                     tkeep_has_gap(s_tkeep, s_tlast);   // Bug 5 + Bug 6
 wire wr_en        = s_tvalid && s_tready && !gap_detected;
+wire ch_sel_w      = s_tuser[STREAM_ID_BIT];
 
 // ============================================================
-// Write side FSM
+// Write side (Gap fix W1: no shared FSM -- see header note).
+// Every beat is handled the same way regardless of which channel
+// it belongs to or whether a burst is "in progress": a TKEEP gap
+// drops the beat and pulses err_tkeep_gap; otherwise the beat is
+// written verbatim (full s_tuser, including its own session_offset)
+// and that channel's burst_active_ch bit tracks open/closed via
+// its own TLAST. There is no cross-channel interleave check left
+// to do -- interleaving is the expected steady state here.
 // ============================================================
 always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
-        fsm_state            <= ST_IDLE;
         wr_ptr               <= {FIFO_AW{1'b0}};
-        latched_tuser        <= {TUSER_W{1'b0}};
-        burst_active         <= 1'b0;
+        burst_active_ch[0]   <= 1'b0;
+        burst_active_ch[1]   <= 1'b0;
         err_tkeep_gap        <= 1'b0;
         err_burst_interleave <= 1'b0;
     end else begin
         err_tkeep_gap        <= 1'b0;   // default: pulse cleared each cycle
-        err_burst_interleave <= 1'b0;
+        err_burst_interleave <= 1'b0;   // Gap fix W1: no longer has a valid trigger; tied off
 
-        case (fsm_state)
-
-            // ------------------------------------------------
-            // ST_IDLE — waiting for first beat of a new burst
-            // ------------------------------------------------
-            ST_IDLE: begin
-                if (s_tvalid) begin
-                    if (gap_detected) begin
-                        // Malformed first beat — flag and drop.
-                        // Do not latch TUSER; stay in IDLE.
-                        // The burst is abandoned at the source side.
-                        err_tkeep_gap <= 1'b1;
-                    end else if (s_tready) begin
-                        // Latch TUSER from the first beat.
-                        // Only latched_tuser[STREAM_ID_BIT] is used
-                        // in subsequent cycles (to detect cross-stream
-                        // interleaving).  session_offset is per-beat
-                        // and is taken from s_tuser on every beat
-                        // individually — latched_tuser is never
-                        // replayed into the FIFO.
-                        latched_tuser <= s_tuser;
-                        burst_active  <= 1'b1;
-
-                        // Write first beat into FIFO using s_tuser
-                        // directly (latched_tuser not yet valid on
-                        // this same cycle).
-                        mem[wr_ptr] <= {s_tuser, s_tlast, s_tkeep, s_tdata};
-                        wr_ptr      <= wr_ptr + 1'b1;
-
-                        if (!s_tlast)
-                            fsm_state <= ST_BURST;
-                        else
-                            burst_active <= 1'b0;  // single-beat burst
-                    end
-                end
+        if (s_tvalid) begin
+            if (gap_detected) begin
+                err_tkeep_gap <= 1'b1;
+                // Malformed beat -- flag and drop, don't touch FIFO
+                // or this channel's burst_active_ch.
+            end else if (s_tready) begin
+                mem[wr_ptr] <= {s_tuser, s_tlast, s_tkeep, s_tdata};
+                wr_ptr      <= wr_ptr + 1'b1;
+                burst_active_ch[ch_sel_w] <= !s_tlast;
             end
-
-            // ------------------------------------------------
-            // ST_BURST — inside a multi-beat burst
-            // ------------------------------------------------
-            ST_BURST: begin
-                if (s_tvalid) begin
-                    // STREAM_ID (bit 0) must be constant for all beats
-                    // of a single AXI4 burst.  session_offset (bits
-                    // [SOFF_W:1]) legitimately changes every beat —
-                    // it carries the per-beat byte offset and is stored
-                    // verbatim via s_tuser, NOT replayed from
-                    // latched_tuser.  Do NOT compare session_offset.
-                    if (s_tuser[STREAM_ID_BIT] !== latched_tuser[STREAM_ID_BIT]) begin
-                        err_burst_interleave <= 1'b1;
-                        // Drop the offending beat; stay in ST_BURST
-                        // waiting for TLAST from the original stream.
-                        // The FIFO entry for this beat is silently
-                        // discarded — the burst is corrupted but we
-                        // do not enter an undefined state.
-                    end else if (gap_detected) begin
-                        // Bug 5+6: gap_detected already gated by s_tready
-                        // and catches zero-TKEEP on non-last beats.
-                        err_tkeep_gap <= 1'b1;
-                        // Drop the beat; burst continues.
-                    end else if (s_tready) begin
-                        // Store the full incoming TUSER (including the
-                        // per-beat session_offset) in the FIFO entry.
-                        // latched_tuser is NOT used here — it only
-                        // provided the stream_id check above.
-                        mem[wr_ptr] <= {s_tuser, s_tlast, s_tkeep, s_tdata};
-                        wr_ptr      <= wr_ptr + 1'b1;
-
-                        if (s_tlast) begin
-                            fsm_state    <= ST_IDLE;
-                            burst_active <= 1'b0;
-                        end
-                    end
-                end
-            end
-
-        endcase
+        end
     end
 end
 
@@ -426,11 +382,10 @@ end
 // ============================================================
 `ifdef SIMULATION
 always @(posedge clk) begin
-    // AXI4 violation: stream_id changed mid-burst
-    if (err_burst_interleave)
-        $error("[write_data_buffer] FATAL: stream_id changed mid-burst. \
-                TUSER[0] differs from latched value. \
-                Upstream master or CDC is non-compliant.");
+    // Gap fix W1: the old stream_id-changed-mid-burst check is
+    // removed -- interleaving between channels is normal here, not
+    // a violation (see header note). err_burst_interleave is tied
+    // to 0 and no longer checked.
 
     // Bug 4 fix: check wr_en (actual write), not s_tvalid && s_tready,
     // to avoid false firing during the HWM-1 lag cycle.
@@ -438,15 +393,6 @@ always @(posedge clk) begin
         $error("[write_data_buffer] FATAL: FIFO overflow. \
                 Beat written when FIFO was full. \
                 Back-pressure watermark logic has a bug.");
-
-    // stream_id changed mid-burst without TLAST — cross-stream
-    // interleave attempt. session_offset changes every beat and
-    // is intentional; only stream_id is checked here.
-    if (burst_active && s_tvalid &&
-        (s_tuser[STREAM_ID_BIT] !== latched_tuser[STREAM_ID_BIT]))
-        $warning("[write_data_buffer] AXI4 violation: stream_id changed \
-                  mid-burst without TLAST. Cross-stream interleave \
-                  attempt — beat will be dropped.");
 
     // Bug 6 check: zero TKEEP arriving on a non-last beat while
     // s_tready is high should have been caught by gap_detected,
