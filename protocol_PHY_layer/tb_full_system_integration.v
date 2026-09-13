@@ -15,13 +15,13 @@
 //     destriper chain, to confirm the new blocks don't disturb it
 //
 // NEW in this file:
-//   - rst_sync, sitting between datapath_rst_n and a synthetic "Swaray domain"
+//   - rst_sync, sitting between datapath_rst_n and a synthetic "ext domain"
 //   - fifo_scoreboard, driven by testbench-modeled fifo_occupancy/fifo_full/
-//     fifo_hwm/err_tkeep_gap (Swaray's actual FIFO RTL isn't in our repo, so
+//     fifo_hwm/err_tkeep_gap (the actual FIFO RTL isn't in our repo, so
 //     these are hand-driven stimulus standing in for his module's outputs -
 //     this validates OUR wiring and counting logic, not his FIFO itself)
 //   - session_arm_ctrl, sharing datapath_rst_n (this is a register in OUR
-//     boundary, not Swaray's, so it uses our sync reset directly, no rst_sync
+//     boundary, so it uses our sync reset directly, no rst_sync
 //     needed for this one)
 // =============================================================================
 
@@ -72,13 +72,13 @@ pcie_reset_controller u_rst (
 assign datapath_rst_n_probe = perst_n;
 
 // =============================================================================
-// NEW BLOCK 1: rst_sync + fifo_scoreboard, sitting in reset domain
+// NEW BLOCK 1: rst_sync + fifo_scoreboard, sitting in other reset domain
 // =============================================================================
-wire swaray_rst_n;
+wire ext_rst_n;
 rst_sync u_rst_sync (
   .clk(clk),
   .async_rst_n(datapath_rst_n),
-  .sync_rst_n(swaray_rst_n)
+  .sync_rst_n(ext_rst_n)
 );
 
 reg [4:0] fake_fifo_occupancy;
@@ -87,7 +87,7 @@ wire [31:0] err_tkeep_gap_count, fifo_hwm_cycles, fifo_full_cycles;
 wire [4:0]  fifo_occupancy_peak;
 
 fifo_scoreboard u_scoreboard (
-  .clk(clk), .rst_n(swaray_rst_n),
+  .clk(clk), .rst_n(sext_rst_n),
   .fifo_occupancy(fake_fifo_occupancy),
   .fifo_full(fake_fifo_full),
   .fifo_hwm(fake_fifo_hwm),
@@ -101,8 +101,8 @@ fifo_scoreboard u_scoreboard (
 );
 
 // =============================================================================
-// NEW BLOCK 2: session_arm_ctrl, sharing OUR sync reset
-// (this is our own register-file boundary, no rst_sync needed here)
+// NEW BLOCK 2: session_arm_ctrl, sharing OUR sync reset (not external domain -
+// this is our own register-file boundary, no rst_sync needed here)
 // =============================================================================
 reg  [63:0] session_base_addr;
 reg  [2:0]  session_tc;
@@ -240,10 +240,10 @@ initial begin
   // sharing the domain correctly rather than free-running ----
   @(negedge clk); @(negedge clk);
 
-  if (swaray_rst_n !== 1'b0) begin
-    $display("FAIL: swaray_rst_n not held low under PERST#");
+  if (ext_rst_n !== 1'b0) begin
+    $display("FAIL: ext_rst_n not held low under PERST#");
     errors = errors + 1;
-  end else $display("PASS: swaray_rst_n correctly held low under PERST#");
+  end else $display("PASS: ext_rst_n correctly held low under PERST#");
 
   if (session_valid !== 1'b0) begin
     $display("FAIL: session_valid not held low under PERST#");
@@ -268,14 +268,14 @@ initial begin
   // datapath_rst_n rose synchronously (perst_n was already high, no async
   // edge here), so sync_rst_n should track it within rst_sync's 2-stage
   // pipeline - check it eventually rises and never rises BEFORE datapath_rst_n.
-  if (datapath_rst_n === 1'b1 && swaray_rst_n === 1'b0) begin
-    $display("INFO: swaray_rst_n correctly still settling behind datapath_rst_n (2-FF sync stage)");
+  if (datapath_rst_n === 1'b1 && ext_rst_n === 1'b0) begin
+    $display("INFO: ext_rst_n correctly still settling behind datapath_rst_n (2-FF sync stage)");
   end
   repeat (3) @(negedge clk);
-  if (swaray_rst_n !== 1'b1) begin
-    $display("FAIL: swaray_rst_n never deasserted after datapath_rst_n went high");
+  if (ext_rst_n !== 1'b1) begin
+    $display("FAIL: ext_rst_n never deasserted after datapath_rst_n went high");
     errors = errors + 1;
-  end else $display("PASS: swaray_rst_n correctly followed datapath_rst_n through rst_sync");
+  end else $display("PASS: ext_rst_n correctly followed datapath_rst_n through rst_sync");
 
   // ---- Phase 3: release AXI reset (verbatim reuse) ----
   updatefc_received = 1;
@@ -288,7 +288,7 @@ initial begin
     errors = errors + 1;
   end else $display("PASS: axi_rst_n released correctly in full integration");
 
-  // ---- Phase 4: exercise fifo_scoreboard against modeled Swaray FIFO
+  // ---- Phase 4: exercise fifo_scoreboard against modeled ext FIFO
   // behaviour - ramp occupancy up past HWM, pulse err_tkeep_gap twice,
   // never assert fifo_full (per his note: should stay zero in normal op) ----
   fake_fifo_occupancy = 5'd3;  @(negedge clk);
@@ -337,6 +337,14 @@ initial begin
 
   if (session_base_addr_latched !== 64'hDEAD_BEEF_0000_1234 || session_tc_latched !== 3'd5) begin
     $display("FAIL: session_base_addr_latched/tc_latched mismatch");
+    $display("  expected base_addr_latched: %h", 64'hDEAD_BEEF_0000_1234);
+    $display("  got      base_addr_latched: %h", session_base_addr_latched);
+    $display("  expected tc_latched: %b", 3'd5);
+    $display("  got      tc_latched: %b", session_tc_latched);
+    $display("  driven   base_addr_in (live): %h", session_base_addr);
+    $display("  driven   tc_in       (live): %b", session_tc);
+    $display("  u_session.state at check time: %b (00=IDLE 01=LATCH 10=ACTIVE)", u_session.state);
+    $display("  session_valid at check time: %b", session_valid);
     errors = errors + 1;
   end else $display("PASS: base_addr/tc latched correctly");
 
