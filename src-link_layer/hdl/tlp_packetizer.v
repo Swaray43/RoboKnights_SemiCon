@@ -4,11 +4,6 @@
 // Module : tlp_packetizer
 // Layer  : Link layer (Engineer B -- Module 5 of 9)
 //
-// Bug fixes applied vs original:
-//   Bug P1 -- wire declaration inside always block (illegal Verilog).
-//             last_be / first_be now live at module level.
-//   Bug P2 -- write data was never forwarded; wdata stream port added.
-//   Bug P3 -- req_ready left deasserted after last multi-chunk; fixed.
 // ============================================================
 
 module tlp_packetizer #(
@@ -68,8 +63,29 @@ module tlp_packetizer #(
     // PCIe spec: LastBE = 4'b0000 when Length == 1 DW
     // -------------------------------------------------------
     wire [3:0] last_be  = (chunk_len == 10'd1) ? 4'b0000 : 4'b1111;
-    wire [3:0] first_be = 4'b1111;
     wire [2:0] tlp_fmt  = curr_is_write ? FMT_4DW_DATA : FMT_4DW_NODATA;
+
+    // -------------------------------------------------------
+    // Bug P4 fix: FirstBE for non-DW-aligned start addresses.
+    // curr_addr[1:0] is the byte offset of the transfer start within
+    // its first DW. The enabled bytes run contiguously from that
+    // offset to the top of the DW (byte 3), per PCIe BE rules.
+    //   offset 00 -> 1111   offset 10 -> 1100
+    //   offset 01 -> 1110   offset 11 -> 1000
+    // -------------------------------------------------------
+    function [3:0] first_be_from_offset;
+        input [1:0] byte_offset;
+        begin
+            case (byte_offset)
+                2'b00: first_be_from_offset = 4'b1111;
+                2'b01: first_be_from_offset = 4'b1110;
+                2'b10: first_be_from_offset = 4'b1100;
+                2'b11: first_be_from_offset = 4'b1000;
+            endcase
+        end
+    endfunction
+
+    wire [3:0] first_be = first_be_from_offset(curr_addr[1:0]);
 
     // -------------------------------------------------------
     // Combinational output mux

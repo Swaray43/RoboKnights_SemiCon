@@ -3,14 +3,6 @@
 /*
  * Module: fec_encoder_decoder
  *
- * Bugfix: the original SEC-DED parity generator (calc_parity) and bit
- * corrector (repair_data) were hardcoded for a 128-bit DATA_WIDTH (fixed
- * 128-bit literal masks, a fixed 0..127 correction loop) no matter what
- * DATA_WIDTH was set to. That made the module silently wrong the moment
- * DATA_WIDTH != 128 -- e.g. instantiated at FLIT_WIDTH=2048 by a
- * width-generalized flit_framer, it would still only generate/check parity
- * over the low 128 bits and only ever correct bit positions 0..127.
- *
  * This version computes parity generically from DATA_WIDTH/FEC_WIDTH so it
  * scales to any width, using the standard extended-Hamming construction:
  *   - POS_BITS = FEC_WIDTH-1 position-parity bits: parity[k] covers every

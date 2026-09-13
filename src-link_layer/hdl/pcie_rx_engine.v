@@ -1,5 +1,6 @@
 `timescale 1ns/1ps
 
+
 module pcie_rx_engine #(
     parameter TAG_WIDTH      = 10,
     parameter MAX_DW_PER_REQ = 16,
@@ -40,11 +41,53 @@ module pcie_rx_engine #(
     
     input  wire [PCIE_ADDR_W-1:0]  cfg_window_base,
     input  wire [PCIE_ADDR_W-1:0]  cfg_window_mask,
-    input  wire [AXI_ADDR_W-1:0]   cfg_axi_base
+    input  wire [AXI_ADDR_W-1:0]   cfg_axi_base,
+
+    // Gap fix X1: CfgRd/CfgWr routing (extension point -- no
+    // config-space block exists in the project yet to connect this
+    // to). Asserted one cycle after tlp_rx_sof, once tag/addr/length
+    // are valid (Cfg requests are always 3DW headers).
+    output wire                    cfg_req_valid,
+    output wire                    cfg_req_type1,     // 0: Type0, 1: Type1
+    output wire [TAG_WIDTH-1:0]    cfg_req_tag,
+    output wire [9:0]              cfg_req_len_dw,
+    output wire [PCIE_ADDR_W-1:0]  cfg_req_addr,
+
+    // Gap fix X2: malformed TLP (unrecognised Type field) detection.
+    output wire                    malformed_tlp_err
 );
 
     wire is_cpld = (tlp_type == 5'b01010);
     wire is_mwr  = (tlp_type == 5'b00000) || (tlp_type == 5'b10000);
+
+    // Gap fix X1: Cfg Type0 (0_0100) / Type1 (0_0101) detection.
+    wire is_cfg      = (tlp_type == 5'b00100) || (tlp_type == 5'b00101);
+    wire cfg_type1_w = tlp_type[0];
+
+    // Gap fix X2: any TLP whose Type isn't one of the above is
+    // outside what this bridge currently recognises.
+    // NOTE: is_mwr's existing 5'b00000 case is ambiguous with a plain
+    // MRd (same Type per spec; the two are only pre-existing distinct
+    // here via the non-standard 5'b10000 encoding) -- that ambiguity
+    // predates this fix and isn't resolved here, so a genuine MRd is
+    // still classified alongside MWr rather than flagged malformed.
+    wire malformed_type_err = tlp_rx_valid && tlp_rx_sof &&
+                               !(is_mwr || is_cpld || is_cfg);
+    assign malformed_tlp_err = malformed_type_err;
+
+    // Gap fix X1: delay cfg_req_valid to one cycle after SOF so
+    // tlp_tag/tlp_addr/tlp_length_dw are valid (see header note).
+    reg cfg_req_valid_r;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) cfg_req_valid_r <= 1'b0;
+        else        cfg_req_valid_r <= tlp_rx_valid && tlp_rx_sof && is_cfg;
+    end
+
+    assign cfg_req_valid  = cfg_req_valid_r;
+    assign cfg_req_type1  = cfg_type1_w;
+    assign cfg_req_tag    = tlp_tag;
+    assign cfg_req_len_dw = tlp_length_dw;
+    assign cfg_req_addr   = tlp_addr;
 
     reg in_cpld_pkt;
     reg in_mwr_pkt;
