@@ -279,7 +279,42 @@ output reg  [7:0] lane_out_2,
 output reg  [7:0] lane_out_3,
 output reg  [3:0] lane_valid_out    // matches flit_lane_destriper's lane_valid_in width
 );
+`ifdef FORMAL
+    // Force the solver to start with reset asserted
+    initial assume(!rst_n);
 
+    always @(posedge clk) begin
+        // ---------------------------------------------------------
+        // 1. Reset Behavior Verification
+        // ---------------------------------------------------------
+        if (!rst_n) begin
+            assert(state == WAIT_SOF);
+            assert(payload_cnt == 3'd0);
+            assert(lane_valid_out == 4'b0000);
+            assert(lane_out_0 == 8'd0);
+            assert(lane_out_1 == 8'd0);
+            assert(lane_out_2 == 8'd0);
+            assert(lane_out_3 == 8'd0);
+        end 
+        // ---------------------------------------------------------
+        // 2. FSM Safety Properties (Post-Reset)
+        // ---------------------------------------------------------
+        else begin
+            // Ensure the state machine is strictly in a known state
+            assert(state == WAIT_SOF || state == PASS_FLIT);
+
+            // In WAIT_SOF, payload_cnt must remain 0
+            if (state == WAIT_SOF) begin
+                assert(payload_cnt == 3'd0);
+            end
+
+            // In PASS_FLIT, payload_cnt must never exceed 7
+            if (state == PASS_FLIT) begin
+                assert(payload_cnt <= 3'd7);
+            end
+        end
+    end
+`endif
 localparam SOF_TOKEN = 8'hFB;
 
 localparam WAIT_SOF  = 1'b0;
@@ -852,7 +887,7 @@ endmodule
 
 module tx_elastic_deskew #(
 parameter DEPTH = 8,
-parameter THRESHOLD = 4   // minimum fill before release - this is your "±N UI" tolerance
+parameter THRESHOLD = 4   // minimum fill before release - this is your " N UI" tolerance
 )(
 input  wire       clk,
 input  wire       rst_n,
