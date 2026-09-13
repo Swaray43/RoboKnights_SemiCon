@@ -235,7 +235,9 @@ initial begin
   valid_in = 0; flit_in = 256'd0; sof_phase = 0;
   fake_fifo_occupancy = 0; fake_fifo_full = 0; fake_fifo_hwm = 0; fake_err_tkeep_gap = 0;
   session_base_addr = 64'h0; session_tc = 3'd0; session_arm = 0; session_end = 0;
-
+  $monitor("t=%0t perst_n=%b probe=%b u_ts0.rst_n=%b u_ts0.state=%b u_ts0.byte_idx=%0d ts_byte_valid=%b ts_byte_l0=%h lnv0=%b link_trained=%b",
+          $time, perst_n, datapath_rst_n_probe, u_ts0.rst_n, u_ts0.state, u_ts0.byte_idx,
+          ts_byte_valid, ts_byte_l0, lnv0, link_trained);
   // ---- Phase 0: under PERST#, every new block must sit quietly in reset,
   // sharing the domain correctly rather than free-running ----
   @(negedge clk); @(negedge clk);
