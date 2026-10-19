@@ -1,0 +1,13 @@
+*.log
+*.jou
+*.vds
+*.rpt
+*.pb
+*.str
+*.wdb
+vivado_project/**/runs/
+vivado_project/**/sim/
+*.wdb
+*.sim/
+*.jou
+*.log

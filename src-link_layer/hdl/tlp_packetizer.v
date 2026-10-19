@@ -4,6 +4,16 @@
 // Module : tlp_packetizer
 // Layer  : Link layer (Engineer B -- Module 5 of 9)
 //
+// Change (bridge review follow-up, "P5"):
+//   DW0 was built from 31 bits ({1'b0, Fmt, Type, 1'b0, TC, 4'b0, Attr,
+//   2'b0, Length}), so Verilog zero-extended it and Fmt landed in
+//   DW0[30:28] instead of DW0[31:29]; Type, TC etc. were all shifted down
+//   by one bit. Any receiver decoding the header (including the new
+//   rx_tlp_delimiter, which sizes TLPs from Fmt/Length) saw garbage.
+//   DW0 is now the PCIe layout, exactly 32 bits:
+//     [31:29] Fmt  [28:24] Type  [23] T9  [22:20] TC  [19] T8  [18] Attr2
+//     [17] LN  [16] TH  [15] TD  [14] EP  [13:12] Attr  [11:10] AT
+//     [9:0] Length
 // ============================================================
 
 module tlp_packetizer #(
@@ -12,7 +22,7 @@ module tlp_packetizer #(
     input  wire        clk,
     input  wire        rst_n,
 
-    // Descriptor interface (from address_translation)
+    // Descriptor interface (from ar_request_splitter)
     input  wire        req_valid,
     input  wire        req_is_write,
     input  wire [63:0] req_addr,
@@ -21,12 +31,12 @@ module tlp_packetizer #(
     input  wire [7:0]  req_tag,
     output reg         req_ready,
 
-    // Write data stream (from write_data_buffer) -- MWr only
+    // Write data stream -- MWr only
     input  wire [31:0] wdata_tdata,
     input  wire        wdata_tvalid,
     output reg         wdata_tready,
 
-    // Outbound TLP word stream (to TX engine / replay buffer)
+    // Outbound TLP word stream
     output reg         tlp_out_valid,
     output reg  [31:0] tlp_out_data,
     output reg         tlp_out_sof,
@@ -58,21 +68,11 @@ module tlp_packetizer #(
     reg [15:0] curr_rid;
     reg [9:0]  data_cnt;
 
-    // -------------------------------------------------------
-    // Bug P1 fix: last_be / first_be at module scope (not inside always)
     // PCIe spec: LastBE = 4'b0000 when Length == 1 DW
-    // -------------------------------------------------------
     wire [3:0] last_be  = (chunk_len == 10'd1) ? 4'b0000 : 4'b1111;
     wire [2:0] tlp_fmt  = curr_is_write ? FMT_4DW_DATA : FMT_4DW_NODATA;
 
-    // -------------------------------------------------------
-    // Bug P4 fix: FirstBE for non-DW-aligned start addresses.
-    // curr_addr[1:0] is the byte offset of the transfer start within
-    // its first DW. The enabled bytes run contiguously from that
-    // offset to the top of the DW (byte 3), per PCIe BE rules.
-    //   offset 00 -> 1111   offset 10 -> 1100
-    //   offset 01 -> 1110   offset 11 -> 1000
-    // -------------------------------------------------------
+    // FirstBE for non-DW-aligned start addresses
     function [3:0] first_be_from_offset;
         input [1:0] byte_offset;
         begin
@@ -86,6 +86,21 @@ module tlp_packetizer #(
     endfunction
 
     wire [3:0] first_be = first_be_from_offset(curr_addr[1:0]);
+
+    // DW0, PCIe bit layout (32 bits exactly -- see header note)
+    wire [31:0] hdr_dw0 = {tlp_fmt,        // [31:29] Fmt
+                           TYPE_MEM_REQ,   // [28:24] Type
+                           1'b0,           // [23]    T9
+                           3'b000,         // [22:20] TC
+                           1'b0,           // [19]    T8
+                           1'b0,           // [18]    Attr[2]
+                           1'b0,           // [17]    LN
+                           1'b0,           // [16]    TH
+                           1'b0,           // [15]    TD
+                           1'b0,           // [14]    EP
+                           2'b00,          // [13:12] Attr[1:0]
+                           2'b00,          // [11:10] AT
+                           chunk_len};     // [9:0]   Length
 
     // -------------------------------------------------------
     // Combinational output mux
@@ -101,10 +116,7 @@ module tlp_packetizer #(
             S_HDR0: begin
                 tlp_out_valid = 1'b1;
                 tlp_out_sof   = 1'b1;
-                // DW0: {Rsvd,Fmt[2:0],Type[4:0],Rsvd,TC[2:0],Rsvd[3:0],Attr[1:0],Rsvd[1:0],Len[9:0]}
-                tlp_out_data  = {1'b0, tlp_fmt, TYPE_MEM_REQ,
-                                 1'b0, 3'b000, 4'b0000, 2'b00, 2'b00,
-                                 chunk_len};
+                tlp_out_data  = hdr_dw0;
             end
             S_HDR1: begin
                 tlp_out_valid = 1'b1;
@@ -113,17 +125,14 @@ module tlp_packetizer #(
             end
             S_HDR2: begin
                 tlp_out_valid = 1'b1;
-                // DW2: upper address
                 tlp_out_data  = curr_addr[63:32];
             end
             S_HDR3: begin
                 tlp_out_valid = 1'b1;
-                // DW3: lower address; EOF here for MRd (no data follows)
                 tlp_out_eof   = !curr_is_write;
                 tlp_out_data  = {curr_addr[31:2], 2'b00};
             end
             S_DATA: begin
-                // Bug P2 fix: forward write_data_buffer beats to TLP stream
                 tlp_out_valid = wdata_tvalid;
                 tlp_out_eof   = (data_cnt == 10'd1) && wdata_tvalid;
                 tlp_out_data  = wdata_tdata;
@@ -149,7 +158,6 @@ module tlp_packetizer #(
             data_cnt      <= 10'd0;
         end else begin
             case (state)
-
                 S_IDLE: begin
                     req_ready <= 1'b1;
                     if (req_valid && req_ready) begin
@@ -196,7 +204,6 @@ module tlp_packetizer #(
                     rem_length <= rem_length - chunk_len;
                     curr_addr  <= curr_addr + {chunk_len, 2'b00};
                     if (rem_length == chunk_len) begin
-                        // Bug P3 fix: always re-assert req_ready here
                         req_ready <= 1'b1;
                         state     <= S_IDLE;
                     end else begin
