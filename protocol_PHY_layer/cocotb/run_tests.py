@@ -1,5 +1,8 @@
 """
-run_tests.py - runs the cocotb testbench without needing GNU Make.
+run_tests.py - runs the cocotb testbenches without needing GNU Make.
+
+Top level is now pcie_phy_top (pcie_link_top was folded into it; every
+pcie_link_top port kept its name). Sources are read from ../files.f.
 
 Usage:
     python run_tests.py                  # Icarus Verilog (default)
@@ -8,9 +11,9 @@ Usage:
 Requires: iverilog (or verilator) on PATH, and `pip install cocotb`.
 Same file layout as the Makefile version:
     cocotb/
-    ├── run_tests.py        (this file)
-    ├── pcie_link_top.v     (place next to your other .v sources)
-    ├── test_pcie_link_top.py
+    ├── run_tests.py           (this file)
+    ├── test_pcie_link_top.py  (original 4 tests, unchanged)
+    ├── test_pcie_phy_top.py   (BAR0, session CDC, MSI-X, datapath loopback)
     └── models/
         └── rc_bfm.py
 """
@@ -23,14 +26,15 @@ from cocotb_tools.runner import get_runner
 
 THIS_DIR = Path(__file__).resolve().parent
 
-# Same source list as the Makefile - add pcie_phy_datapath.v-derived files
-# here once the PHY datapath is folded into pcie_link_top.v in a later pass.
+# Same source list as the Makefile: the single RTL file list, ../files.f
+FILES_F = THIS_DIR / ".." / "files.f"
 VERILOG_SOURCES = [
-    THIS_DIR / ".." / "pcie_phy_datapath.v",
-    THIS_DIR / ".." / "pcie_tag_man.v",
-    THIS_DIR / ".." / "pcie_config_msix.v",
-    THIS_DIR / "pcie_link_top.v",
+    THIS_DIR / ".." / line.strip()
+    for line in FILES_F.read_text().splitlines()
+    if line.strip() and not line.strip().startswith("//")
 ]
+TOPLEVEL = "pcie_phy_top"
+TEST_MODULES = ["test_pcie_link_top", "test_pcie_phy_top"]
 
 
 def main():
@@ -44,24 +48,25 @@ def main():
         print("ERROR: missing source file(s):")
         for m in missing:
             print(f"  {m}")
-        print("Check that pcie_link_top.v sits next to your other .v files as described above this script's docstring.")
+        print("Check that ../files.f matches the files in ../rtl/.")
         sys.exit(1)
 
     runner = get_runner(args.sim)
 
-    build_args = ["-g2001"] if args.sim == "icarus" else []
+    build_args = ["-g2005"] if args.sim == "icarus" else []
 
     runner.build(
         sources=[str(p.resolve()) for p in VERILOG_SOURCES],
-        hdl_toplevel="pcie_link_top",
+        hdl_toplevel=TOPLEVEL,
         build_args=build_args,
         build_dir=str(THIS_DIR / "sim_build"),
+        timescale=("1ns", "1ps"),
         always=True,
     )
 
     runner.test(
-        hdl_toplevel="pcie_link_top",
-        test_module="test_pcie_link_top",
+        hdl_toplevel=TOPLEVEL,
+        test_module=TEST_MODULES,
         test_dir=str(THIS_DIR),
         results_xml="results.xml",
     )

@@ -1,0 +1,5 @@
+sim_out/
+cocotb/sim_build/
+cocotb/results.xml
+__pycache__/
+formal/*/

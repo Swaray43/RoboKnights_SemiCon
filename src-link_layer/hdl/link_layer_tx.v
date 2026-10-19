@@ -2,241 +2,153 @@
 
 // ============================================================
 // Module : link_layer_tx
-// Layer  : Link layer (Engineer B)
+// Layer  : Link layer (Engineer B) -- Flit framer + PHY serialiser
 //
-// Change (interleave support 2025):
-//   Fully independent per-channel FLIT assembly state.
-//   See module comment in write_data_buffer.v for context.
+// Rewritten against the AXI4-PCIe6 bridge review (L4-L8, Seam C).
 //
-//   Each channel (0=SmartNIC, 1=ML) owns:
-//     flit_buf_ch[CH][0..3]  four 512-bit beat slots
-//     beat_cnt_ch[CH]        beats buffered so far
-//     ch_busy[CH]            FLIT sealed, awaiting serialisation
-//     payload_ch[CH]         assembled 2008-bit payload
+// What changed and why
+//   * Input is now a finished 236-byte TLP area (59 DW) plus its Flit
+//     sequence number, taken from the replay buffer. Packing TLP DWs into
+//     that area is done upstream by flit_payload_builder, so nothing is
+//     dropped (L6: the old 2008-bit payload threw away s_axis_tdata[511:472]
+//     of every 4th beat) and short TLPs are not stranded in fixed slots
+//     (L7: the old partial seal always wrote the last beat into slot 3).
+//   * The sequence number travels in the DLP bytes, not over the top of
+//     TLP data (L4).
+//   * Every Flit carries a piggy-backed ACK/NAK for the reverse direction
+//     in its DLP; if there is no payload to send but an ACK/NAK is pending,
+//     a control-only Flit (kind=1, TLP area all NOPs) is sent so the far
+//     end's replay buffer always drains (L3).
+//   * Protection is CRC-64 over TLP+DLP and real 3-way interleaved SEC-DED
+//     FEC (L8), laid out as 236/6/8/6 bytes like PCIe 6.0 (see flit_defs.vh).
+//   * m_sys_bus_ready from the PHY now stalls the 8-word serialiser
+//     (Seam C). The PHY can take as long as it needs per word.
+//   * Per-channel Flit assembly is gone: a Flit is a link-level container
+//     and TLPs from both streams share it. The TLP header carries the
+//     address, which is all the far end needs.
 //
-//   Output arbitration: round-robin between two sealed channels.
-//
-//   Per-channel back-pressure: s_axis_tready_ch[CH] de-asserts
-//   while ch_busy[CH]=1. The combined s_axis_tready is high when
-//   the presented channel (s_axis_tuser[0]) is ready.
-//
-// LT2 fix retained: partial FLITs zero-fill unwritten slots.
-// LT4 fix retained: out_cnt does not overflow past 7.
+// Timing: 1 cycle to latch, 1 cycle to compute CRC/FEC into a register,
+// then 8 bus words. Back-to-back Flits cost 10 cycles each with ready=1.
 // ============================================================
 
 module link_layer_tx #(
-    parameter AXIS_DATA_W  = 512,
-    parameter SYS_BUS_W    = 256,
-    parameter FLIT_BYTES   = 256,
-    parameter FLIT_BITS    = FLIT_BYTES * 8,
-    parameter TUSER_W      = 26,
-    parameter SOFF_W       = 24
+    parameter SYS_BUS_W = 256,
+    parameter SEQ_W     = 12
 )(
-    input  wire                    clk,
-    input  wire                    rst_n,
+    input  wire                 clk,
+    input  wire                 rst_n,
 
-    // Upstream AXI4-Stream 512-bit
-    // tuser[0]        = stream_id  (0=SmartNIC, 1=ML)
-    // tuser[SOFF_W:1] = session_offset
-    // tuser[TUSER_W-1]= tlast_flag
-    input  wire                    s_axis_tvalid,
-    input  wire [AXIS_DATA_W-1:0]  s_axis_tdata,
-    input  wire                    s_axis_tlast,
-    input  wire [TUSER_W-1:0]      s_axis_tuser,
-    output wire                    s_axis_tready,      // high when presented channel is ready
-    output wire [1:0]              s_axis_tready_ch,   // per-channel ready
+    // Payload Flit from replay buffer
+    input  wire                 s_valid,
+    input  wire [1887:0]        s_payload,       // 59 DW TLP area
+    input  wire [SEQ_W-1:0]     s_seq,
+    output wire                 s_ready,
 
-    // Downstream System-Synchronous 256-bit bus to PHY
-    output reg                     m_sys_bus_valid,
-    output reg  [SYS_BUS_W-1:0]    m_sys_bus_data,
-    output reg                     m_sys_bus_sof,
-    output reg                     m_sys_bus_eof
+    // ACK/NAK to piggy-back (from the receive-side scheduler)
+    input  wire                 ack_req,
+    input  wire                 nak_req,
+    input  wire [SEQ_W-1:0]     ackn_seq,
+    output wire                 ackn_taken,      // same-cycle: pending ACK/NAK is being loaded into a Flit
+
+    // System-synchronous 256-bit bus to PHY
+    output wire                 m_sys_bus_valid,
+    output wire [SYS_BUS_W-1:0] m_sys_bus_data,
+    output wire                 m_sys_bus_sof,
+    output wire                 m_sys_bus_eof,
+    input  wire                 m_sys_bus_ready
 );
 
-    localparam BEATS_PER_FLIT = 4;
-    localparam PAYLOAD_BITS   = 2008;
-    localparam NUM_CHANNELS   = 2;
+    `include "flit_defs.vh"
 
-    wire ch_sel = s_axis_tuser[0];
+    localparam ST_IDLE = 2'd0;
+    localparam ST_CALC = 2'd1;
+    localparam ST_SEND = 2'd2;
 
-    // ------------------------------------------------------------------
-    // Per-channel FLIT assembly state
-    // ------------------------------------------------------------------
-    reg [AXIS_DATA_W-1:0] flit_buf_ch [0:NUM_CHANNELS-1][0:BEATS_PER_FLIT-1];
-    reg [1:0]             beat_cnt_ch  [0:NUM_CHANNELS-1];
-    reg                   ch_busy      [0:NUM_CHANNELS-1];
-    reg [PAYLOAD_BITS-1:0] payload_ch  [0:NUM_CHANNELS-1];
+    reg [1:0]            state;
+    reg [FL_BODY_W-1:0]  body_r;      // TLP area + DLP
+    reg [FLIT_W-1:0]     flit_r;      // complete protected Flit
+    reg [2:0]            word_idx;
 
-    // ------------------------------------------------------------------
-    // CRC32
-    // ------------------------------------------------------------------
-    function [31:0] calc_crc32;
-        input [PAYLOAD_BITS-1:0] data;
-        integer i;
-        reg [31:0] crc;
+    wire have_ackn = ack_req || nak_req;
+
+    // Accept a payload Flit only when idle
+    assign s_ready = (state == ST_IDLE);
+
+    // DLP for whatever is loaded this cycle
+    function [FL_DLP_W-1:0] make_dlp;
+        input [1:0]       kind;
+        input [SEQ_W-1:0] seq;
+        input             ack_v;
+        input             nak_v;
+        input [SEQ_W-1:0] an_seq;
         begin
-            crc = 32'hFFFFFFFF;
-            for (i = 0; i < PAYLOAD_BITS; i = i + 1) begin
-                if ((crc[31] ^ data[i]) == 1'b1)
-                    crc = (crc << 1) ^ 32'h04C11DB7;
-                else
-                    crc = crc << 1;
-            end
-            calc_crc32 = ~crc;
+            make_dlp = {FL_DLP_W{1'b0}};
+            make_dlp[11:0]  = seq;
+            make_dlp[13:12] = kind;
+            make_dlp[14]    = ack_v;
+            make_dlp[15]    = nak_v;
+            make_dlp[27:16] = an_seq;
         end
     endfunction
 
-    // ------------------------------------------------------------------
-    // FEC parity
-    // ------------------------------------------------------------------
-    function [7:0] calc_fec;
-        input [PAYLOAD_BITS-1:0] d;
-        begin
-            calc_fec[0] = ^d[250:0];
-            calc_fec[1] = ^d[501:251];
-            calc_fec[2] = ^d[752:502];
-            calc_fec[3] = ^d[1003:753];
-            calc_fec[4] = ^d[1254:1004];
-            calc_fec[5] = ^d[1505:1255];
-            calc_fec[6] = ^d[1756:1506];
-            calc_fec[7] = ^d[2007:1757];
-        end
-    endfunction
+    // NAK wins over ACK if both are pending (NAK also acknowledges
+    // everything up to its sequence number).
+    wire send_nak = nak_req;
+    wire send_ack = ack_req && !nak_req;
 
-    // ------------------------------------------------------------------
-    // Per-channel back-pressure
-    // ------------------------------------------------------------------
-    assign s_axis_tready_ch[0] = !ch_busy[0];
-    assign s_axis_tready_ch[1] = !ch_busy[1];
-    assign s_axis_tready       =  s_axis_tready_ch[ch_sel];
+    // Combinational so the scheduler clears exactly the request that was
+    // sampled; a newer request arriving on the same edge wins over the clear.
+    assign ackn_taken = (state == ST_IDLE) && have_ackn;
 
-    // ------------------------------------------------------------------
-    // Output serialiser state
-    // ------------------------------------------------------------------
-    reg [2:0]              out_cnt;
-    reg                    out_busy;
-    reg                    out_ch;
-    reg [PAYLOAD_BITS-1:0] out_payload;
+    // CRC + FEC on the latched body
+    wire [63:0] body_crc = flit_crc64(body_r);
+    wire [47:0] body_fec = flit_fec_encode({body_crc, body_r});
 
-    wire [31:0] out_crc = calc_crc32(out_payload);
-    wire [7:0]  out_fec = calc_fec(out_payload);
-
-    // ------------------------------------------------------------------
-    // Round-robin arbiter
-    // ------------------------------------------------------------------
-    reg rr_last;
-
-    wire ch0_rdy = ch_busy[0];
-    wire ch1_rdy = ch_busy[1];
-    wire any_rdy = ch0_rdy || ch1_rdy;
-
-    wire next_ch = (ch0_rdy && ch1_rdy) ? !rr_last :
-                   ch1_rdy              ?  1'b1     :
-                                           1'b0;
-
-    // ------------------------------------------------------------------
-    // Per-channel FLIT assembly
-    // ------------------------------------------------------------------
-    integer c;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            for (c = 0; c < NUM_CHANNELS; c = c + 1) begin
-                beat_cnt_ch[c]    <= 2'd0;
-                ch_busy[c]        <= 1'b0;
-                payload_ch[c]     <= {PAYLOAD_BITS{1'b0}};
-                flit_buf_ch[c][0] <= {AXIS_DATA_W{1'b0}};
-                flit_buf_ch[c][1] <= {AXIS_DATA_W{1'b0}};
-                flit_buf_ch[c][2] <= {AXIS_DATA_W{1'b0}};
-                flit_buf_ch[c][3] <= {AXIS_DATA_W{1'b0}};
-            end
+            state      <= ST_IDLE;
+            body_r     <= {FL_BODY_W{1'b0}};
+            flit_r     <= {FLIT_W{1'b0}};
+            word_idx   <= 3'd0;
         end else begin
-            // Accept beat into the correct channel
-            if (s_axis_tvalid && s_axis_tready_ch[ch_sel]) begin
-                flit_buf_ch[ch_sel][beat_cnt_ch[ch_sel]] <= s_axis_tdata;
-
-                if (beat_cnt_ch[ch_sel] == 2'd3 || s_axis_tlast) begin
-                    // Seal FLIT with zero-fill for unwritten slots (LT2 fix)
-                    begin : seal
-                        reg [AXIS_DATA_W-1:0] b0, b1, b2;
-                        b0 = (beat_cnt_ch[ch_sel] >= 2'd1) ? flit_buf_ch[ch_sel][0] : {AXIS_DATA_W{1'b0}};
-                        b1 = (beat_cnt_ch[ch_sel] >= 2'd2) ? flit_buf_ch[ch_sel][1] : {AXIS_DATA_W{1'b0}};
-                        b2 = (beat_cnt_ch[ch_sel] >= 2'd3) ? flit_buf_ch[ch_sel][2] : {AXIS_DATA_W{1'b0}};
-                        payload_ch[ch_sel] <= {s_axis_tdata[471:0], b2, b1, b0};
+            case (state)
+                ST_IDLE: begin
+                    if (s_valid) begin
+                        body_r     <= {make_dlp(FLIT_KIND_PAYLOAD, s_seq, send_ack, send_nak, ackn_seq),
+                                       s_payload};
+                        state      <= ST_CALC;
+                    end else if (have_ackn) begin
+                        body_r     <= {make_dlp(FLIT_KIND_CONTROL, {SEQ_W{1'b0}}, send_ack, send_nak, ackn_seq),
+                                       {FL_TLP_W{1'b0}}};
+                        state      <= ST_CALC;
                     end
-                    ch_busy[ch_sel]     <= 1'b1;
-                    beat_cnt_ch[ch_sel] <= 2'd0;
-                end else begin
-                    beat_cnt_ch[ch_sel] <= beat_cnt_ch[ch_sel] + 1'b1;
                 end
-            end
-
-            // Release winning channel when serialiser picks it up
-            if (!out_busy && any_rdy)
-                ch_busy[next_ch] <= 1'b0;
+                ST_CALC: begin
+                    flit_r   <= {body_fec, body_crc, body_r};
+                    word_idx <= 3'd0;
+                    state    <= ST_SEND;
+                end
+                ST_SEND: begin
+                    if (m_sys_bus_ready) begin
+                        if (word_idx == 3'd7) state <= ST_IDLE;
+                        word_idx <= word_idx + 3'd1;
+                    end
+                end
+                default: state <= ST_IDLE;
+            endcase
         end
     end
 
-    // ------------------------------------------------------------------
-    // Output serialisation FSM
-    // ------------------------------------------------------------------
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            out_busy        <= 1'b0;
-            out_ch          <= 1'b0;
-            out_cnt         <= 3'd0;
-            rr_last         <= 1'b0;
-            out_payload     <= {PAYLOAD_BITS{1'b0}};
-            m_sys_bus_valid <= 1'b0;
-            m_sys_bus_data  <= {SYS_BUS_W{1'b0}};
-            m_sys_bus_sof   <= 1'b0;
-            m_sys_bus_eof   <= 1'b0;
-        end else begin
-            m_sys_bus_valid <= 1'b0;
-            m_sys_bus_sof   <= 1'b0;
-            m_sys_bus_eof   <= 1'b0;
+    assign m_sys_bus_valid = (state == ST_SEND);
+    assign m_sys_bus_data  = flit_r[word_idx*SYS_BUS_W +: SYS_BUS_W];
+    assign m_sys_bus_sof   = (state == ST_SEND) && (word_idx == 3'd0);
+    assign m_sys_bus_eof   = (state == ST_SEND) && (word_idx == 3'd7);
 
-            if (!out_busy) begin
-                if (any_rdy) begin
-                    out_ch      <= next_ch;
-                    out_payload <= payload_ch[next_ch];
-                    rr_last     <= next_ch;
-                    out_busy    <= 1'b1;
-                    out_cnt     <= 3'd0;
-                end
-            end else begin
-                m_sys_bus_valid <= 1'b1;
-                m_sys_bus_sof   <= (out_cnt == 3'd0);
-                m_sys_bus_eof   <= (out_cnt == 3'd7);
-
-                case (out_cnt)
-                    3'd0: m_sys_bus_data <= out_payload[255:0];
-                    3'd1: m_sys_bus_data <= out_payload[511:256];
-                    3'd2: m_sys_bus_data <= out_payload[767:512];
-                    3'd3: m_sys_bus_data <= out_payload[1023:768];
-                    3'd4: m_sys_bus_data <= out_payload[1279:1024];
-                    3'd5: m_sys_bus_data <= out_payload[1535:1280];
-                    3'd6: m_sys_bus_data <= out_payload[1791:1536];
-                    3'd7: begin
-                        // [215:0]=payload tail [247:216]=CRC32 [255:248]=FEC
-                        m_sys_bus_data <= {out_fec, out_crc, out_payload[2007:1792]};
-                        out_busy <= 1'b0;
-                    end
-                endcase
-
-                // LT4 fix: explicit reset, no overflow past 7
-                if (out_cnt != 3'd7)
-                    out_cnt <= out_cnt + 1'b1;
-                else
-                    out_cnt <= 3'd0;
-            end
-        end
+    // synthesis translate_off
+    initial begin
+        if (SYS_BUS_W * 8 != FLIT_W)
+            $fatal(1, "[link_layer_tx] SYS_BUS_W (%0d) * 8 must equal the 2048-bit Flit", SYS_BUS_W);
     end
-
-`ifdef SIMULATION
-always @(posedge clk) begin
-    if (s_axis_tvalid && ch_busy[ch_sel] && s_axis_tready_ch[ch_sel])
-        $error("[link_layer_tx] Beat accepted on ch%0d while ch_busy=1", ch_sel);
-end
-`endif
+    // synthesis translate_on
 
 endmodule
