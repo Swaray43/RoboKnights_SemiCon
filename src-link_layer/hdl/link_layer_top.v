@@ -1,144 +1,112 @@
 `timescale 1ns/1ps
- 
+
 // ============================================================
-// Module : link_phy_bridge_top
-// Layer  : glue between the link layer (Swaray) and the protocol-to-PHY
-//          layer (Kshitij) -- the module bridge_top.v has always expected
-//          to instantiate under this exact name/port list, but which
-//          never actually existed as a project doc until now.
+// Module : link_layer_top
+// Layer  : Link layer (Swaray) -- single top-level module
 //
-// What this wires together
+// Wraps stream_tx_path_top (TX MWr chain + Flit-mode DLL: replay, CRC-64,
+// FEC, ACK/NAK) and adds the RX decode: unpack the wide inbound TLP stream
+// to 32-bit DWs, parse it with tlp_header_parser, and run it through
+// pcie_rx_engine (reorder buffer + address translator inside) to produce
+// AXI BAR0 writes (m_axi_aw*).
 //
-//   interconnect_top --s_axis_*--> [ this module ] --tx_level/rx_level--> SerDes
-//                                        |
-//                        link_layer_top (Swaray: TX chain + Flit DLL +
-//                        the new RX decode -- see link_layer_top.v) on one
-//                        side, pcie_phy_top (Kshitij: training, reset,
-//                        config space, BAR0/MSI-X regs, PHY datapath) on
-//                        the other, joined at:
-//                          * phy_tx_*/phy_rx_*        (Flit <-> PAM4 PHY)
-//                          * cfg_base_addr_ch0/ch1/wr (session arm -> DMA base)
-//                          * msix: mwr_* <-> msix_req_*, session_done
+// This module issues no non-posted (MRd) requests of its own -- the stream
+// path is MWr-only -- so pcie_rx_engine's tag-allocation input is tied off
+// and its completion stream is exposed but never fires.
 //
-// cfg_base_addr arbitration
-//   pcie_phy_top exposes TWO base-address write pulses (one per stream),
-//   but link_layer_top's config port is a single {id, data, wr} write
-//   (it forwards straight into stream_tx_path_top -> address_translation,
-//   which only has one such port, shared by both streams via the id
-//   field). If both channels arm in the same cycle, channel 0 is served
-//   immediately and channel 1 is deferred one cycle (pend1), the same
-//   collision-handling shape pcie_phy_top's own MSI-X arbiter uses
-//   (done_pend). base_addr_latched is already stable on pcie_phy_top's
-//   side by the time this pulses, so a one-cycle defer loses nothing.
+// RX unpacker note
+//   Sizes each beat from its own TKEEP (popcount/4), because rx_tlp_delimiter
+//   emits real byte enables on the final beat of a TLP.
+//   Throughput: one DW per clk (a full 512-bit beat drains in 16 clk). When
+//   inbound traffic is faster than that, the DLL's RX FIFO fills and the
+//   link NAKs -> replay. Fine for host->device register writes; a Phase 2
+//   item if inbound bulk traffic is ever needed (widen the parser).
 //
-// Known follow-up (flagged, not fixed here)
-//   link_layer_top's inbound-MWr decode window (cfg_window_base/mask,
-//   cfg_axi_base) has no config-space source yet -- pcie_config_space /
-//   bar0_dma_regs don't expose a BAR0 window register today. Until they
-//   do, the window is fixed by the WINDOW_* / AXI_BASE_DEFAULT parameters
-//   below rather than a port, so this module's own port list doesn't
-//   have to change later -- override the parameters at this instance if
-//   a different window is needed.
-//   Likewise m_axi_awready has no real BAR0-write slave wired to it yet
-//   (bar0_dma_regs only takes the external/cocotb-driven bar0_wr_en path
-//   today) -- it's tied high here so the decode never stalls. Wiring the
-//   decoded m_axi_awvalid/awaddr into bar0_dma_regs as a second write
-//   source is a pcie_phy_top change, out of scope for this glue module.
+// mon_rx_axis_* : observe-only copy of each inbound beat the decode accepts
+//   (used by bridge_top's testbenches as the TLP checker tap).
 // ============================================================
- 
-module link_phy_bridge_top #(
-    parameter DATA_W     = 512,
-    parameter KEEP_W     = DATA_W / 8,
-    parameter SOFF_W     = 24,
-    parameter TUSER_W    = SOFF_W + 2,     // {tlast_flag, session_offset, stream_id}
-    parameter NUM_STREAMS = 2,
-    parameter SYS_BUS_W  = 256,
-    parameter AXI_ADDR_W = 32,
-    parameter WW         = 8,              // arbiter weight width  (interconnect_top)
-    parameter LW         = 24,             // session limit width   (interconnect_top)
- 
-    // Inbound-MWr decode window (see "Known follow-up" above)
-    parameter [63:0]        WINDOW_BASE      = 64'h0000_0001_0000_0000,
-    parameter [63:0]        WINDOW_MASK      = 64'hFFFF_FFFF_0000_0000,
-    parameter [AXI_ADDR_W-1:0] AXI_BASE_DEFAULT = 32'h2000_0000
+
+module link_layer_top #(
+    // -- stream_tx_path_top / DLL parameters (passed straight through) --
+    parameter DATA_W          = 512,
+    parameter KEEP_W          = DATA_W / 8,
+    parameter TUSER_W         = 26,
+    parameter SOFF_W          = 24,
+    parameter ADDR_W          = 64,     // PCIe host address width
+    parameter LEN_W           = 11,
+    parameter NUM_STREAMS     = 2,
+    parameter MAX_PAYLOAD_DW  = 64,
+    parameter [15:0] REQ_ID   = 16'h0200,
+    parameter FIFO_D          = 16,
+    parameter HWM             = 12,
+    parameter SYS_BUS_W       = 256,
+    parameter SEQ_WIDTH       = 12,
+    parameter AXIS_DATA_W     = 512,
+    parameter REPLAY_DEPTH    = 32,
+    parameter REPLAY_TIMEOUT  = 16384,
+    parameter FLIT_IDLE_FLUSH = 8,
+
+    // -- RX decode parameters (pcie_rx_engine / tlp_header_parser) --
+    parameter TAG_WIDTH      = 10,
+    parameter MAX_DW_PER_REQ = 16,
+    parameter AXI_ADDR_W     = 32
 )(
-    input  wire              clk,
-    input  wire              perst_n,
-    input  wire              aclk,
-    input  wire              aclk_rst_n,
- 
-    // ---- Upstream AXI4-Stream (from interconnect_top) ----
+    input  wire clk,
+    input  wire rst_n,
+
+    // ---- Upstream AXI4-Stream (from the interconnect) ----
     input  wire [DATA_W-1:0]   s_axis_tdata,
     input  wire [KEEP_W-1:0]   s_axis_tkeep,
-    input  wire [SOFF_W:0]     ic_tuser,        // {session_offset, stream_id}, no tlast bit yet
+    input  wire [TUSER_W-1:0]  s_axis_tuser,   // {tlast_flag, session_offset, stream_id}
     input  wire                s_axis_tlast,
     input  wire                s_axis_tvalid,
     output wire                s_axis_tready,
- 
-    // ---- Inbound TLPs (host -> device), decoded raw bytes, pre-BAR0 ----
-    output wire                     m_rx_axis_tvalid,
-    output wire [DATA_W-1:0]        m_rx_axis_tdata,
-    output wire [KEEP_W-1:0]        m_rx_axis_tkeep,
-    output wire                     m_rx_axis_tlast,
-    input  wire                     m_rx_axis_tready,
- 
-    // ---- Training / reset sideband (straight to pcie_phy_top) ----
-    input  wire         ts_byte_valid,
-    input  wire [7:0]   ts_byte_l0, ts_byte_l1, ts_byte_l2, ts_byte_l3,
-    output wire         link_trained,
-    output wire         lane_reversed_locked,
-    input  wire         hot_reset_request,
-    input  wire         flr_request,
-    input  wire         updatefc_received,
-    output wire         datapath_rst_n,
-    output wire         axi_rst_n,
-    output wire         flr_active,
- 
-    // ---- Config-space CfgRd/CfgWr (straight to pcie_phy_top) ----
-    input  wire         cfg_wr_en,
-    input  wire         cfg_rd_en,
-    input  wire [11:0]  cfg_addr,
-    input  wire [31:0]  cfg_wdata,
-    output wire [31:0]  cfg_rdata,
-    output wire         cfg_cpl_valid,
- 
-    // ---- MSI-X table/PBA (straight to pcie_phy_top) ----
-    input  wire         tbl_wr_en,
-    input  wire [2:0]   tbl_wr_vec,
-    input  wire [63:0]  tbl_wr_addr,
-    input  wire [31:0]  tbl_wr_data,
-    input  wire         tbl_wr_mask,
-    input  wire         tbl_rd_en,
-    input  wire [2:0]   tbl_rd_vec,
-    output wire [63:0]  tbl_rd_addr,
-    output wire [31:0]  tbl_rd_data,
-    output wire         tbl_rd_mask,
-    output wire [7:0]   pba,
-    input  wire         dma_complete_pulse,
-    input  wire [2:0]   dma_complete_vector,
- 
-    // ---- BAR0 DMA registers, external/test access (straight to pcie_phy_top) ----
-    input  wire         bar0_wr_en,
-    input  wire         bar0_rd_en,
-    input  wire [11:0]  bar0_addr,
-    input  wire [31:0]  bar0_wdata,
-    output wire [31:0]  bar0_rdata,
-    output wire         bar0_rd_valid,
- 
-    // ---- SerDes symbol bus ----
-    output wire [11:0]  tx_level,
-    output wire [3:0]   tx_level_valid,
-    input  wire [11:0]  rx_level,
-    input  wire [3:0]   rx_level_valid,
- 
-    // ---- Session handshake with the interconnect (aclk domain) ----
-    output wire [NUM_STREAMS-1:0] session_start_aclk,
-    input  wire [NUM_STREAMS-1:0] session_end_aclk,
-    input  wire [NUM_STREAMS-1:0] session_overflow_aclk,
-    output wire [WW-1:0]          arb_weight_ch0,
-    output wire [WW-1:0]          arb_weight_ch1,
-    output wire [LW-1:0]          session_limit,
- 
+
+    // ---- Config-space: per-stream DMA base address ----
+    input  wire                            cfg_base_addr_wr,
+    input  wire [$clog2(NUM_STREAMS)-1:0]  cfg_base_addr_id,
+    input  wire [ADDR_W-1:0]               cfg_base_addr_data,
+    input  wire                            cfg_base_addr_clr,
+
+    // ---- Config-space: inbound MWr -> AXI BAR0 window ----
+    input  wire [ADDR_W-1:0]     cfg_window_base,
+    input  wire [ADDR_W-1:0]     cfg_window_mask,
+    input  wire [AXI_ADDR_W-1:0] cfg_axi_base,
+
+    // ---- MSI-X MWr injection ----
+    input  wire                    msix_req_valid,
+    input  wire [ADDR_W-1:0]       msix_req_addr,
+    input  wire [31:0]             msix_req_data,
+    output wire                    msix_req_ready,
+    output wire [NUM_STREAMS-1:0]  session_done,
+
+    // ---- PHY TX ----
+    output wire                   phy_tx_valid,
+    output wire [SYS_BUS_W-1:0]   phy_tx_data,
+    output wire                   phy_tx_sof,
+    output wire                   phy_tx_eof,
+    input  wire                   phy_tx_ready,
+
+    // ---- PHY RX ----
+    input  wire                   phy_rx_valid,
+    input  wire [SYS_BUS_W-1:0]   phy_rx_data,
+    input  wire                   phy_rx_sof,
+    input  wire                   phy_rx_eof,
+
+    // ---- Decoded inbound MWr -> AXI write address channel (host -> BAR0) ----
+    output wire                    m_axi_awvalid,
+    output wire [AXI_ADDR_W-1:0]   m_axi_awaddr,
+    output wire                    m_axi_awerr,
+    input  wire                    m_axi_awready,
+
+    // ---- Inbound completions (unused on this path -- see header note) ----
+    output wire        cpl_tvalid,
+    output wire [31:0] cpl_tdata,
+    output wire        cpl_tlast,
+    output wire [3:0]  cpl_tkeep,
+    output wire        cpl_tuser,
+    input  wire        cpl_tready,
+
     // ---- Status ----
     output wire  err_xlat_miss,
     output wire  err_addr_ovf,
@@ -148,205 +116,263 @@ module link_phy_bridge_top #(
     output wire  fec_err,
     output wire  fec_corrected,
     output wire  replay_event,
-    output wire  phy_tx_idle,
-    output wire  phy_framing_err,
-    output wire  phy_lane_err,
- 
-    // ---- Decoded inbound MWr -> AXI BAR0 write (new; not yet consumed by
-    //      bridge_top.v -- see "Known follow-up" above) ----
-    output wire                   m_axi_awvalid,
-    output wire [AXI_ADDR_W-1:0]  m_axi_awaddr,
-    output wire                   m_axi_awerr,
-    output wire                   malformed_tlp_err
+    output wire  malformed_tlp_err,
+
+    // ---- Monitor tap: inbound TLP byte stream, one pulse per beat the RX
+    //      decode accepts (observe-only, no backpressure) ----
+    output wire                     mon_rx_axis_tvalid,
+    output wire [AXIS_DATA_W-1:0]   mon_rx_axis_tdata,
+    output wire [AXIS_DATA_W/8-1:0] mon_rx_axis_tkeep,
+    output wire                     mon_rx_axis_tlast
 );
- 
-    // synthesis translate_off
-    initial begin
-        if (TUSER_W != SOFF_W + 2)
-            $fatal(1, "[link_phy_bridge_top] TUSER_W (%0d) must equal SOFF_W+2 (%0d)",
-                   TUSER_W, SOFF_W + 2);
-    end
-    // synthesis translate_on
- 
+
     // ================================================================
-    // 1. pcie_phy_top -- Kshitij's layer (training, reset, config space,
-    //    BAR0/MSI-X regs, PHY datapath)
+    // 1. stream_tx_path_top -- TX (MWr) chain + Flit-mode DLL
     // ================================================================
-    wire                   phy_tx_valid, phy_tx_sof, phy_tx_eof, phy_tx_ready;
-    wire [SYS_BUS_W-1:0]   phy_tx_data;
-    wire                   phy_rx_valid, phy_rx_sof, phy_rx_eof;
-    wire [SYS_BUS_W-1:0]   phy_rx_data;
- 
-    wire [63:0] pt_base_ch0, pt_base_ch1;
-    wire [1:0]  pt_base_wr;
-    wire [2:0]  pt_tc_ch0, pt_tc_ch1;           // not consumed by link_layer_top today
-    wire [1:0]  pt_session_valid;               // not consumed by link_layer_top today
- 
-    wire        pt_mwr_valid;
-    wire [63:0] pt_mwr_addr;
-    wire [31:0] pt_mwr_data;
-    wire        pt_mwr_ready;
- 
-    wire [1:0]  ll_session_done;
- 
-    pcie_phy_top #(
-        .WW(WW), .LW(LW)
-    ) u_pcie_phy_top (
+    wire                     rx_wide_valid;
+    wire [AXIS_DATA_W-1:0]   rx_wide_data;
+    wire [AXIS_DATA_W/8-1:0] rx_wide_keep;
+    wire                     rx_wide_last;
+    wire                     rx_wide_ready;
+
+    stream_tx_path_top #(
+        .DATA_W         (DATA_W),
+        .KEEP_W         (KEEP_W),
+        .TUSER_W        (TUSER_W),
+        .SOFF_W         (SOFF_W),
+        .ADDR_W         (ADDR_W),
+        .LEN_W          (LEN_W),
+        .NUM_STREAMS    (NUM_STREAMS),
+        .MAX_PAYLOAD_DW (MAX_PAYLOAD_DW),
+        .REQ_ID         (REQ_ID),
+        .FIFO_D         (FIFO_D),
+        .HWM            (HWM),
+        .SYS_BUS_W      (SYS_BUS_W),
+        .SEQ_WIDTH      (SEQ_WIDTH),
+        .AXIS_DATA_W    (AXIS_DATA_W),
+        .REPLAY_DEPTH   (REPLAY_DEPTH),
+        .REPLAY_TIMEOUT (REPLAY_TIMEOUT),
+        .FLIT_IDLE_FLUSH(FLIT_IDLE_FLUSH)
+    ) u_stream_tx_path_top (
         .clk               (clk),
-        .perst_n           (perst_n),
- 
-        .ts_byte_valid     (ts_byte_valid),
-        .ts_byte_l0        (ts_byte_l0), .ts_byte_l1(ts_byte_l1),
-        .ts_byte_l2        (ts_byte_l2), .ts_byte_l3(ts_byte_l3),
-        .link_trained      (link_trained),
-        .lane_reversed_locked(lane_reversed_locked),
- 
-        .hot_reset_request (hot_reset_request),
-        .flr_request       (flr_request),
-        .updatefc_received (updatefc_received),
-        .datapath_rst_n    (datapath_rst_n),
-        .axi_rst_n         (axi_rst_n),
-        .flr_active        (flr_active),
- 
-        .cfg_wr_en         (cfg_wr_en), .cfg_rd_en(cfg_rd_en),
-        .cfg_addr          (cfg_addr), .cfg_wdata(cfg_wdata),
-        .cfg_rdata         (cfg_rdata), .cfg_cpl_valid(cfg_cpl_valid),
- 
-        .tbl_wr_en         (tbl_wr_en), .tbl_wr_vec(tbl_wr_vec),
-        .tbl_wr_addr       (tbl_wr_addr), .tbl_wr_data(tbl_wr_data), .tbl_wr_mask(tbl_wr_mask),
-        .tbl_rd_en         (tbl_rd_en), .tbl_rd_vec(tbl_rd_vec),
-        .tbl_rd_addr       (tbl_rd_addr), .tbl_rd_data(tbl_rd_data), .tbl_rd_mask(tbl_rd_mask),
-        .pba               (pba),
-        .dma_complete_pulse(dma_complete_pulse), .dma_complete_vector(dma_complete_vector),
- 
-        .mwr_valid         (pt_mwr_valid), .mwr_ready(pt_mwr_ready),
-        .mwr_addr          (pt_mwr_addr),  .mwr_data (pt_mwr_data),
- 
-        .phy_tx_data       (phy_tx_data), .phy_tx_valid(phy_tx_valid),
-        .phy_tx_sof        (phy_tx_sof),  .phy_tx_eof(phy_tx_eof), .phy_tx_ready(phy_tx_ready),
-        .tx_level          (tx_level), .tx_level_valid(tx_level_valid),
-        .rx_level          (rx_level), .rx_level_valid(rx_level_valid),
-        .phy_rx_data       (phy_rx_data), .phy_rx_valid(phy_rx_valid),
-        .phy_rx_sof        (phy_rx_sof),  .phy_rx_eof(phy_rx_eof),
-        .phy_tx_idle       (phy_tx_idle), .phy_framing_err(phy_framing_err), .phy_lane_err(phy_lane_err),
- 
-        .bar0_wr_en        (bar0_wr_en), .bar0_rd_en(bar0_rd_en), .bar0_addr(bar0_addr),
-        .bar0_wdata        (bar0_wdata), .bar0_rdata(bar0_rdata), .bar0_rd_valid(bar0_rd_valid),
- 
-        .cfg_base_addr_ch0 (pt_base_ch0), .cfg_base_addr_ch1(pt_base_ch1),
-        .cfg_base_addr_wr  (pt_base_wr),
-        .cfg_tc_ch0        (pt_tc_ch0),   .cfg_tc_ch1(pt_tc_ch1),
-        .session_valid     (pt_session_valid),
-        .session_done      (ll_session_done),
- 
-        .aclk              (aclk), .aclk_rst_n(aclk_rst_n),
-        .session_start_aclk(session_start_aclk),
-        .session_end_aclk  (session_end_aclk),
-        .session_overflow_aclk(session_overflow_aclk),
-        .arb_weight_ch0    (arb_weight_ch0), .arb_weight_ch1(arb_weight_ch1),
-        .session_limit     (session_limit)
-    );
- 
-    // ================================================================
-    // 2. cfg_base_addr arbiter -- two per-channel pulses from
-    //    pcie_phy_top down to link_layer_top's single {id,data,wr} port
-    //    (see header comment)
-    // ================================================================
-    reg pend1;
-    wire serve0 = pt_base_wr[0];
-    wire serve1 = !serve0 && (pt_base_wr[1] || pend1);
- 
-    always @(posedge clk or negedge datapath_rst_n) begin
-        if (!datapath_rst_n)       pend1 <= 1'b0;
-        else if (serve1)          pend1 <= 1'b0;
-        else if (pt_base_wr[1])   pend1 <= 1'b1;
-    end
- 
-    wire                                   ll_cfg_base_addr_wr   = serve0 || serve1;
-    wire [$clog2(NUM_STREAMS)-1:0]         ll_cfg_base_addr_id   = serve1 ? 1'b1 : 1'b0;
-    wire [63:0]                             ll_cfg_base_addr_data = serve1 ? pt_base_ch1 : pt_base_ch0;
- 
-    // ================================================================
-    // 3. link_layer_top -- Swaray's layer: TX stream chain + Flit DLL +
-    //    the new RX decode (unpacker -> tlp_header_parser -> pcie_rx_engine)
-    // ================================================================
-    wire [TUSER_W-1:0] ll_s_axis_tuser = {s_axis_tlast, ic_tuser};  // add tlast_flag mirror bit
- 
-    link_layer_top #(
-        .DATA_W      (DATA_W),
-        .KEEP_W      (KEEP_W),
-        .TUSER_W     (TUSER_W),
-        .SOFF_W      (SOFF_W),
-        .NUM_STREAMS (NUM_STREAMS),
-        .SYS_BUS_W   (SYS_BUS_W),
-        .AXIS_DATA_W (DATA_W),
-        .AXI_ADDR_W  (AXI_ADDR_W)
-    ) u_link_layer_top (
-        .clk                (clk),
-        .rst_n              (datapath_rst_n),
- 
-        .s_axis_tdata       (s_axis_tdata),
-        .s_axis_tkeep       (s_axis_tkeep),
-        .s_axis_tuser       (ll_s_axis_tuser),
-        .s_axis_tlast       (s_axis_tlast),
-        .s_axis_tvalid      (s_axis_tvalid),
-        .s_axis_tready      (s_axis_tready),
- 
-        .cfg_base_addr_wr   (ll_cfg_base_addr_wr),
-        .cfg_base_addr_id   (ll_cfg_base_addr_id),
-        .cfg_base_addr_data (ll_cfg_base_addr_data),
-        .cfg_base_addr_clr  (1'b0),
- 
-        .cfg_window_base    (WINDOW_BASE),
-        .cfg_window_mask    (WINDOW_MASK),
-        .cfg_axi_base       (AXI_BASE_DEFAULT),
- 
-        .msix_req_valid     (pt_mwr_valid),
-        .msix_req_addr      (pt_mwr_addr),
-        .msix_req_data      (pt_mwr_data),
-        .msix_req_ready     (pt_mwr_ready),
-        .session_done       (ll_session_done),
- 
-        .phy_tx_valid       (phy_tx_valid),
-        .phy_tx_data        (phy_tx_data),
-        .phy_tx_sof         (phy_tx_sof),
-        .phy_tx_eof         (phy_tx_eof),
-        .phy_tx_ready       (phy_tx_ready),
- 
-        .phy_rx_valid       (phy_rx_valid),
-        .phy_rx_data        (phy_rx_data),
-        .phy_rx_sof         (phy_rx_sof),
-        .phy_rx_eof         (phy_rx_eof),
- 
-        .m_axi_awvalid      (m_axi_awvalid),
-        .m_axi_awaddr       (m_axi_awaddr),
-        .m_axi_awerr        (m_axi_awerr),
-        .m_axi_awready      (1'b1),           // no BAR0-write slave wired yet -- see header note
- 
-        .cpl_tvalid         (/* unused -- MWr-only path, never fires */),
-        .cpl_tdata          (/* unused */),
-        .cpl_tlast          (/* unused */),
-        .cpl_tkeep          (/* unused */),
-        .cpl_tuser          (/* unused */),
-        .cpl_tready         (1'b1),
- 
-        .err_xlat_miss      (err_xlat_miss),
-        .err_addr_ovf       (err_addr_ovf),
+        .rst_n             (rst_n),
+
+        .s_axis_tdata      (s_axis_tdata),
+        .s_axis_tkeep      (s_axis_tkeep),
+        .s_axis_tuser      (s_axis_tuser),
+        .s_axis_tlast      (s_axis_tlast),
+        .s_axis_tvalid     (s_axis_tvalid),
+        .s_axis_tready     (s_axis_tready),
+
+        .cfg_base_addr_wr  (cfg_base_addr_wr),
+        .cfg_base_addr_id  (cfg_base_addr_id),
+        .cfg_base_addr_data(cfg_base_addr_data),
+        .cfg_base_addr_clr (cfg_base_addr_clr),
+
+        .msix_req_valid    (msix_req_valid),
+        .msix_req_addr     (msix_req_addr),
+        .msix_req_data     (msix_req_data),
+        .msix_req_ready    (msix_req_ready),
+        .session_done      (session_done),
+
+        .phy_tx_valid      (phy_tx_valid),
+        .phy_tx_data       (phy_tx_data),
+        .phy_tx_sof        (phy_tx_sof),
+        .phy_tx_eof        (phy_tx_eof),
+        .phy_tx_ready      (phy_tx_ready),
+
+        .phy_rx_valid      (phy_rx_valid),
+        .phy_rx_data       (phy_rx_data),
+        .phy_rx_sof        (phy_rx_sof),
+        .phy_rx_eof        (phy_rx_eof),
+
+        .m_rx_axis_tvalid  (rx_wide_valid),
+        .m_rx_axis_tdata   (rx_wide_data),
+        .m_rx_axis_tkeep   (rx_wide_keep),
+        .m_rx_axis_tlast   (rx_wide_last),
+        .m_rx_axis_tready  (rx_wide_ready),
+
+        .err_xlat_miss     (err_xlat_miss),
+        .err_addr_ovf      (err_addr_ovf),
         .stat_split_occurred(stat_split_occurred),
-        .err_tkeep_gap      (err_tkeep_gap),
-        .crc_err            (crc_err),
-        .fec_err            (fec_err),
-        .fec_corrected      (fec_corrected),
-        .replay_event       (replay_event),
-        .malformed_tlp_err  (malformed_tlp_err)
+        .err_tkeep_gap     (err_tkeep_gap),
+        .crc_err           (crc_err),
+        .fec_err           (fec_err),
+        .fec_corrected     (fec_corrected),
+        .replay_event      (replay_event)
     );
- 
-    // RX TLP stream out of the link layer (raw bytes, not yet BAR0-decoded
-    // on the m_rx_axis_* path -- that happens via m_axi_awvalid above;
-    // m_rx_axis_* is kept for whatever still consumes the raw byte stream).
-    assign m_rx_axis_tvalid = 1'b0;
-    assign m_rx_axis_tdata  = {DATA_W{1'b0}};
-    assign m_rx_axis_tkeep  = {KEEP_W{1'b0}};
-    assign m_rx_axis_tlast  = 1'b0;
- 
+
+    // ================================================================
+    // 2. RX wide-to-32bit unpacker, sized from TKEEP (not a fixed 16 DW)
+    // ================================================================
+    localparam RX_WORDS_PER_BEAT = AXIS_DATA_W / 32;
+    localparam RX_WIDX_W = $clog2(RX_WORDS_PER_BEAT) + 1;
+
+    function automatic [RX_WIDX_W-1:0] dw_count_from_keep;
+        input [AXIS_DATA_W/8-1:0] keep;
+        integer i;
+        reg [RX_WIDX_W+1:0] byte_cnt;
+        begin
+            byte_cnt = 0;
+            for (i = 0; i < AXIS_DATA_W/8; i = i + 1)
+                byte_cnt = byte_cnt + keep[i];
+            dw_count_from_keep = byte_cnt[RX_WIDX_W+1:2] +
+                                  (|byte_cnt[1:0] ? 1'b1 : 1'b0);
+        end
+    endfunction
+
+    reg [AXIS_DATA_W-1:0] rx_shift;
+    reg [RX_WIDX_W-1:0]   rx_dw_total;   // valid DWs in the beat being drained
+    reg [RX_WIDX_W-1:0]   rx_dw_idx;     // DWs already emitted from this beat
+    reg                   rx_beat_last;  // this beat is the TLP's tlast beat
+    reg                   rx_busy;
+    reg                   rx_next_is_new_tlp;
+
+    assign rx_wide_ready = !rx_busy;
+
+    assign mon_rx_axis_tvalid = rx_wide_valid && rx_wide_ready;
+    assign mon_rx_axis_tdata  = rx_wide_data;
+    assign mon_rx_axis_tkeep  = rx_wide_keep;
+    assign mon_rx_axis_tlast  = rx_wide_last;
+
+    wire rx_word_valid = rx_busy && (rx_dw_total != {RX_WIDX_W{1'b0}});
+    wire rx_word_sof   = rx_word_valid && (rx_dw_idx == {RX_WIDX_W{1'b0}}) &&
+                         rx_next_is_new_tlp;
+    wire rx_word_eof   = rx_word_valid && (rx_dw_idx == rx_dw_total - 1'b1) &&
+                         rx_beat_last;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            rx_shift            <= {AXIS_DATA_W{1'b0}};
+            rx_dw_total         <= {RX_WIDX_W{1'b0}};
+            rx_dw_idx           <= {RX_WIDX_W{1'b0}};
+            rx_beat_last        <= 1'b0;
+            rx_busy             <= 1'b0;
+            rx_next_is_new_tlp  <= 1'b1;
+        end else if (rx_busy) begin
+            if (rx_dw_total == {RX_WIDX_W{1'b0}}) begin
+                rx_busy <= 1'b0;
+                if (rx_beat_last) rx_next_is_new_tlp <= 1'b1;
+            end else begin
+                rx_shift <= rx_shift >> 32;
+                if (rx_dw_idx == rx_dw_total - 1'b1) begin
+                    rx_busy   <= 1'b0;
+                    rx_dw_idx <= {RX_WIDX_W{1'b0}};
+                    if (rx_beat_last) rx_next_is_new_tlp <= 1'b1;
+                end else begin
+                    rx_dw_idx          <= rx_dw_idx + 1'b1;
+                    rx_next_is_new_tlp <= 1'b0;
+                end
+            end
+        end else if (rx_wide_valid) begin
+            rx_shift     <= rx_wide_data;
+            rx_dw_total  <= dw_count_from_keep(rx_wide_keep);
+            rx_dw_idx    <= {RX_WIDX_W{1'b0}};
+            rx_beat_last <= rx_wide_last;
+            rx_busy      <= 1'b1;
+        end
+    end
+
+    // ================================================================
+    // 3. TLP header parser
+    // ================================================================
+    wire        parsed_rx_valid, parsed_rx_sof, parsed_rx_eof;
+    wire [31:0] parsed_rx_data;
+    wire [4:0]  parsed_type;
+    wire [9:0]  parsed_length_dw;
+    wire [TAG_WIDTH-1:0] parsed_tag;
+    wire [6:0]  parsed_lower_addr;
+    wire [2:0]  parsed_cpl_status;
+    wire [ADDR_W-1:0] parsed_addr;
+    wire        parsed_hdr_done;
+
+    tlp_header_parser #(
+        .TAG_WIDTH  (TAG_WIDTH),
+        .PCIE_ADDR_W(ADDR_W)
+    ) u_tlp_header_parser (
+        .clk              (clk),
+        .rst_n            (rst_n),
+        .rx_tlp_valid     (rx_word_valid),
+        .rx_tlp_data      (rx_shift[31:0]),
+        .rx_tlp_sof       (rx_word_sof),
+        .rx_tlp_eof       (rx_word_eof),
+        .parsed_rx_valid  (parsed_rx_valid),
+        .parsed_rx_sof    (parsed_rx_sof),
+        .parsed_rx_eof    (parsed_rx_eof),
+        .parsed_rx_data   (parsed_rx_data),
+        .parsed_type      (parsed_type),
+        .parsed_length_dw (parsed_length_dw),
+        .parsed_tag       (parsed_tag),
+        .parsed_lower_addr(parsed_lower_addr),
+        .parsed_cpl_status(parsed_cpl_status),
+        .parsed_addr      (parsed_addr),
+        .parsed_hdr_done  (parsed_hdr_done)
+    );
+
+    // ================================================================
+    // 4. pcie_rx_engine -- MWr decode to AXI BAR0
+    // ================================================================
+    pcie_rx_engine #(
+        .TAG_WIDTH     (TAG_WIDTH),
+        .MAX_DW_PER_REQ(MAX_DW_PER_REQ),
+        .PCIE_ADDR_W   (ADDR_W),
+        .AXI_ADDR_W    (AXI_ADDR_W),
+        .REQ_ON_HDR_DONE(1)
+    ) u_pcie_rx_engine (
+        .clk               (clk),
+        .rst_n             (rst_n),
+
+        .tlp_rx_valid      (parsed_rx_valid),
+        .tlp_rx_sof        (parsed_rx_sof),
+        .tlp_rx_eof        (parsed_rx_eof),
+        .tlp_rx_data       (parsed_rx_data),
+
+        .tlp_type          (parsed_type),
+        .tlp_length_dw     (parsed_length_dw),
+        .tlp_tag           (parsed_tag),
+        .tlp_lower_addr    (parsed_lower_addr),
+        .tlp_cpl_status    (parsed_cpl_status),
+        .tlp_addr          (parsed_addr),
+        .tlp_hdr_done      (parsed_hdr_done),
+
+        // No MRd source on this (MWr-only) path
+        .req_alloc_valid   (1'b0),
+        .req_alloc_tag     ({TAG_WIDTH{1'b0}}),
+        .req_alloc_len     (10'd0),
+        .req_alloc_ready   (),
+
+        .m_axis_cpl_tvalid (cpl_tvalid),
+        .m_axis_cpl_tdata  (cpl_tdata),
+        .m_axis_cpl_tlast  (cpl_tlast),
+        .m_axis_cpl_tkeep  (cpl_tkeep),
+        .m_axis_cpl_tuser  (cpl_tuser),
+        .m_axis_cpl_tready (cpl_tready),
+
+        .m_axi_awvalid     (m_axi_awvalid),
+        .m_axi_awready     (m_axi_awready),
+        .m_axi_awaddr      (m_axi_awaddr),
+        .m_axi_awerr       (m_axi_awerr),
+
+        .cfg_window_base   (cfg_window_base),
+        .cfg_window_mask   (cfg_window_mask),
+        .cfg_axi_base      (cfg_axi_base),
+
+        .cfg_req_valid     (),
+        .cfg_req_type1     (),
+        .cfg_req_tag       (),
+        .cfg_req_len_dw    (),
+        .cfg_req_addr      (),
+
+        .malformed_tlp_err (malformed_tlp_err)
+    );
+
+`ifdef SIMULATION
+    always @(posedge clk) begin
+        if (rx_word_sof && !rx_word_valid)
+            $error("[link_layer_top] RX sof without valid");
+        if (rx_word_eof && !rx_word_valid)
+            $error("[link_layer_top] RX eof without valid");
+    end
+`endif
+
 endmodule

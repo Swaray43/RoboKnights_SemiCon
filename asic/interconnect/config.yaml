@@ -1,0 +1,17 @@
+# LibreLane config -- interconnect_top (Aditya). Run from this folder:
+#   librelane --pdk sky130A config.yaml          (or --pdk ihp-sg13g2 / gf180mcuD)
+DESIGN_NAME: interconnect_top
+VERILOG_FILES:
+  - dir::../../interconnect_layer/src/axi4s_ingest_port.v
+  - dir::../../interconnect_layer/src/rr_arbiter_2ch.v
+  - dir::../../interconnect_layer/src/cdc_fifo_async.v
+  - dir::../../interconnect_layer/src/interconnect_top.v
+CLOCK_PORT: [aclk, pcie_clk]
+CLOCK_PERIOD: 10            # ns. 100 MHz is a realistic first target in sky130; tighten after the first run.
+PNR_SDC_FILE: dir::interconnect.sdc
+SIGNOFF_SDC_FILE: dir::interconnect.sdc
+SYNTH_PARAMETERS:
+  - FIFO_ADDR_WIDTH=3       # CDC FIFO 16 -> 8 deep (almost_full at 6). Halves the largest flop array here.
+FP_SIZING: relative
+FP_CORE_UTIL: 40
+PL_TARGET_DENSITY_PCT: 50

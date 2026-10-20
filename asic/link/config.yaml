@@ -1,0 +1,36 @@
+# LibreLane config -- link_layer_top (Swaray): TX stream chain + Flit DLL (CRC-64/FEC/replay) + RX MWr decode.
+DESIGN_NAME: link_layer_top
+VERILOG_FILES:
+  - dir::../../src-link_layer/hdl/address_translation.v
+  - dir::../../src-link_layer/hdl/ar_request_splitter.v
+  - dir::../../src-link_layer/hdl/axi_pcie_reorder_buffer.v
+  - dir::../../src-link_layer/hdl/cfg_base_addr_bridge.v
+  - dir::../../src-link_layer/hdl/credit_manager.v
+  - dir::../../src-link_layer/hdl/data_link_layer_top.v
+  - dir::../../src-link_layer/hdl/flit_payload_builder.v
+  - dir::../../src-link_layer/hdl/link_layer_rx.v
+  - dir::../../src-link_layer/hdl/link_layer_top.v
+  - dir::../../src-link_layer/hdl/link_layer_tx.v
+  - dir::../../src-link_layer/hdl/pcie_address_translator.v
+  - dir::../../src-link_layer/hdl/pcie_rx_engine.v
+  - dir::../../src-link_layer/hdl/replay_buffer.v
+  - dir::../../src-link_layer/hdl/rx_tlp_delimiter.v
+  - dir::../../src-link_layer/hdl/stream_descriptor_gen.v
+  - dir::../../src-link_layer/hdl/stream_tx_path_top.v
+  - dir::../../src-link_layer/hdl/tlp32_to_axis_packetizer.v
+  - dir::../../src-link_layer/hdl/tlp_header_parser.v
+  - dir::../../src-link_layer/hdl/tlp_packetizer.v
+  - dir::../../src-link_layer/hdl/write_data_buffer.v
+VERILOG_INCLUDE_DIRS:
+  - dir::../../src-link_layer/hdl                 # flit_defs.vh
+CLOCK_PORT: clk
+CLOCK_PERIOD: 10
+PNR_SDC_FILE: dir::link.sdc
+SIGNOFF_SDC_FILE: dir::link.sdc
+SYNTH_PARAMETERS:
+  - REPLAY_DEPTH=8          # 32 -> 8 Flits (60 kbit -> 15 kbit of flops). Re-run tb_stream_path with errors after changing.
+  - FIFO_D=8
+  - HWM=6
+FP_SIZING: relative
+FP_CORE_UTIL: 35
+PL_TARGET_DENSITY_PCT: 45

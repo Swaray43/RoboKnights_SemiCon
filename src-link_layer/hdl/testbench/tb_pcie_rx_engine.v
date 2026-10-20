@@ -74,7 +74,7 @@ module tb_pcie_rx_engine;
         .tlp_tag(tlp_tag),
         .tlp_lower_addr(tlp_lower_addr),
         .tlp_cpl_status(tlp_cpl_status),
-        .tlp_addr(tlp_addr),
+        .tlp_addr(tlp_addr), .tlp_hdr_done(1'b0),
         .req_alloc_valid(req_alloc_valid),
         .req_alloc_tag(req_alloc_tag),
         .req_alloc_len(req_alloc_len),

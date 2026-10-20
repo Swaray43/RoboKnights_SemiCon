@@ -11,6 +11,9 @@
 //   * aclk-domain reset    = rst_sync(aclk, axi_rst_n). axi_rst_n is produced on
 //                            clk by pcie_reset_controller.
 //   * interconnect pcie_rstn = datapath_rst_n (same clk domain, already synchronous)
+//
+// session_end_aclk is debug-only inside the PHY since ticket K1 (sessions end
+// on the link layer's session_done); it shows up as BAR0 STATUS[5:4].
 // ============================================================
 module bridge_top #(
     parameter DATA_W = 512,
@@ -43,9 +46,18 @@ module bridge_top #(
     input  wire              hot_reset_request, flr_request, updatefc_received,
     output wire              datapath_rst_n, axi_rst_n,
 
+    // ---- host config access (CfgRd/CfgWr, until an inbound TLP decoder exists) ----
+    // A host must set Command.Memory Space Enable (0x004 bit 1) before BAR0
+    // works, and MSI-X Enable (0x050 bit 31) before any MSI-X is sent.
+    input  wire              cfg_wr_en, cfg_rd_en,
+    input  wire [11:0]       cfg_addr,
+    input  wire [31:0]       cfg_wdata,
+    output wire [31:0]       cfg_rdata,
+    output wire              cfg_cpl_valid,
+
     // ---- host register access (until an inbound MWr/MRd decoder exists) ----
     input  wire              bar0_wr_en, bar0_rd_en,
-    input  wire [11:0]       bar0_addr,
+    input  wire [15:0]       bar0_addr,     // 0x0000 DMA regs, 0x1000 MSI-X table, 0x1800 PBA
     input  wire [31:0]       bar0_wdata,
     output wire [31:0]       bar0_rdata,
     output wire              bar0_rd_valid,
@@ -72,7 +84,7 @@ module bridge_top #(
     // ---------------- interconnect <-> link wires ----------------
     wire [DATA_W-1:0] ic_tdata;
     wire [KEEP_W-1:0] ic_tkeep;
-    wire [SOFF_W:0]   ic_tuser;
+    wire [SOFF_W+1:0] ic_tuser;      // {tlast_flag, session_offset, stream_id} -- link-native
     wire              ic_tlast, ic_tvalid, ic_tready;
 
     wire [1:0]  session_start_aclk;
@@ -101,7 +113,7 @@ module bridge_top #(
 
     link_phy_bridge_top u_lpb (
         .clk(clk), .perst_n(perst_n), .aclk(aclk), .aclk_rst_n(arstn),
-        .s_axis_tdata(ic_tdata), .s_axis_tkeep(ic_tkeep), .ic_tuser(ic_tuser),
+        .s_axis_tdata(ic_tdata), .s_axis_tkeep(ic_tkeep), .s_axis_tuser(ic_tuser),
         .s_axis_tlast(ic_tlast), .s_axis_tvalid(ic_tvalid), .s_axis_tready(ic_tready),
         .m_rx_axis_tvalid(m_rx_axis_tvalid), .m_rx_axis_tdata(m_rx_axis_tdata),
         .m_rx_axis_tkeep(m_rx_axis_tkeep), .m_rx_axis_tlast(m_rx_axis_tlast),
@@ -112,8 +124,8 @@ module bridge_top #(
         .hot_reset_request(hot_reset_request), .flr_request(flr_request),
         .updatefc_received(updatefc_received),
         .datapath_rst_n(datapath_rst_n), .axi_rst_n(axi_rst_n), .flr_active(),
-        .cfg_wr_en(1'b0), .cfg_rd_en(1'b0), .cfg_addr(12'd0), .cfg_wdata(32'd0),
-        .cfg_rdata(), .cfg_cpl_valid(),
+        .cfg_wr_en(cfg_wr_en), .cfg_rd_en(cfg_rd_en), .cfg_addr(cfg_addr), .cfg_wdata(cfg_wdata),
+        .cfg_rdata(cfg_rdata), .cfg_cpl_valid(cfg_cpl_valid),
         .tbl_wr_en(tbl_wr_en), .tbl_wr_vec(tbl_wr_vec), .tbl_wr_addr(tbl_wr_addr),
         .tbl_wr_data(tbl_wr_data), .tbl_wr_mask(tbl_wr_mask),
         .tbl_rd_en(1'b0), .tbl_rd_vec(3'd0), .tbl_rd_addr(), .tbl_rd_data(), .tbl_rd_mask(), .pba(),

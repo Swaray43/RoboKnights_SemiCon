@@ -1,0 +1,42 @@
+# LibreLane config -- pcie_phy_top (Kshitij): PHY datapath + sideband.
+DESIGN_NAME: pcie_phy_top
+VERILOG_FILES:
+  - dir::../../protocol_PHY_layer/rtl/ts_os_gen.v
+  - dir::../../protocol_PHY_layer/rtl/rx_lane_deskew.v
+  - dir::../../protocol_PHY_layer/rtl/pcie_ltssm.v
+  - dir::../../protocol_PHY_layer/rtl/bar0_dma_regs.v
+  - dir::../../protocol_PHY_layer/rtl/byte_to_symbol.v
+  - dir::../../protocol_PHY_layer/rtl/elastic_fifo.v
+  - dir::../../protocol_PHY_layer/rtl/flit_lane_destriper.v
+  - dir::../../protocol_PHY_layer/rtl/flit_lane_striper.v
+  - dir::../../protocol_PHY_layer/rtl/flit_sof_strip.v
+  - dir::../../protocol_PHY_layer/rtl/gray_dec.v
+  - dir::../../protocol_PHY_layer/rtl/gray_enc.v
+  - dir::../../protocol_PHY_layer/rtl/lane_reversal_detector.v
+  - dir::../../protocol_PHY_layer/rtl/lane_reversal_latch.v
+  - dir::../../protocol_PHY_layer/rtl/lane_rx.v
+  - dir::../../protocol_PHY_layer/rtl/lane_swap_mux.v
+  - dir::../../protocol_PHY_layer/rtl/lane_tx.v
+  - dir::../../protocol_PHY_layer/rtl/msix_controller.v
+  - dir::../../protocol_PHY_layer/rtl/pam4_demap.v
+  - dir::../../protocol_PHY_layer/rtl/pam4_map.v
+  - dir::../../protocol_PHY_layer/rtl/pcie_config_space.v
+  - dir::../../protocol_PHY_layer/rtl/pcie_phy_rx.v
+  - dir::../../protocol_PHY_layer/rtl/pcie_phy_top.v
+  - dir::../../protocol_PHY_layer/rtl/pcie_phy_tx.v
+  - dir::../../protocol_PHY_layer/rtl/pcie_reset_controller.v
+  - dir::../../protocol_PHY_layer/rtl/pulse_sync.v
+  - dir::../../protocol_PHY_layer/rtl/rst_sync.v
+  - dir::../../protocol_PHY_layer/rtl/session_arm_ctrl.v
+  - dir::../../protocol_PHY_layer/rtl/symbol_to_byte.v
+  - dir::../../protocol_PHY_layer/rtl/ts_ordered_set_detector.v
+  - dir::../../protocol_PHY_layer/rtl/tx_elastic_deskew.v
+CLOCK_PORT: [clk, aclk]
+CLOCK_PERIOD: 10
+PNR_SDC_FILE: dir::phy.sdc
+SIGNOFF_SDC_FILE: dir::phy.sdc
+SYNTH_PARAMETERS:
+  - TX_FIFO_DEPTH=8         # one Flit of slack instead of two
+FP_SIZING: relative
+FP_CORE_UTIL: 40
+PL_TARGET_DENSITY_PCT: 50

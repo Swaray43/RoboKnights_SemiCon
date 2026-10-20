@@ -1,0 +1,103 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<wave_config>
+   <wave_state>
+   </wave_state>
+   <db_ref_list>
+      <db_ref path="tb_tlp_packetizer_behav.wdb" id="1">
+         <top_modules>
+            <top_module name="glbl" />
+            <top_module name="tb_tlp_packetizer" />
+         </top_modules>
+      </db_ref>
+   </db_ref_list>
+   <zoom_setting>
+      <ZoomStartTime time="0.000 ns"></ZoomStartTime>
+      <ZoomEndTime time="1,000.001 ns"></ZoomEndTime>
+      <Cursor1Time time="401.717 ns"></Cursor1Time>
+   </zoom_setting>
+   <column_width_setting>
+      <NameColumnWidth column_width="209"></NameColumnWidth>
+      <ValueColumnWidth column_width="162"></ValueColumnWidth>
+   </column_width_setting>
+   <WVObjectSize size="20" />
+   <wvobject fp_name="/tb_tlp_packetizer/clk" type="logic">
+      <obj_property name="ElementShortName">clk</obj_property>
+      <obj_property name="ObjectShortName">clk</obj_property>
+   </wvobject>
+   <wvobject fp_name="/tb_tlp_packetizer/rst_n" type="logic">
+      <obj_property name="ElementShortName">rst_n</obj_property>
+      <obj_property name="ObjectShortName">rst_n</obj_property>
+   </wvobject>
+   <wvobject fp_name="/tb_tlp_packetizer/req_valid" type="logic">
+      <obj_property name="ElementShortName">req_valid</obj_property>
+      <obj_property name="ObjectShortName">req_valid</obj_property>
+   </wvobject>
+   <wvobject fp_name="/tb_tlp_packetizer/req_ready" type="logic">
+      <obj_property name="ElementShortName">req_ready</obj_property>
+      <obj_property name="ObjectShortName">req_ready</obj_property>
+   </wvobject>
+   <wvobject fp_name="/tb_tlp_packetizer/req_is_mwr" type="logic">
+      <obj_property name="ElementShortName">req_is_mwr</obj_property>
+      <obj_property name="ObjectShortName">req_is_mwr</obj_property>
+   </wvobject>
+   <wvobject fp_name="/tb_tlp_packetizer/req_addr" type="array">
+      <obj_property name="ElementShortName">req_addr[63:0]</obj_property>
+      <obj_property name="ObjectShortName">req_addr[63:0]</obj_property>
+   </wvobject>
+   <wvobject fp_name="/tb_tlp_packetizer/req_len" type="array">
+      <obj_property name="ElementShortName">req_len[9:0]</obj_property>
+      <obj_property name="ObjectShortName">req_len[9:0]</obj_property>
+   </wvobject>
+   <wvobject fp_name="/tb_tlp_packetizer/req_tag" type="array">
+      <obj_property name="ElementShortName">req_tag[9:0]</obj_property>
+      <obj_property name="ObjectShortName">req_tag[9:0]</obj_property>
+   </wvobject>
+   <wvobject fp_name="/tb_tlp_packetizer/req_fbe" type="array">
+      <obj_property name="ElementShortName">req_fbe[3:0]</obj_property>
+      <obj_property name="ObjectShortName">req_fbe[3:0]</obj_property>
+   </wvobject>
+   <wvobject fp_name="/tb_tlp_packetizer/req_lbe" type="array">
+      <obj_property name="ElementShortName">req_lbe[3:0]</obj_property>
+      <obj_property name="ObjectShortName">req_lbe[3:0]</obj_property>
+   </wvobject>
+   <wvobject fp_name="/tb_tlp_packetizer/s_tdata" type="array">
+      <obj_property name="ElementShortName">s_tdata[31:0]</obj_property>
+      <obj_property name="ObjectShortName">s_tdata[31:0]</obj_property>
+   </wvobject>
+   <wvobject fp_name="/tb_tlp_packetizer/s_tvalid" type="logic">
+      <obj_property name="ElementShortName">s_tvalid</obj_property>
+      <obj_property name="ObjectShortName">s_tvalid</obj_property>
+   </wvobject>
+   <wvobject fp_name="/tb_tlp_packetizer/s_tready" type="logic">
+      <obj_property name="ElementShortName">s_tready</obj_property>
+      <obj_property name="ObjectShortName">s_tready</obj_property>
+   </wvobject>
+   <wvobject fp_name="/tb_tlp_packetizer/m_tdata" type="array">
+      <obj_property name="ElementShortName">m_tdata[31:0]</obj_property>
+      <obj_property name="ObjectShortName">m_tdata[31:0]</obj_property>
+   </wvobject>
+   <wvobject fp_name="/tb_tlp_packetizer/m_tvalid" type="logic">
+      <obj_property name="ElementShortName">m_tvalid</obj_property>
+      <obj_property name="ObjectShortName">m_tvalid</obj_property>
+   </wvobject>
+   <wvobject fp_name="/tb_tlp_packetizer/m_tready" type="logic">
+      <obj_property name="ElementShortName">m_tready</obj_property>
+      <obj_property name="ObjectShortName">m_tready</obj_property>
+   </wvobject>
+   <wvobject fp_name="/tb_tlp_packetizer/m_tlast" type="logic">
+      <obj_property name="ElementShortName">m_tlast</obj_property>
+      <obj_property name="ObjectShortName">m_tlast</obj_property>
+   </wvobject>
+   <wvobject fp_name="/tb_tlp_packetizer/i" type="array">
+      <obj_property name="ElementShortName">i[31:0]</obj_property>
+      <obj_property name="ObjectShortName">i[31:0]</obj_property>
+   </wvobject>
+   <wvobject fp_name="/tb_tlp_packetizer/MAX_PAYLOAD_SIZE_DW" type="array">
+      <obj_property name="ElementShortName">MAX_PAYLOAD_SIZE_DW[31:0]</obj_property>
+      <obj_property name="ObjectShortName">MAX_PAYLOAD_SIZE_DW[31:0]</obj_property>
+   </wvobject>
+   <wvobject fp_name="/tb_tlp_packetizer/REQ_ID" type="array">
+      <obj_property name="ElementShortName">REQ_ID[15:0]</obj_property>
+      <obj_property name="ObjectShortName">REQ_ID[15:0]</obj_property>
+   </wvobject>
+</wave_config>
