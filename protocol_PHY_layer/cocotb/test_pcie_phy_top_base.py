@@ -96,6 +96,7 @@ async def test_msix_masked_and_unmasked(dut):
     await bfm.reset()
     await bfm.train_link()
     await bfm.release_axi_reset()
+    await bfm.enable_function()   # MSI-X Enable is now honoured (config-space gating)
 
     # Vector 2 left at its default-masked reset state - fire and expect PBA, no MWr
     await bfm.fire_dma_complete(2)

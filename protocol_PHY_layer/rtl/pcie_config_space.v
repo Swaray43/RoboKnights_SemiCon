@@ -10,8 +10,10 @@
 // Address map (byte addresses, DWORD-aligned, reduced/documented vs full PCIe
 // spec - same "architecture honesty" approach as the rest of this project):
 //   0x00        Vendor/Device ID              (RO)
-//   0x04        Status/Command                (Command[1:0] RW: mem space en,
-//                                               bus master en; Status RO)
+//   0x04        Status/Command                (Command[2:1] RW: bit1 memory space
+//                                               enable, bit2 bus master enable, per
+//                                               the PCI spec; bit0 I/O space RO 0 -
+//                                               no I/O BARs. Status RO)
 //   0x08        Class Code/Revision ID        (RO)
 //   0x0C        BIST/HeaderType/LatTmr/CLS    (RO, HeaderType=0 fixed)
 //   0x10-0x24   BAR0-BAR5                     (RW, size-masked per BAR)
@@ -29,8 +31,8 @@
 //   0x50        MSI-X Cap header (id=0x11, next=0x00) + Message Control
 //                                              (MSI-X Enable[31] RW,
 //                                               Func Mask[30] RW, TblSize RO)
-//   0x54        MSI-X Table Offset/BIR        (RO)
-//   0x58        MSI-X PBA Offset/BIR          (RO)
+//   0x54        MSI-X Table Offset/BIR        (RO) BAR0 + MSIX_TABLE_OFFSET, BIR 0
+//   0x58        MSI-X PBA Offset/BIR          (RO) BAR0 + MSIX_PBA_OFFSET,   BIR 0
 //   0x5C        Link Status (speed/width/training bit)  (RO, from live inputs
 //                                              - doc names this as its own
 //                                              bullet, given a dedicated
@@ -56,7 +58,9 @@ module pcie_config_space #(
     parameter [31:0] BAR4_SIZE = 32'h0,
     parameter [31:0] BAR5_SIZE = 32'h0,
 
-    parameter        MSIX_TABLE_SIZE_M1 = 11'd7  // "table size" field is N-1; 8 vectors default for sim
+    parameter        MSIX_TABLE_SIZE_M1 = 11'd7,  // "table size" field is N-1; 8 vectors default for sim
+    parameter [31:0] MSIX_TABLE_OFFSET  = 32'h0000_1000, // where the MSI-X table sits in BAR0 (8-byte aligned)
+    parameter [31:0] MSIX_PBA_OFFSET    = 32'h0000_1800  // where the PBA sits in BAR0
 )(
     input  wire        clk,
     input  wire        rst_n,
@@ -90,7 +94,7 @@ localparam PCIE_CAP_ID = 8'h10;
 localparam MSIX_CAP_ID = 8'h11;
 
 // ---- Type 0 header registers ----
-reg [15:0] command_reg;      // only bits [1:0] implemented: mem space en, bus master en
+reg [15:0] command_reg;      // only bits [2:1] implemented: bit1 memory space en, bit2 bus master en
 reg [31:0] bar [0:5];
 reg [7:0]  interrupt_line;
 
@@ -139,7 +143,7 @@ always @(posedge clk) begin
         if (cfg_wr_en) begin
             cfg_cpl_valid <= 1'b1;
             case (cfg_addr[11:2])
-                10'h001: command_reg <= {14'b0, cfg_wdata[1:0]};
+                10'h001: command_reg <= {13'b0, cfg_wdata[2:1], 1'b0};
                 10'h004: bar[0] <= (cfg_wdata & bar_mask[0]) | (bar[0] & ~bar_mask[0]);
                 10'h005: bar[1] <= (cfg_wdata & bar_mask[1]) | (bar[1] & ~bar_mask[1]);
                 10'h006: bar[2] <= (cfg_wdata & bar_mask[2]) | (bar[2] & ~bar_mask[2]);
@@ -165,7 +169,7 @@ always @(posedge clk) begin
             cfg_cpl_valid <= 1'b1;
             case (cfg_addr[11:2])
                 10'h000: cfg_rdata <= {DEVICE_ID, VENDOR_ID};
-                10'h001: cfg_rdata <= {16'h0, 14'b0, command_reg[1:0]};      // Status RO=0 (not modeled)
+                10'h001: cfg_rdata <= {16'h0, 13'b0, command_reg[2:1], 1'b0}; // Status RO=0 (not modeled)
                 10'h002: cfg_rdata <= {CLASS_CODE, REVISION_ID};
                 10'h003: cfg_rdata <= {8'h0, 8'h00, 8'h00, 8'h00};           // BIST/HeaderType(Type0)/LatTmr/CLS, all RO 0
                 10'h004: cfg_rdata <= bar[0];
@@ -185,8 +189,8 @@ always @(posedge clk) begin
                 10'h012: cfg_rdata <= {16'h0, 1'b0, mrrs_reg, dev_ctrl_enable_bits[4], mps_reg, dev_ctrl_enable_bits[3:0]}; // 0x48: {DevStatus=0, DevControl}
                 10'h013: cfg_rdata <= 32'h0;                                  // 0x4C: Link Capabilities, not modeled
                 10'h014: cfg_rdata <= {msix_enable_reg, msix_func_mask_reg, MSIX_TABLE_SIZE_M1[10:0], 3'b0, 8'h00, MSIX_CAP_ID}; // 0x50
-                10'h015: cfg_rdata <= 32'h0;                                  // 0x54: Table Offset/BIR - RO, not exposing a real BAR-relative offset yet (design pending BAR layout finalization)
-                10'h016: cfg_rdata <= 32'h0;                                  // 0x58: PBA Offset/BIR - same caveat
+                10'h015: cfg_rdata <= {MSIX_TABLE_OFFSET[31:3], 3'd0};        // 0x54: Table Offset, BIR=0 (BAR0)
+                10'h016: cfg_rdata <= {MSIX_PBA_OFFSET[31:3],   3'd0};        // 0x58: PBA Offset,   BIR=0 (BAR0)
                 10'h017: cfg_rdata <= {20'h0, link_speed, link_width, 1'b0, link_training_bit}; // 0x5C: Link Status
                 default: cfg_rdata <= 32'h0;
             endcase
@@ -198,8 +202,8 @@ assign bar_addr_0 = bar[0]; assign bar_addr_1 = bar[1]; assign bar_addr_2 = bar[
 assign bar_addr_3 = bar[3]; assign bar_addr_4 = bar[4]; assign bar_addr_5 = bar[5];
 assign max_payload_size  = mps_reg;
 assign max_read_req_size = mrrs_reg;
-assign mem_space_enable  = command_reg[0];
-assign bus_master_enable = command_reg[1];
+assign mem_space_enable  = command_reg[1];   // PCI Command bit 1 (was bit 0, which is I/O space)
+assign bus_master_enable = command_reg[2];   // PCI Command bit 2 (was bit 1, which is memory space)
 assign msix_enable       = msix_enable_reg;
 assign msix_func_mask    = msix_func_mask_reg;
 

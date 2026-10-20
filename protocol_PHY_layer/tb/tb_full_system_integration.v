@@ -185,10 +185,10 @@ lane_tx u_ltx2 (.clk(clk), .rst_n(datapath_rst_n), .byte_in_valid(deskew_valid_d
 lane_tx u_ltx3 (.clk(clk), .rst_n(datapath_rst_n), .byte_in_valid(deskew_valid_d), .byte_in(deskew_out3), .busy(pipe_busy3), .tx_level_valid(tx_lv[3]), .tx_level(tx_l3));
 
 // ideal channel: wires
-lane_rx u_lrx0 (.clk(clk), .rst_n(datapath_rst_n), .rx_level_valid(tx_lv[0]), .rx_level(tx_l0), .byte_out_valid(pipe_valid0), .byte_out(pipe_out0));
-lane_rx u_lrx1 (.clk(clk), .rst_n(datapath_rst_n), .rx_level_valid(tx_lv[1]), .rx_level(tx_l1), .byte_out_valid(pipe_valid1), .byte_out(pipe_out1));
-lane_rx u_lrx2 (.clk(clk), .rst_n(datapath_rst_n), .rx_level_valid(tx_lv[2]), .rx_level(tx_l2), .byte_out_valid(pipe_valid2), .byte_out(pipe_out2));
-lane_rx u_lrx3 (.clk(clk), .rst_n(datapath_rst_n), .rx_level_valid(tx_lv[3]), .rx_level(tx_l3), .byte_out_valid(pipe_valid3), .byte_out(pipe_out3));
+lane_rx u_lrx0 (.clk(clk), .rst_n(datapath_rst_n), .align_en(1'b0), .rx_level_valid(tx_lv[0]), .rx_level(tx_l0), .byte_out_valid(pipe_valid0), .byte_out(pipe_out0));
+lane_rx u_lrx1 (.clk(clk), .rst_n(datapath_rst_n), .align_en(1'b0), .rx_level_valid(tx_lv[1]), .rx_level(tx_l1), .byte_out_valid(pipe_valid1), .byte_out(pipe_out1));
+lane_rx u_lrx2 (.clk(clk), .rst_n(datapath_rst_n), .align_en(1'b0), .rx_level_valid(tx_lv[2]), .rx_level(tx_l2), .byte_out_valid(pipe_valid2), .byte_out(pipe_out2));
+lane_rx u_lrx3 (.clk(clk), .rst_n(datapath_rst_n), .align_en(1'b0), .rx_level_valid(tx_lv[3]), .rx_level(tx_l3), .byte_out_valid(pipe_valid3), .byte_out(pipe_out3));
 
 reg sof_phase;
 wire [7:0] strip_in0 = sof_phase ? 8'hFB : pipe_out0;
@@ -403,7 +403,7 @@ initial begin
     if (!destriper_flit_valid) begin
       $display("FAIL: timed out waiting for destriper_flit_valid in full integration");
       errors = errors + 1;
-      $stop;
+      $display(" RESULT: %s", (errors == 0) ? "PASS" : "FAIL"); $finish;
     end
   end
 
@@ -416,7 +416,7 @@ initial begin
 
   if (errors == 0) $display("ALL PASS: rst_sync + fifo_scoreboard + session_arm_ctrl integrated cleanly");
   else $display("TOTAL FAILURES: %0d", errors);
-  $stop;
+  $display(" RESULT: %s", (errors == 0) ? "PASS" : "FAIL"); $finish;
 end
 endmodule
 `default_nettype wire

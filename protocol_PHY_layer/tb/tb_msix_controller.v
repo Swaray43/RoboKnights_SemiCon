@@ -26,7 +26,9 @@ msix_controller #(.NUM_VECTORS(8)) dut (
     .tbl_rd_addr(tbl_rd_addr), .tbl_rd_data(tbl_rd_data), .tbl_rd_mask(tbl_rd_mask),
     .pba(pba),
     .dma_complete_pulse(dma_complete_pulse), .dma_complete_vector(dma_complete_vector),
-    .mwr_valid(mwr_valid), .mwr_ready(1'b1), .mwr_addr(mwr_addr), .mwr_data(mwr_data)
+    .mwr_valid(mwr_valid), .mwr_ready(1'b1), .mwr_addr(mwr_addr), .mwr_data(mwr_data),
+    .msix_enable(1'b1), .func_mask(1'b0),   // unit-level: MSI-X on (gating is tested in tb_pcie_phy_top)
+    .mm_wr_en(1'b0), .mm_rd_en(1'b0), .mm_pba(1'b0), .mm_addr(12'h0), .mm_wdata(32'h0), .mm_rdata(), .mm_rd_valid()
 );
 
 initial clk = 0;
@@ -94,6 +96,6 @@ initial begin
 
     if (errors == 0) $display("ALL PASS: msix_controller");
     else $display("TOTAL FAILURES: %0d", errors);
-    $stop;
+    $display(" RESULT: %s", (errors == 0) ? "PASS" : "FAIL"); $finish;
 end
 endmodule

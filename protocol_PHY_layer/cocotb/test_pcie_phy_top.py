@@ -2,8 +2,10 @@
 cocotb tests for the new pcie_phy_top features: BAR0 DMA registers, session
 start crossing to aclk, MSI-X on session_done, and the PAM4 datapath with the
 SerDes channel modelled in Python (loopback lives in the testbench, not RTL).
+The datapath tests train the link over that channel (TS1 sent by TX, read off
+the received lanes), not through the ts_byte_* injection port.
 
-The four original tests in test_pcie_link_top.py run against the same top.
+The four original tests in test_pcie_phy_top_base.py run against the same top.
 """
 
 import os
@@ -26,6 +28,7 @@ async def _bring_up(dut, lane_nums=(0, 1, 2, 3)):
     await bfm.reset()
     await bfm.train_link(lane_nums)
     await bfm.release_axi_reset()
+    await bfm.enable_function()   # Memory Space + Bus Master + MSI-X Enable
     return bfm
 
 
@@ -81,9 +84,15 @@ async def test_session_done_raises_msix(dut):
     assert int(dut.mwr_valid.value) == 0, "MWr should retire once accepted"
 
 
-async def _datapath_roundtrip(dut, lane_nums, cross_lanes, n_flits):
-    bfm = await _bring_up(dut, lane_nums)
+async def _datapath_roundtrip(dut, cross_lanes, n_flits):
+    # Channel first, then train over it: no ts_byte_* injection here.
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    cocotb.start_soon(Clock(dut.aclk, 7, unit="ns").start())
+    bfm = RootComplexBFM(dut)
+    await bfm.reset()
     cocotb.start_soon(bfm.serdes_loopback(cross_lanes=cross_lanes))
+    await bfm.wait_link_up_over_lanes()
+    await bfm.release_axi_reset()
 
     rng = random.Random(1234)
     sent = []
@@ -119,13 +128,36 @@ async def _datapath_roundtrip(dut, lane_nums, cross_lanes, n_flits):
 
 @cocotb.test()
 async def test_datapath_loopback(dut):
-    """3 Flits through tx_level -> Python channel -> rx_level, bit-exact."""
-    await _datapath_roundtrip(dut, (0, 1, 2, 3), cross_lanes=False, n_flits=3)
+    """Train over the lanes, then 3 Flits through tx_level -> Python channel
+    -> rx_level, bit-exact."""
+    await _datapath_roundtrip(dut, cross_lanes=False, n_flits=3)
     assert int(dut.lane_reversed_locked.value) == 0
 
 
 @cocotb.test()
 async def test_datapath_lane_reversed(dut):
-    """Same, with the channel crossing lanes and training reporting 3,2,1,0."""
-    await _datapath_roundtrip(dut, (3, 2, 1, 0), cross_lanes=True, n_flits=2)
+    """Same, with the channel crossing lanes: training must detect the
+    reversal from the TS1 lane numbers alone."""
+    await _datapath_roundtrip(dut, cross_lanes=True, n_flits=2)
     assert int(dut.lane_reversed_locked.value) == 1
+
+
+@cocotb.test()
+async def test_msix_table_through_bar0(dut):
+    """Config 0x54 points at BAR0+0x1000; a vector programmed there with
+    DWORD writes fires correctly, and nothing happens with MSI-X disabled."""
+    bfm = await _bring_up(dut)
+    assert await bfm.cfg_read(0x054) == 0x1000, "MSI-X table offset/BIR"
+    assert await bfm.cfg_read(0x058) == 0x1800, "MSI-X PBA offset/BIR"
+    base = 0x1000 + 16 * 3
+    await bfm.bar0_write(base + 0, 0xFEE0_0040)
+    await bfm.bar0_write(base + 4, 0x0)
+    await bfm.bar0_write(base + 8, 0xABCD)
+    await bfm.bar0_write(base + 12, 0)            # unmask
+    await bfm.fire_dma_complete(3)
+    assert int(dut.mwr_valid.value) == 1 and int(dut.mwr_data.value) == 0xABCD
+    await FallingEdge(dut.clk)
+    await bfm.cfg_write(0x050, 0)                 # MSI-X off
+    await bfm.fire_dma_complete(3)
+    await FallingEdge(dut.clk)
+    assert int(dut.mwr_valid.value) == 0 and int(dut.pba.value) == 0, "MSI-X disabled must drop the event"

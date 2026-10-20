@@ -148,7 +148,7 @@ module tb_legacy_axi4s_ingest_port;
         else
             $display("\n=== %0d TEST(S) FAILED ===", errors);
 
-        $stop;
+        $display(" RESULT: %s", (errors == 0) ? "PASS" : "FAIL"); $finish;
     end
 
 endmodule

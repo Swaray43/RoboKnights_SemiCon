@@ -65,7 +65,7 @@ initial begin
   else
     $display("TOTAL FAILURES: %0d", errors);
 
-  $stop;
+  $display(" RESULT: %s", (errors == 0) ? "PASS" : "FAIL"); $finish;
 end
 
 endmodule

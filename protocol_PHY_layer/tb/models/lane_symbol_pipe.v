@@ -28,7 +28,7 @@ lane_tx u_tx (
 
 // ideal channel: no noise, no attenuation, no skew
 lane_rx u_rx (
-  .clk(clk), .rst_n(rst_n),
+  .clk(clk), .rst_n(rst_n), .align_en(1'b0),
   .rx_level_valid(lvl_valid), .rx_level(lvl),
   .byte_out_valid(byte_out_valid), .byte_out(byte_out)
 );

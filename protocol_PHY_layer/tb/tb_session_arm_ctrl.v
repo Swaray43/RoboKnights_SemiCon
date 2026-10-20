@@ -102,7 +102,7 @@ module tb_session_arm_ctrl;
         else
             $display("\n=== %0d TEST(S) FAILED ===", errors);
 
-        $stop;
+        $display(" RESULT: %s", (errors == 0) ? "PASS" : "FAIL"); $finish;
     end
 
 endmodule

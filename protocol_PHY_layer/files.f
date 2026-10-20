@@ -24,13 +24,16 @@ rtl/pam4_demap.v
 rtl/pam4_map.v
 rtl/pcie_config_space.v
 rtl/pcie_reset_controller.v
+rtl/pcie_ltssm.v
 rtl/pcie_tag_manager.v
 rtl/perf_counters.v
 rtl/pulse_sync.v
 rtl/rst_sync.v
+rtl/rx_lane_deskew.v
 rtl/session_arm_ctrl.v
 rtl/symbol_to_byte.v
 rtl/ts_ordered_set_detector.v
+rtl/ts_os_gen.v
 rtl/tx_elastic_deskew.v
 rtl/pcie_phy_tx.v
 rtl/pcie_phy_rx.v

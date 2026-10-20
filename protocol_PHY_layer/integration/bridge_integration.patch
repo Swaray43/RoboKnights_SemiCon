@@ -1,0 +1,202 @@
+--- a/bridge_top/README.md
++++ b/bridge_top/README.md
+@@ -41,16 +41,24 @@
+ | `tb_ingest_overflow_leak` | Ingest-port unit test: no data beat past the session limit | — |
+ 
+ The SerDes is a wire loopback (`rx_level = tx_level`); the link ACKs its own Flits.
++The link trains by itself over that loopback (PHY LTSSM: Detect → Polling/TS1 → Configuration/TS2 → L0,
++about 1,700 clk); the benches just wait for `link_trained`, send UpdateFC, then enable Memory Space
++(config 0x004 = 0x6) and MSI-X (config 0x050 bit 31) like a host driver would. The `ts_byte_*`
++injection port is still there but no longer needed.
+ 
+ ## Verified (Icarus Verilog 12, Yosys 0.33)
+ 
+ - `tb_bridge_top`, `tb_bridge_ovf`, `tb_ingest_overflow_leak`: PASS
+-- Interconnect unit tests 4/4, PHY benches 24/24, link `tb_stream_path` with bit errors: PASS
++- Interconnect unit tests 4/4, PHY benches 24/24 (+ 9 cocotb), link `tb_stream_path` with bit errors: PASS
++- PHY updated to the LTSSM / lane-deskew / config-gating version (see `protocol_PHY_layer/CHANGELOG.md`, Update 8):
++  `tb_bridge_top` 144/144 TLPs and 6/6 MSI-X (also 600/600 with `+SESS=6 +BEATS=50`), `tb_bridge_ovf` PASS
+ - Yosys elaboration of `bridge_top` from `bridge_top.f`: 0 problems, 0 latches
+ - **Not run here:** Vivado or Quartus synthesis/implementation, timing closure
+ 
+ ## Ports to note
+ 
+ - No pin constraints: `tx_level`/`rx_level` are meant for SerDes IP, outside this project.
+-- `bar0_*` and `tbl_*` are driven by the testbench until an inbound MWr/MRd decoder exists.
++- `cfg_*`, `bar0_*` and `tbl_*` are driven by the testbench until an inbound TLP decoder exists.
++  `bar0_addr` is 16 bits: 0x0000 DMA/session regs, 0x1000 MSI-X table, 0x1800 PBA.
++  BAR0 is ignored until Command.Memory Space Enable is set; MSI-X is silent until MSI-X Enable is set.
+ - Clocks: `clk` (pcie_clk, 4 ns) and `aclk` (5.4 ns) are asynchronous; see `bridge_top.xdc` / `.sdc`.
+--- a/bridge_top/bridge_top.f
++++ b/bridge_top/bridge_top.f
+@@ -23,15 +23,18 @@
+ protocol_PHY_layer/rtl/pam4_demap.v
+ protocol_PHY_layer/rtl/pam4_map.v
+ protocol_PHY_layer/rtl/pcie_config_space.v
++protocol_PHY_layer/rtl/pcie_ltssm.v
+ protocol_PHY_layer/rtl/pcie_phy_rx.v
+ protocol_PHY_layer/rtl/pcie_phy_top.v
+ protocol_PHY_layer/rtl/pcie_phy_tx.v
+ protocol_PHY_layer/rtl/pcie_reset_controller.v
+ protocol_PHY_layer/rtl/pulse_sync.v
+ protocol_PHY_layer/rtl/rst_sync.v
++protocol_PHY_layer/rtl/rx_lane_deskew.v
+ protocol_PHY_layer/rtl/session_arm_ctrl.v
+ protocol_PHY_layer/rtl/symbol_to_byte.v
+ protocol_PHY_layer/rtl/ts_ordered_set_detector.v
++protocol_PHY_layer/rtl/ts_os_gen.v
+ protocol_PHY_layer/rtl/tx_elastic_deskew.v
+ src-link_layer/hdl/address_translation.v
+ src-link_layer/hdl/ar_request_splitter.v
+--- a/bridge_top/rtl/bridge_top.v
++++ b/bridge_top/rtl/bridge_top.v
+@@ -11,6 +11,9 @@
+ //   * aclk-domain reset    = rst_sync(aclk, axi_rst_n). axi_rst_n is produced on
+ //                            clk by pcie_reset_controller.
+ //   * interconnect pcie_rstn = datapath_rst_n (same clk domain, already synchronous)
++//
++// session_end_aclk is debug-only inside the PHY since ticket K1 (sessions end
++// on the link layer's session_done); it shows up as BAR0 STATUS[5:4].
+ // ============================================================
+ module bridge_top #(
+     parameter DATA_W = 512,
+@@ -43,9 +46,18 @@
+     input  wire              hot_reset_request, flr_request, updatefc_received,
+     output wire              datapath_rst_n, axi_rst_n,
+ 
++    // ---- host config access (CfgRd/CfgWr, until an inbound TLP decoder exists) ----
++    // A host must set Command.Memory Space Enable (0x004 bit 1) before BAR0
++    // works, and MSI-X Enable (0x050 bit 31) before any MSI-X is sent.
++    input  wire              cfg_wr_en, cfg_rd_en,
++    input  wire [11:0]       cfg_addr,
++    input  wire [31:0]       cfg_wdata,
++    output wire [31:0]       cfg_rdata,
++    output wire              cfg_cpl_valid,
++
+     // ---- host register access (until an inbound MWr/MRd decoder exists) ----
+     input  wire              bar0_wr_en, bar0_rd_en,
+-    input  wire [11:0]       bar0_addr,
++    input  wire [15:0]       bar0_addr,     // 0x0000 DMA regs, 0x1000 MSI-X table, 0x1800 PBA
+     input  wire [31:0]       bar0_wdata,
+     output wire [31:0]       bar0_rdata,
+     output wire              bar0_rd_valid,
+@@ -112,8 +124,8 @@
+         .hot_reset_request(hot_reset_request), .flr_request(flr_request),
+         .updatefc_received(updatefc_received),
+         .datapath_rst_n(datapath_rst_n), .axi_rst_n(axi_rst_n), .flr_active(),
+-        .cfg_wr_en(1'b0), .cfg_rd_en(1'b0), .cfg_addr(12'd0), .cfg_wdata(32'd0),
+-        .cfg_rdata(), .cfg_cpl_valid(),
++        .cfg_wr_en(cfg_wr_en), .cfg_rd_en(cfg_rd_en), .cfg_addr(cfg_addr), .cfg_wdata(cfg_wdata),
++        .cfg_rdata(cfg_rdata), .cfg_cpl_valid(cfg_cpl_valid),
+         .tbl_wr_en(tbl_wr_en), .tbl_wr_vec(tbl_wr_vec), .tbl_wr_addr(tbl_wr_addr),
+         .tbl_wr_data(tbl_wr_data), .tbl_wr_mask(tbl_wr_mask),
+         .tbl_rd_en(1'b0), .tbl_rd_vec(3'd0), .tbl_rd_addr(), .tbl_rd_data(), .tbl_rd_mask(), .pba(),
+--- a/bridge_top/tb/tb_bridge_ovf.v
++++ b/bridge_top/tb/tb_bridge_ovf.v
+@@ -33,7 +33,8 @@
+     reg updatefc_received = 0;
+     wire link_trained, datapath_rst_n, axi_rst_n;
+ 
+-    reg bar0_wr_en = 0; reg [11:0] bar0_addr = 0; reg [31:0] bar0_wdata = 0;
++    reg bar0_wr_en = 0; reg [15:0] bar0_addr = 0; reg [31:0] bar0_wdata = 0;
++    reg cfg_wr_en = 0; reg [11:0] cfg_addr = 0; reg [31:0] cfg_wdata = 0;
+     reg tbl_wr_en = 0; reg [2:0] tbl_wr_vec = 0; reg [63:0] tbl_wr_addr = 0; reg [31:0] tbl_wr_data = 0;
+ 
+     wire [11:0] lvl; wire [3:0] lvl_v;
+@@ -50,6 +51,8 @@
+         .ts_byte_l2(ts_byte_l2), .ts_byte_l3(ts_byte_l3), .link_trained(link_trained),
+         .hot_reset_request(1'b0), .flr_request(1'b0), .updatefc_received(updatefc_received),
+         .datapath_rst_n(datapath_rst_n), .axi_rst_n(axi_rst_n),
++        .cfg_wr_en(cfg_wr_en), .cfg_rd_en(1'b0), .cfg_addr(cfg_addr), .cfg_wdata(cfg_wdata),
++        .cfg_rdata(), .cfg_cpl_valid(),
+         .bar0_wr_en(bar0_wr_en), .bar0_rd_en(1'b0), .bar0_addr(bar0_addr), .bar0_wdata(bar0_wdata),
+         .bar0_rdata(), .bar0_rd_valid(),
+         .tbl_wr_en(tbl_wr_en), .tbl_wr_vec(tbl_wr_vec), .tbl_wr_addr(tbl_wr_addr),
+@@ -134,7 +137,10 @@
+         for (j = 10; j <= 15; j = j + 1) begin {ts_byte_l0, ts_byte_l1, ts_byte_l2, ts_byte_l3} = {4{8'h4A}}; @(negedge clk); end
+         ts_byte_valid = 0;
+     end endtask
+-    task bar0_write(input [11:0] a, input [31:0] d); begin
++    task cfg_write(input [11:0] a, input [31:0] d); begin
++        @(negedge clk); cfg_addr = a; cfg_wdata = d; cfg_wr_en = 1; @(negedge clk); cfg_wr_en = 0;
++    end endtask
++    task bar0_write(input [15:0] a, input [31:0] d); begin
+         @(negedge clk); bar0_addr = a; bar0_wdata = d; bar0_wr_en = 1; @(negedge clk); bar0_wr_en = 0;
+     end endtask
+     task msix_entry(input [2:0] v, input [63:0] a, input [31:0] d); begin
+@@ -194,9 +200,14 @@
+         exp_wr[0] = 0; exp_wr[1] = 0; exp_rd[0] = 0; exp_rd[1] = 0; msix_cnt[0] = 0; msix_cnt[1] = 0;
+ 
+         repeat (5) @(negedge clk); perst_n = 1;
+-        send_ts1; send_ts1;
++        // Link trains by itself over the SerDes loopback (LTSSM: Detect -> Polling/TS1
++        // -> Configuration/TS2 -> L0, ~1700 clk); no TS1 injection needed any more.
++        wait (link_trained === 1'b1);
+         repeat (3) @(negedge clk); updatefc_received = 1; @(negedge clk); updatefc_received = 0;
+         wait (axi_rst_n === 1'b1);
++        // What a host driver does first: Memory Space + Bus Master, then MSI-X Enable.
++        cfg_write(12'h004, 32'h0000_0006);
++        cfg_write(12'h050, 32'h8000_0000);
+         repeat (20) @(negedge clk);
+         $display("[%0t] link_trained=%b datapath_rst_n=%b axi_rst_n=%b", $time, link_trained, datapath_rst_n, axi_rst_n);
+ 
+--- a/bridge_top/tb/tb_bridge_top.v
++++ b/bridge_top/tb/tb_bridge_top.v
+@@ -33,7 +33,8 @@
+     reg updatefc_received = 0;
+     wire link_trained, datapath_rst_n, axi_rst_n;
+ 
+-    reg bar0_wr_en = 0; reg [11:0] bar0_addr = 0; reg [31:0] bar0_wdata = 0;
++    reg bar0_wr_en = 0; reg [15:0] bar0_addr = 0; reg [31:0] bar0_wdata = 0;
++    reg cfg_wr_en = 0; reg [11:0] cfg_addr = 0; reg [31:0] cfg_wdata = 0;
+     reg tbl_wr_en = 0; reg [2:0] tbl_wr_vec = 0; reg [63:0] tbl_wr_addr = 0; reg [31:0] tbl_wr_data = 0;
+ 
+     wire [11:0] lvl; wire [3:0] lvl_v;
+@@ -50,6 +51,8 @@
+         .ts_byte_l2(ts_byte_l2), .ts_byte_l3(ts_byte_l3), .link_trained(link_trained),
+         .hot_reset_request(1'b0), .flr_request(1'b0), .updatefc_received(updatefc_received),
+         .datapath_rst_n(datapath_rst_n), .axi_rst_n(axi_rst_n),
++        .cfg_wr_en(cfg_wr_en), .cfg_rd_en(1'b0), .cfg_addr(cfg_addr), .cfg_wdata(cfg_wdata),
++        .cfg_rdata(), .cfg_cpl_valid(),
+         .bar0_wr_en(bar0_wr_en), .bar0_rd_en(1'b0), .bar0_addr(bar0_addr), .bar0_wdata(bar0_wdata),
+         .bar0_rdata(), .bar0_rd_valid(),
+         .tbl_wr_en(tbl_wr_en), .tbl_wr_vec(tbl_wr_vec), .tbl_wr_addr(tbl_wr_addr),
+@@ -133,7 +136,10 @@
+         for (j = 10; j <= 15; j = j + 1) begin {ts_byte_l0, ts_byte_l1, ts_byte_l2, ts_byte_l3} = {4{8'h4A}}; @(negedge clk); end
+         ts_byte_valid = 0;
+     end endtask
+-    task bar0_write(input [11:0] a, input [31:0] d); begin
++    task cfg_write(input [11:0] a, input [31:0] d); begin
++        @(negedge clk); cfg_addr = a; cfg_wdata = d; cfg_wr_en = 1; @(negedge clk); cfg_wr_en = 0;
++    end endtask
++    task bar0_write(input [15:0] a, input [31:0] d); begin
+         @(negedge clk); bar0_addr = a; bar0_wdata = d; bar0_wr_en = 1; @(negedge clk); bar0_wr_en = 0;
+     end endtask
+     task msix_entry(input [2:0] v, input [63:0] a, input [31:0] d); begin
+@@ -183,9 +189,14 @@
+         exp_wr[0] = 0; exp_wr[1] = 0; exp_rd[0] = 0; exp_rd[1] = 0; msix_cnt[0] = 0; msix_cnt[1] = 0;
+ 
+         repeat (5) @(negedge clk); perst_n = 1;
+-        send_ts1; send_ts1;
++        // Link trains by itself over the SerDes loopback (LTSSM: Detect -> Polling/TS1
++        // -> Configuration/TS2 -> L0, ~1700 clk); no TS1 injection needed any more.
++        wait (link_trained === 1'b1);
+         repeat (3) @(negedge clk); updatefc_received = 1; @(negedge clk); updatefc_received = 0;
+         wait (axi_rst_n === 1'b1);
++        // What a host driver does first: Memory Space + Bus Master, then MSI-X Enable.
++        cfg_write(12'h004, 32'h0000_0006);
++        cfg_write(12'h050, 32'h8000_0000);
+         repeat (20) @(negedge clk);
+         $display("[%0t] link_trained=%b datapath_rst_n=%b axi_rst_n=%b", $time, link_trained, datapath_rst_n, axi_rst_n);
+ 
+--- a/src-link_layer/hdl/link_phy_bridge_top.v
++++ b/src-link_layer/hdl/link_phy_bridge_top.v
+@@ -102,7 +102,7 @@
+     // ---- BAR0 DMA registers ----
+     input  wire         bar0_wr_en,
+     input  wire         bar0_rd_en,
+-    input  wire [11:0]  bar0_addr,
++    input  wire [15:0]  bar0_addr,     // 16 bits: BAR0 0x0000 DMA regs, 0x1000 MSI-X table, 0x1800 PBA
+     input  wire [31:0]  bar0_wdata,
+     output wire [31:0]  bar0_rdata,
+     output wire         bar0_rd_valid,

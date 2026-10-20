@@ -9,7 +9,9 @@ input  wire       rst_n,
 input  wire       byte_valid,
 input  wire [7:0] byte_in,
 output reg        lane_num_valid,
-output reg  [7:0] lane_num_out
+output reg  [7:0] lane_num_out,
+output reg        os_valid,       // NEW: pulse when any well-formed TS1/TS2 ends (for pcie_ltssm)
+output reg        os_ts2          // NEW: ...and it was a TS2
 );
 
 localparam COM     = 8'hBC;
@@ -40,8 +42,11 @@ always @(posedge clk or negedge rst_n) begin
     prev_valid     <= 1'b0;
     prev_confirmed <= 8'd0;
     id_match       <= 1'b1;
+    os_valid       <= 1'b0;
+    os_ts2         <= 1'b0;
   end else begin
     lane_num_valid <= 1'b0;
+    os_valid       <= 1'b0;
 
     if (byte_valid) begin
       case (state)
@@ -66,6 +71,8 @@ always @(posedge clk or negedge rst_n) begin
 
           if (byte_idx == 4'd15) begin
             if (id_match && byte_ok_now && (id_byte0 == TS1_ID || id_byte0 == TS2_ID)) begin
+              os_valid <= 1'b1;
+              os_ts2   <= (id_byte0 == TS2_ID);
               if (prev_valid && (prev_confirmed == lane_candidate)) begin
                 lane_num_valid <= 1'b1;
                 lane_num_out   <= lane_candidate;
