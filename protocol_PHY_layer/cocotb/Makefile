@@ -6,8 +6,8 @@ VERILOG_SOURCES += $(addprefix $(PWD)/../,$(shell grep -v '^//' ../files.f | gre
 
 TOPLEVEL = pcie_phy_top
 COCOTB_TOPLEVEL = pcie_phy_top
-MODULE   = test_pcie_link_top,test_pcie_phy_top
-COCOTB_TEST_MODULES = test_pcie_link_top,test_pcie_phy_top
+MODULE   = test_pcie_phy_top_base,test_pcie_phy_top
+COCOTB_TEST_MODULES = test_pcie_phy_top_base,test_pcie_phy_top
 
 ifeq ($(SIM),verilator)
     EXTRA_ARGS += --trace --trace-structs

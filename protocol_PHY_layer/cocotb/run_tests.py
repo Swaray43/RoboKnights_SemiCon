@@ -12,7 +12,7 @@ Requires: iverilog (or verilator) on PATH, and `pip install cocotb`.
 Same file layout as the Makefile version:
     cocotb/
     ├── run_tests.py           (this file)
-    ├── test_pcie_link_top.py  (original 4 tests, unchanged)
+    ├── test_pcie_phy_top_base.py  (original 4 tests; was test_pcie_link_top.py)
     ├── test_pcie_phy_top.py   (BAR0, session CDC, MSI-X, datapath loopback)
     └── models/
         └── rc_bfm.py
@@ -34,7 +34,7 @@ VERILOG_SOURCES = [
     if line.strip() and not line.strip().startswith("//")
 ]
 TOPLEVEL = "pcie_phy_top"
-TEST_MODULES = ["test_pcie_link_top", "test_pcie_phy_top"]
+TEST_MODULES = ["test_pcie_phy_top_base", "test_pcie_phy_top"]
 
 
 def main():

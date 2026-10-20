@@ -174,7 +174,7 @@ initial begin
     if (!destriper_flit_valid) begin
       $display("FAIL: timed out waiting for destriper_flit_valid - chain stalled somewhere");
       errors = errors + 1;
-      $stop;
+      $display(" RESULT: %s", (errors == 0) ? "PASS" : "FAIL"); $finish;
     end
   end
 
@@ -189,6 +189,6 @@ initial begin
 
   if (errors == 0) $display("ALL PASS: full data-path integration verified");
   else $display("TOTAL FAILURES: %0d", errors);
-  $stop;
+  $display(" RESULT: %s", (errors == 0) ? "PASS" : "FAIL"); $finish;
 end
 endmodule

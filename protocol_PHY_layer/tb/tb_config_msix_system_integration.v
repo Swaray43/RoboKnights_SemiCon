@@ -99,7 +99,9 @@ msix_controller #(.NUM_VECTORS(8)) u_msix (
   .tbl_rd_addr(tbl_rd_addr), .tbl_rd_data(tbl_rd_data), .tbl_rd_mask(tbl_rd_mask),
   .pba(pba),
   .dma_complete_pulse(dma_complete_pulse), .dma_complete_vector(dma_complete_vector),
-  .mwr_valid(mwr_valid), .mwr_ready(1'b1), .mwr_addr(mwr_addr), .mwr_data(mwr_data)
+  .mwr_valid(mwr_valid), .mwr_ready(1'b1), .mwr_addr(mwr_addr), .mwr_data(mwr_data),
+    .msix_enable(1'b1), .func_mask(1'b0),   // unit-level: MSI-X on (gating is tested in tb_pcie_phy_top)
+    .mm_wr_en(1'b0), .mm_rd_en(1'b0), .mm_pba(1'b0), .mm_addr(12'h0), .mm_wdata(32'h0), .mm_rdata(), .mm_rd_valid()
 );
 
 // ---- Steady-state datapath (verbatim reuse, proves no interference) ----
@@ -296,7 +298,7 @@ initial begin
 
   // ---- Phase 5: push one real FLIT through the datapath IN PARALLEL with config
   // space / MSI-X activity, to confirm no shared-resource interference ----
-  cfg_write(12'h004, 32'h3); // enable mem space + bus master, concurrently with FLIT traffic below
+  cfg_write(12'h004, 32'h6); // enable mem space (bit1) + bus master (bit2), concurrently with FLIT traffic below
 
   for (k = 0; k < 32; k = k + 1)
     flit_in[k*8 +: 8] = k[7:0];
@@ -315,7 +317,7 @@ initial begin
     if (!destriper_flit_valid) begin
       $display("FAIL: timed out waiting for destriper_flit_valid with config/MSI-X sharing the domain");
       errors = errors + 1;
-      $stop;
+      $display(" RESULT: %s", (errors == 0) ? "PASS" : "FAIL"); $finish;
     end
   end
 
@@ -325,13 +327,13 @@ initial begin
   end else $display("PASS: FLIT round-trip bit-exact with config space + MSI-X live in the same simulation");
 
   cfg_read(12'h004);
-  if (cfg_rdata[1:0] !== 2'b11) begin
+  if (cfg_rdata[2:1] !== 2'b11) begin
     $display("FAIL: Command register write lost during concurrent FLIT traffic");
     errors = errors + 1;
   end else $display("PASS: Command register write survived concurrent FLIT traffic, no resource conflict");
 
   if (errors == 0) $display("ALL PASS: pcie_config_space + msix_controller integrated cleanly into the full chain");
   else $display("TOTAL FAILURES: %0d", errors);
-  $stop;
+  $display(" RESULT: %s", (errors == 0) ? "PASS" : "FAIL"); $finish;
 end
 endmodule

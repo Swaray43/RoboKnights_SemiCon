@@ -13,7 +13,13 @@
 // Register map (byte offsets, 32-bit registers):
 //   0x00 CTRL          W1S, reads 0   [0] arm ch0  [1] arm ch1   (1-cycle pulses)
 //   0x04 STATUS        RO             [0] session_valid ch0  [1] session_valid ch1
-//                                     [9:8] status_in (spare inputs, e.g. overflow)
+//                                         session_valid clears once the session's data has
+//                                         LEFT THE LINK LAYER (session_done) -> safe to re-arm.
+//                                         An arm while it is still 1 is ignored and counted
+//                                         in ARM_DEBUG.
+//                                     [5:4] interconnect finished accepting ch0/ch1, data
+//                                         still draining (debug; from session_end_aclk)
+//                                     [9:8] status_in (overflow flags from the interconnect)
 //   0x08 ARB_WEIGHTS   RW             [WW-1:0] weight ch0   [8+WW-1:8] weight ch1
 //                                     reset 1:1
 //   0x0C SESSION_LIMIT RW             [LW-1:0] session byte limit, reset all-ones
@@ -58,6 +64,7 @@ module bar0_dma_regs #(
     // ---- status readback ----
     input  wire [1:0]    session_valid,
     input  wire [1:0]    status_in,
+    input  wire [1:0]    ic_end_seen,
     input  wire [7:0]    arm_dbg_ch0,
     input  wire [7:0]    arm_dbg_ch1
 );
@@ -104,7 +111,7 @@ always @(posedge clk) begin
             bar0_rd_valid <= 1'b1;
             case (bar0_addr[11:2])
                 10'h000: bar0_rdata <= 32'h0;
-                10'h001: bar0_rdata <= {22'h0, status_in, 6'h0, session_valid};
+                10'h001: bar0_rdata <= {22'h0, status_in, 2'h0, ic_end_seen, 2'h0, session_valid};
                 10'h002: bar0_rdata <= {16'h0, w1_x, w0_x};
                 10'h003: bar0_rdata <= lim_x;
                 10'h004: bar0_rdata <= {21'h0, msix_vec_ch1, 5'h0, msix_vec_ch0};

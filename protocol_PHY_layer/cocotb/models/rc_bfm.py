@@ -93,14 +93,48 @@ class RootComplexBFM:
         for _ in range(n):
             await FallingEdge(self.dut.clk)
 
-    async def train_link(self, lane_nums=(0, 1, 2, 3)):
-        """Send two TS1 ordered sets (matching the Verilog testbenches'
-        margin) and return once link_trained asserts. lane_nums (3,2,1,0)
-        models a lane-reversed link."""
-        await self._send_ts1_all_lanes(lane_nums)
-        await self._send_ts1_all_lanes(lane_nums)
+    async def _send_ts_all_lanes(self, lane_nums, ident):
+        """One 16-byte ordered set on all 4 injection lanes (ident 0x4A = TS1,
+        0x45 = TS2)."""
+        self.dut.ts_byte_valid.value = 1
+        lanes = ("ts_byte_l0", "ts_byte_l1", "ts_byte_l2", "ts_byte_l3")
+        for k in range(16):
+            for i, lane in enumerate(lanes):
+                if k == 0:
+                    v = 0xBC
+                elif k == 2:
+                    v = lane_nums[i]
+                elif k >= 10:
+                    v = ident
+                else:
+                    v = 0x00
+                getattr(self.dut, lane).value = v
+            await FallingEdge(self.dut.clk)
+        self.dut.ts_byte_valid.value = 0
+
+    async def train_link(self, lane_nums=(0, 1, 2, 3), max_ts2=200):
+        """Train through the ts_byte_* injection port, playing the link
+        partner for pcie_ltssm: 8 TS1 (Polling), then TS2 until the LTSSM
+        reaches L0 (it needs 8 TS2 received and 16 of its own TS2 sent)."""
+        while int(self.dut.ltssm_state.value) != 1:     # wait out Detect
+            await FallingEdge(self.dut.clk)
+        for _ in range(8):
+            await self._send_ts_all_lanes(lane_nums, 0x4A)
+        for _ in range(max_ts2):
+            await self._send_ts_all_lanes(lane_nums, 0x45)
+            if int(self.dut.link_trained.value):
+                break
         await self._wait_negedges(3)
         assert self.dut.link_trained.value == 1, "link_trained did not assert after training sequence"
+
+    async def wait_link_up_over_lanes(self, max_cycles=6000):
+        """Training over the lanes: TX sends TS1 through whatever channel the
+        test models (start serdes_loopback first); return once link_trained."""
+        for _ in range(max_cycles):
+            await FallingEdge(self.dut.clk)
+            if int(self.dut.link_trained.value):
+                return
+        assert False, "link did not train over the lanes"
 
     async def release_axi_reset(self):
         """Pulse updatefc_received once link_state has settled to LINK_UP,
@@ -130,6 +164,12 @@ class RootComplexBFM:
         await FallingEdge(self.dut.clk)
         self.dut.cfg_rd_en.value = 0
         return int(self.dut.cfg_rdata.value)
+
+    async def enable_function(self):
+        """What a host driver does before using the device: Command register
+        Memory Space (bit 1) + Bus Master (bit 2), and MSI-X Enable."""
+        await self.cfg_write(0x004, 0x0000_0006)
+        await self.cfg_write(0x050, 0x8000_0000)
 
     async def program_msix_vector(self, vec, addr, data, masked=False):
         await FallingEdge(self.dut.clk)

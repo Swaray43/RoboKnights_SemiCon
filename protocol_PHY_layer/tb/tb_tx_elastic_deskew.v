@@ -105,6 +105,6 @@ initial begin
   end
   if (errors == 0) $display("ALL PASS: tx_elastic_deskew core behavior verified");
   else $display("TOTAL FAILURES: %0d", errors);
-  $stop;
+  $display(" RESULT: %s", (errors == 0) ? "PASS" : "FAIL"); $finish;
 end
 endmodule

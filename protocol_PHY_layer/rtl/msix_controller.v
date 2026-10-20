@@ -11,6 +11,17 @@
 //     the PBA bit is cleared when the message goes out (PCIe MSI-X rule).
 //     Before, a masked interrupt stayed pending forever.
 //
+// CHANGES (config-space gating, #3):
+//   - New inputs msix_enable / func_mask (from pcie_config_space Message
+//     Control). MSI-X Enable = 0: no messages, completions are dropped.
+//     Function Mask = 1: completions set PBA bits and nothing is sent until
+//     the function mask clears, then pending vectors drain as normal.
+//   - New DWORD-wide memory-mapped port (mm_*) so the host can reach the
+//     table and PBA through BAR0, where config space 0x54/0x58 now point.
+//     Standard 16-byte entry layout: +0 msg addr lo, +4 msg addr hi,
+//     +8 msg data, +12 vector control (bit 0 = mask). PBA is read-only.
+//     The original tbl_* port still works (cocotb and the unit tests use it).
+//
 // Table entries hold {msg_addr[63:0], msg_data[31:0]} per work_distribution.md
 // (vector-control/mask is tracked separately below as its own array, since
 // the doc's entry description names only address+data - masking is its own
@@ -54,7 +65,20 @@ module msix_controller #(
     output reg                         mwr_valid,
     input  wire                        mwr_ready,
     output reg  [63:0]                 mwr_addr,
-    output reg  [31:0]                 mwr_data
+    output reg  [31:0]                 mwr_data,
+
+    // ---- MSI-X capability Message Control (from config space) ----
+    input  wire                        msix_enable,
+    input  wire                        func_mask,
+
+    // ---- BAR-mapped DWORD access to the table / PBA ----
+    input  wire                        mm_wr_en,
+    input  wire                        mm_rd_en,
+    input  wire                        mm_pba,          // 0 = table region, 1 = PBA region
+    input  wire [11:0]                 mm_addr,         // byte offset inside the region
+    input  wire [31:0]                 mm_wdata,
+    output reg  [31:0]                 mm_rdata,
+    output reg                         mm_rd_valid
 );
 
 localparam VW = $clog2(NUM_VECTORS);
@@ -84,7 +108,13 @@ always @(*) begin
         end
 end
 
-wire new_fires = dma_complete_pulse && !table_mask[dma_complete_vector] && slot_free;
+wire fire_ok   = msix_enable && !func_mask;
+wire new_fires = dma_complete_pulse && fire_ok && !table_mask[dma_complete_vector] && slot_free;
+
+// mm port decode: entry = addr[.. :4], DWORD within entry = addr[3:2]
+wire [VW-1:0] mm_vec   = mm_addr[VW+3:4];
+wire [1:0]    mm_dw    = mm_addr[3:2];
+wire          mm_in_tb = (mm_addr[11:4] < NUM_VECTORS);
 
 integer j;
 always @(posedge clk) begin
@@ -109,8 +139,18 @@ always @(posedge clk) begin
             table_mask[tbl_wr_vec] <= tbl_wr_mask;
         end
 
-        // ---- New completion: fire now, or pend if masked / output busy ----
-        if (dma_complete_pulse) begin
+        // ---- Host DWORD write to the table through BAR0 ----
+        if (mm_wr_en && !mm_pba && mm_in_tb) begin
+            case (mm_dw)
+                2'd0: table_addr[mm_vec][31:0]  <= mm_wdata;
+                2'd1: table_addr[mm_vec][63:32] <= mm_wdata;
+                2'd2: table_data[mm_vec]        <= mm_wdata;
+                2'd3: table_mask[mm_vec]        <= mm_wdata[0];
+            endcase
+        end
+
+        // ---- New completion: fire now, pend if masked / busy, drop if MSI-X off ----
+        if (dma_complete_pulse && msix_enable) begin
             if (new_fires) begin
                 mwr_valid <= 1'b1;
                 mwr_addr  <= table_addr[dma_complete_vector];
@@ -121,12 +161,34 @@ always @(posedge clk) begin
         end
 
         // ---- Drain one pending, now-unmasked vector when the slot is free ----
-        if (!new_fires && slot_free && drain_hit) begin
+        if (!new_fires && fire_ok && slot_free && drain_hit) begin
             mwr_valid <= 1'b1;
             mwr_addr  <= table_addr[drain_vec];
             mwr_data  <= table_data[drain_vec];
             if (!(dma_complete_pulse && dma_complete_vector == drain_vec))
                 pba_reg[drain_vec] <= 1'b0;
+        end
+    end
+end
+
+// ---- BAR-mapped DWORD reads (registered) ----
+always @(posedge clk) begin
+    if (!rst_n) begin
+        mm_rdata    <= 32'h0;
+        mm_rd_valid <= 1'b0;
+    end else begin
+        mm_rd_valid <= mm_rd_en;
+        if (mm_rd_en) begin
+            if (mm_pba)
+                mm_rdata <= (mm_addr[11:2] == 10'd0) ? pba_reg : 32'h0;   // PBA DW0 (NUM_VECTORS <= 32)
+            else if (!mm_in_tb)
+                mm_rdata <= 32'h0;
+            else case (mm_dw)
+                2'd0: mm_rdata <= table_addr[mm_vec][31:0];
+                2'd1: mm_rdata <= table_addr[mm_vec][63:32];
+                2'd2: mm_rdata <= table_data[mm_vec];
+                2'd3: mm_rdata <= {31'h0, table_mask[mm_vec]};
+            endcase
         end
     end
 end

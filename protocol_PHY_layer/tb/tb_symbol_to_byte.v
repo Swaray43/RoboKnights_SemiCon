@@ -49,6 +49,6 @@ initial begin
 
   if (errors == 0) $display("ALL PASS: symbol_to_byte verified");
   else $display("TOTAL FAILURES: %0d", errors);
-  $stop;
+  $display(" RESULT: %s", (errors == 0) ? "PASS" : "FAIL"); $finish;
 end
 endmodule

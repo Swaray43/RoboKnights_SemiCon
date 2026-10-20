@@ -85,7 +85,7 @@ initial begin
 	@(negedge clk);
 	if (!ready_out) begin
 		$display("FAIL: ready_out low when idle, cannot start test");
-		$stop;
+		$display(" RESULT: %s", (errors == 0) ? "PASS" : "FAIL"); $finish;
 	end
 	valid_in = 1;
 	@(negedge clk); // flit_reg now loaded, active=1, cycle_cnt=0 -> this edge shows cycle 0
@@ -101,7 +101,7 @@ initial begin
 		$display("ALL PASS: lane striping round-robin verified for all 8 cycles");
 	else
 		$display("TOTAL FAILURES: %0d", errors);
-	$stop;
+	$display(" RESULT: %s", (errors == 0) ? "PASS" : "FAIL"); $finish;
 end
 
 endmodule

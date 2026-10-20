@@ -25,6 +25,15 @@
 // flit_eof is accepted for interface symmetry; framing is checked against
 // WORDS_PER_FLIT and a mismatch sets framing_err (sticky).
 //
+// ---- Link training over the lanes ---------------------------------------------
+// pcie_ltssm picks what the lanes carry via os_mode: 1 = TS1, 2 = TS2
+// (ts_os_gen); Flit data only goes out with data_en (L0), otherwise the lanes
+// are quiet (Detect). Ordered sets go at the same 1 byte / 4 clk / lane. os_done pulses as
+// each ordered set finishes, so the LTSSM can count TS2s sent.
+// An ordered set is always sent whole; Flit data waits in the FIFO meanwhile
+// (flit_ready drops once it is full). The far end's ts_ordered_set_detector
+// reads these bytes off its lane_rx outputs - see pcie_phy_rx / pcie_phy_top.
+//
 // ---- Lane byte order -----------------------------------------------------------
 // Unchanged from flit_lane_striper: word byte k goes to lane (k mod 4), lowest
 // byte first. tx_level lane i is tx_level[3*i +: 3] (signed -3/-1/+1/+3).
@@ -36,6 +45,13 @@ module pcie_phy_tx #(
 )(
     input  wire         clk,
     input  wire         rst_n,
+
+    // ---- training ----
+    input  wire [1:0]   os_mode,         // from pcie_ltssm: 0 none, 1 TS1, 2 TS2
+    input  wire         data_en,         // link up (L0): Flit data may go out. Before
+                                         // that, data waits in the FIFO (lanes quiet in Detect)
+    output wire         ts_sending,      // TX lanes are carrying ordered sets, not data
+    output reg          os_done,         // pulse: one ordered set fully handed to the lanes
 
     // ---- from link layer (link_layer_tx phy_tx side) ----
     input  wire [255:0] flit_data,
@@ -146,7 +162,23 @@ wire [7:0] dsk_out0, dsk_out1, dsk_out2, dsk_out3;
 wire       dsk_valid;
 reg  [1:0] phase;
 reg        byte_valid;
-wire       dsk_rd = (phase == 2'd0) && dsk_valid;
+reg        byte_is_ts;
+
+// ---- TS1/TS2 ordered-set sequencing ----
+reg  [3:0] ts_idx;          // next byte of the ordered set (0..15)
+reg        ts_is2;          // type of the ordered set in progress
+wire       ts_want  = (os_mode != 2'd0);
+wire       slot     = (phase == 2'd0);
+wire       ts_send  = slot && ((ts_idx != 4'd0) || ts_want);   // never cut an OS short
+wire       dsk_rd   = slot && !ts_send && dsk_valid && data_en;
+assign     ts_sending = ts_want || (ts_idx != 4'd0);
+
+wire [7:0] ts_b0, ts_b1, ts_b2, ts_b3;
+reg  [31:0] ts_bytes_q;
+// type is chosen at byte 0 and held for the whole ordered set
+wire       cur_is2 = (ts_idx == 4'd0) ? (os_mode == 2'd2) : ts_is2;
+ts_os_gen u_tsgen (.idx(ts_idx), .ts2(cur_is2),
+                   .byte_l0(ts_b0), .byte_l1(ts_b1), .byte_l2(ts_b2), .byte_l3(ts_b3));
 
 tx_elastic_deskew #(.DEPTH(DESKEW_DEPTH), .THRESHOLD(4), .ROOM_BYTES(9)) u_deskew (
   .clk(clk), .rst_n(rst_n),
@@ -163,12 +195,32 @@ always @(posedge clk or negedge rst_n) begin
   if (!rst_n) begin
     phase      <= 2'd0;
     byte_valid <= 1'b0;
+    byte_is_ts <= 1'b0;
+    ts_idx     <= 4'd0;
+    ts_is2     <= 1'b0;
+    os_done    <= 1'b0;
+    ts_bytes_q <= 32'd0;
   end else begin
-    byte_valid <= dsk_rd;
-    if (dsk_rd)              phase <= 2'd1;
+    byte_valid <= ts_send || dsk_rd;
+    byte_is_ts <= ts_send;
+    if (ts_send || dsk_rd)   phase <= 2'd1;
     else if (phase != 2'd0)  phase <= phase + 2'd1;   // 1 -> 2 -> 3 -> 0
+
+    os_done <= 1'b0;
+    if (ts_send) begin
+      ts_bytes_q <= {ts_b3, ts_b2, ts_b1, ts_b0};
+      ts_is2     <= cur_is2;
+      ts_idx     <= ts_idx + 4'd1;                     // 15 -> 0 wraps
+      if (ts_idx == 4'd15) os_done <= 1'b1;
+    end
   end
 end
+
+// byte to each lane: the registered TS byte, or the deskew FIFO's registered output
+wire [7:0] ln_b0 = byte_is_ts ? ts_bytes_q[7:0]   : dsk_out0;
+wire [7:0] ln_b1 = byte_is_ts ? ts_bytes_q[15:8]  : dsk_out1;
+wire [7:0] ln_b2 = byte_is_ts ? ts_bytes_q[23:16] : dsk_out2;
+wire [7:0] ln_b3 = byte_is_ts ? ts_bytes_q[31:24] : dsk_out3;
 
 // -----------------------------------------------------------------------------
 // 4. Four TX lanes
@@ -176,18 +228,18 @@ end
 wire [3:0] lane_busy;
 wire signed [2:0] lvl0, lvl1, lvl2, lvl3;
 
-lane_tx u_lane0 (.clk(clk), .rst_n(rst_n), .byte_in_valid(byte_valid), .byte_in(dsk_out0),
+lane_tx u_lane0 (.clk(clk), .rst_n(rst_n), .byte_in_valid(byte_valid), .byte_in(ln_b0),
                  .busy(lane_busy[0]), .tx_level_valid(tx_level_valid[0]), .tx_level(lvl0));
-lane_tx u_lane1 (.clk(clk), .rst_n(rst_n), .byte_in_valid(byte_valid), .byte_in(dsk_out1),
+lane_tx u_lane1 (.clk(clk), .rst_n(rst_n), .byte_in_valid(byte_valid), .byte_in(ln_b1),
                  .busy(lane_busy[1]), .tx_level_valid(tx_level_valid[1]), .tx_level(lvl1));
-lane_tx u_lane2 (.clk(clk), .rst_n(rst_n), .byte_in_valid(byte_valid), .byte_in(dsk_out2),
+lane_tx u_lane2 (.clk(clk), .rst_n(rst_n), .byte_in_valid(byte_valid), .byte_in(ln_b2),
                  .busy(lane_busy[2]), .tx_level_valid(tx_level_valid[2]), .tx_level(lvl2));
-lane_tx u_lane3 (.clk(clk), .rst_n(rst_n), .byte_in_valid(byte_valid), .byte_in(dsk_out3),
+lane_tx u_lane3 (.clk(clk), .rst_n(rst_n), .byte_in_valid(byte_valid), .byte_in(ln_b3),
                  .busy(lane_busy[3]), .tx_level_valid(tx_level_valid[3]), .tx_level(lvl3));
 
 assign tx_level = {lvl3, lvl2, lvl1, lvl0};
 
-assign tx_idle = ff_empty && (strp_left == 4'd0) && !dsk_valid && (phase == 2'd0) &&
+assign tx_idle = !ts_sending && ff_empty && (strp_left == 4'd0) && !dsk_valid && (phase == 2'd0) &&
                  !byte_valid && (lane_busy == 4'b0000) && (tx_level_valid == 4'b0000);
 
 `ifndef SYNTHESIS

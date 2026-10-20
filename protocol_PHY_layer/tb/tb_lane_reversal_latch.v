@@ -47,6 +47,6 @@ initial begin
 
   if (errors == 0) $display("ALL PASS: lane_reversal_latch verified");
   else $display("TOTAL FAILURES: %0d", errors);
-  $stop;
+  $display(" RESULT: %s", (errors == 0) ? "PASS" : "FAIL"); $finish;
 end
 endmodule

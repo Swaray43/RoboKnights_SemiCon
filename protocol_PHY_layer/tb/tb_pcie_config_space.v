@@ -108,8 +108,8 @@ initial begin
         errors = errors + 1;
     end else $display("PASS: Device Control MPS/MRRS written and exposed correctly");
 
-    // ---- Command register: mem space + bus master enable ----
-    cfg_write(12'h004, 32'h0000_0003);
+    // ---- Command register: mem space (bit1) + bus master (bit2) enable, per PCI spec ----
+    cfg_write(12'h004, 32'h0000_0006);
     @(negedge clk);
     if (mem_en !== 1'b1 || bm_en !== 1'b1) begin
         $display("FAIL: mem_space_enable=%b bus_master_enable=%b, expected both 1", mem_en, bm_en);
@@ -161,6 +161,6 @@ initial begin
 
     if (errors == 0) $display("ALL PASS: pcie_config_space");
     else $display("TOTAL FAILURES: %0d", errors);
-    $stop;
+    $display(" RESULT: %s", (errors == 0) ? "PASS" : "FAIL"); $finish;
 end
 endmodule
