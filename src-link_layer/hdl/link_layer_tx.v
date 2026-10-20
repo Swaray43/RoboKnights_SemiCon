@@ -50,6 +50,13 @@ module link_layer_tx #(
     input  wire [SEQ_W-1:0]     ackn_seq,
     output wire                 ackn_taken,      // same-cycle: pending ACK/NAK is being loaded into a Flit
 
+    // G2: Flow-Control DLLPs (DW0 = P, DW1 = NP, DW2 = Cpl), sent in a
+    // control Flit with DLP[28] set. Takes priority over a payload Flit
+    // (one Flit slot; requests are rate-limited by the FC timer).
+    input  wire                 dllp_req,
+    input  wire [95:0]          dllp_data,
+    output wire                 dllp_taken,      // same-cycle: dllp_data is being loaded
+
     // System-synchronous 256-bit bus to PHY
     output wire                 m_sys_bus_valid,
     output wire [SYS_BUS_W-1:0] m_sys_bus_data,
@@ -99,6 +106,14 @@ module link_layer_tx #(
     // Combinational so the scheduler clears exactly the request that was
     // sampled; a newer request arriving on the same edge wins over the clear.
     assign ackn_taken = (state == ST_IDLE) && have_ackn;
+    assign dllp_taken = (state == ST_IDLE) && dllp_req;
+
+    // G2: DLP of an FC DLLP control Flit
+    reg [FL_DLP_W-1:0] fc_dlp;
+    always @(*) begin
+        fc_dlp = make_dlp(FLIT_KIND_CONTROL, {SEQ_W{1'b0}}, send_ack, send_nak, ackn_seq);
+        fc_dlp[FL_DLP_FC_BIT] = 1'b1;
+    end
 
     // CRC + FEC on the latched body
     wire [63:0] body_crc = flit_crc64(body_r);
@@ -113,7 +128,11 @@ module link_layer_tx #(
         end else begin
             case (state)
                 ST_IDLE: begin
-                    if (s_valid) begin
+                    if (dllp_req) begin
+                        // G2: FC DLLP control Flit (also carries any pending ACK/NAK)
+                        body_r     <= {fc_dlp, {(FL_TLP_W-96){1'b0}}, dllp_data};
+                        state      <= ST_CALC;
+                    end else if (s_valid) begin
                         body_r     <= {make_dlp(FLIT_KIND_PAYLOAD, s_seq, send_ack, send_nak, ackn_seq),
                                        s_payload};
                         state      <= ST_CALC;

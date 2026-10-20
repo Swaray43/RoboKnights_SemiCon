@@ -26,6 +26,10 @@
 //   0x10 MSIX_VEC      RW             [2:0] vector ch0  [10:8] vector ch1, reset 0 / 1
 //   0x14 ARM_DEBUG     RO             [7:0] arm-while-active count ch0, [15:8] ch1
 //   0x18 TC            RW             [2:0] traffic class ch0  [10:8] ch1
+//   0x1C XLAT_MISS      RO             [7:0] sticky count of inbound-MWr
+//                                      address-translation window misses
+//                                      (G3/P2-3), saturates at 0xFF. Any
+//                                      write to this offset clears it.
 //   0x20 BASE_CH0_LO   RW             base_addr_ch0[31:0]
 //   0x24 BASE_CH0_HI   RW             base_addr_ch0[63:32]
 //   0x28 BASE_CH1_LO   RW             base_addr_ch1[31:0]
@@ -66,7 +70,11 @@ module bar0_dma_regs #(
     input  wire [1:0]    status_in,
     input  wire [1:0]    ic_end_seen,
     input  wire [7:0]    arm_dbg_ch0,
-    input  wire [7:0]    arm_dbg_ch1
+    input  wire [7:0]    arm_dbg_ch1,
+
+    // ---- G3 (P2-3): inbound address-translation miss count ----
+    input  wire [7:0]    xlat_miss_cnt,
+    output reg           xlat_miss_clr
 );
 
 // zero-extended views for readback (WW <= 8, LW <= 32)
@@ -91,6 +99,7 @@ always @(posedge clk) begin
     end else begin
         arm_pulse     <= 2'b00;
         bar0_rd_valid <= 1'b0;
+        xlat_miss_clr <= 1'b0;
 
         if (bar0_wr_en) begin
             case (bar0_addr[11:2])
@@ -99,6 +108,7 @@ always @(posedge clk) begin
                 10'h003: session_limit <= bar0_wdata[LW-1:0];
                 10'h004: begin msix_vec_ch0 <= bar0_wdata[2:0]; msix_vec_ch1 <= bar0_wdata[10:8]; end
                 10'h006: begin tc_ch0 <= bar0_wdata[2:0]; tc_ch1 <= bar0_wdata[10:8]; end
+                10'h007: xlat_miss_clr <= 1'b1;   // G3: any write clears the sticky counter
                 10'h008: base_addr_ch0[31:0]  <= bar0_wdata;
                 10'h009: base_addr_ch0[63:32] <= bar0_wdata;
                 10'h00A: base_addr_ch1[31:0]  <= bar0_wdata;
@@ -117,6 +127,7 @@ always @(posedge clk) begin
                 10'h004: bar0_rdata <= {21'h0, msix_vec_ch1, 5'h0, msix_vec_ch0};
                 10'h005: bar0_rdata <= {16'h0, arm_dbg_ch1, arm_dbg_ch0};
                 10'h006: bar0_rdata <= {21'h0, tc_ch1, 5'h0, tc_ch0};
+                10'h007: bar0_rdata <= {24'h0, xlat_miss_cnt};
                 10'h008: bar0_rdata <= base_addr_ch0[31:0];
                 10'h009: bar0_rdata <= base_addr_ch0[63:32];
                 10'h00A: bar0_rdata <= base_addr_ch1[31:0];

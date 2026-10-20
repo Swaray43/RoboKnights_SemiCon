@@ -27,6 +27,7 @@ module pcie_rx_engine #(
     input wire [2:0]               tlp_cpl_status,
     input wire [PCIE_ADDR_W-1:0]   tlp_addr,
     input wire                     tlp_hdr_done,    // see REQ_ON_HDR_DONE
+    input wire                     tlp_has_data,    // G4 (P2-5): Fmt[1] -- disambiguates MWr from MRd
 
     input  wire                    req_alloc_valid,
     input  wire [TAG_WIDTH-1:0]    req_alloc_tag,
@@ -60,11 +61,25 @@ module pcie_rx_engine #(
     output wire [PCIE_ADDR_W-1:0]  cfg_req_addr,
 
     // Gap fix X2: malformed TLP (unrecognised Type field) detection.
-    output wire                    malformed_tlp_err
+    output wire                    malformed_tlp_err,
+
+    // G3 (P2-3): sticky inbound address-translation miss count + clear
+    output wire [7:0]              err_xlat_miss_cnt,
+    input  wire                    err_xlat_miss_clr
 );
 
     wire is_cpld = (tlp_type == 5'b01010);
-    wire is_mwr  = (tlp_type == 5'b00000) || (tlp_type == 5'b10000);
+    // G4 (P2-5): Type 0_0000 is shared by MRd and MWr; only Fmt[1]
+    // (tlp_has_data, from tlp_header_parser's parsed_has_data) tells them
+    // apart. The old code also matched a 5'b10000 "non-standard encoding"
+    // that nothing in this project ever produced -- removed, not replaced.
+    // A real inbound MRd (Type 0, no data) is no longer misrouted through
+    // the address translator as if it carried a write (it used to decode
+    // to a bogus AXI write with whatever garbage DW followed the header);
+    // it now falls through to malformed_type_err below, since this
+    // MWr-only RX path has no completion-generating path for inbound
+    // reads yet (P2-8 / future work, not this fix).
+    wire is_mwr  = (tlp_type == 5'b00000) && tlp_has_data;
 
     // Gap fix X1: Cfg Type0 (0_0100) / Type1 (0_0101) detection.
     wire is_cfg      = (tlp_type == 5'b00100) || (tlp_type == 5'b00101);
@@ -72,11 +87,6 @@ module pcie_rx_engine #(
 
     // Gap fix X2: any TLP whose Type isn't one of the above is
     // outside what this bridge currently recognises.
-    // NOTE: is_mwr's existing 5'b00000 case is ambiguous with a plain
-    // MRd (same Type per spec; the two are only pre-existing distinct
-    // here via the non-standard 5'b10000 encoding) -- that ambiguity
-    // predates this fix and isn't resolved here, so a genuine MRd is
-    // still classified alongside MWr rather than flagged malformed.
     wire malformed_type_err = tlp_rx_valid && tlp_rx_sof &&
                                !(is_mwr || is_cpld || is_cfg);
     assign malformed_tlp_err = malformed_type_err;
@@ -162,7 +172,9 @@ module pcie_rx_engine #(
         .axi_addr_ready(m_axi_awready), // Connected AXI4 ready
         .axi_addr_valid(m_axi_awvalid),
         .axi_addr(m_axi_awaddr),
-        .translation_err(m_axi_awerr)
+        .translation_err(m_axi_awerr),
+        .err_xlat_miss_cnt(err_xlat_miss_cnt),
+        .err_xlat_miss_clr(err_xlat_miss_clr)
     );
 
 endmodule

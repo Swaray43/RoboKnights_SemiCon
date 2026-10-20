@@ -26,13 +26,28 @@ module credit_manager (
     reg [7:0]  cplh_limit, cplh_consumed;
     reg [11:0] cpld_limit, cpld_consumed;
 
-    // Infinite Credit Flags (0x7F for Header, 0xFFF for Data per PCIe Spec)
-    wire is_ph_inf   = (ph_limit   == 8'h7F);
-    wire is_pd_inf   = (pd_limit   == 12'hFFF);
-    wire is_nph_inf  = (nph_limit  == 8'h7F);
-    wire is_npd_inf  = (npd_limit  == 12'hFFF);
-    wire is_cplh_inf = (cplh_limit == 8'h7F);
-    wire is_cpld_inf = (cpld_limit == 12'hFFF);
+    // ---- G2 (P2-2): PCIe FC semantics ----------------------------------
+    // * The FIRST update for a pool after reset is its InitFC value. An
+    //   advertised value of 0 there means INFINITE credits for that field
+    //   (header and data independently). 0x7F / 0xFFF are ordinary finite
+    //   limits -- the old "0x7F/0xFFF = infinite" sentinel is gone.
+    // * Later updates (UpdateFC) move a finite limit; for an infinite field
+    //   they are ignored (the spec requires them to be 0 anyway).
+    // * A pool that has not been initialised yet grants nothing: no TLP of
+    //   that type may go out before FC init (data_link_layer_top's
+    //   FC_INIT1 delivers the InitFC values here).
+    reg p_init, np_init, cpl_init;
+    reg ph_inf_r, pd_inf_r, nph_inf_r, npd_inf_r, cplh_inf_r, cpld_inf_r;
+
+    wire is_ph_inf   = ph_inf_r;
+    wire is_pd_inf   = pd_inf_r;
+    wire is_nph_inf  = nph_inf_r;
+    wire is_npd_inf  = npd_inf_r;
+    wire is_cplh_inf = cplh_inf_r;
+    wire is_cpld_inf = cpld_inf_r;
+
+    wire upd_hdr_inf  = (update_fc_hdr_limit  == 8'd0);
+    wire upd_data_inf = (update_fc_data_limit == 12'd0);
 
     // Modulo 2's Complement Credit Available Logic
     wire [7:0]  ph_avail   = (ph_limit   - ph_consumed)   & 8'hFF;
@@ -57,9 +72,9 @@ module credit_manager (
     reg has_credits;
     always @(*) begin
         case (alloc_req_type)
-            2'b00:   has_credits = ph_ok   && pd_ok;   // MWr
-            2'b01:   has_credits = nph_ok  && npd_ok;  // MRd
-            2'b10:   has_credits = cplh_ok && cpld_ok; // CplD
+            2'b00:   has_credits = p_init   && ph_ok   && pd_ok;   // MWr
+            2'b01:   has_credits = np_init  && nph_ok  && npd_ok;  // MRd
+            2'b10:   has_credits = cpl_init && cplh_ok && cpld_ok; // CplD
             default: has_credits = 1'b0;
         endcase
     end
@@ -76,21 +91,49 @@ module credit_manager (
             npd_limit     <= 12'd0;  npd_consumed  <= 12'd0;
             cplh_limit    <= 8'd0;   cplh_consumed <= 8'd0;
             cpld_limit    <= 12'd0;  cpld_consumed <= 12'd0;
+            p_init        <= 1'b0;   np_init       <= 1'b0;   cpl_init   <= 1'b0;
+            ph_inf_r      <= 1'b0;   pd_inf_r      <= 1'b0;
+            nph_inf_r     <= 1'b0;   npd_inf_r     <= 1'b0;
+            cplh_inf_r    <= 1'b0;   cpld_inf_r    <= 1'b0;
         end else begin
-            // Update Flow Control Limits from UpdateFC DLLPs
+            // InitFC (first update per pool) / UpdateFC (later updates)
             if (update_fc_valid) begin
                 case (update_fc_type)
                     2'b00: begin
-                        ph_limit <= update_fc_hdr_limit;
-                        pd_limit <= update_fc_data_limit;
+                        if (!p_init) begin
+                            p_init   <= 1'b1;
+                            ph_inf_r <= upd_hdr_inf;
+                            pd_inf_r <= upd_data_inf;
+                            ph_limit <= update_fc_hdr_limit;
+                            pd_limit <= update_fc_data_limit;
+                        end else begin
+                            if (!ph_inf_r) ph_limit <= update_fc_hdr_limit;
+                            if (!pd_inf_r) pd_limit <= update_fc_data_limit;
+                        end
                     end
                     2'b01: begin
-                        nph_limit <= update_fc_hdr_limit;
-                        npd_limit <= update_fc_data_limit;
+                        if (!np_init) begin
+                            np_init   <= 1'b1;
+                            nph_inf_r <= upd_hdr_inf;
+                            npd_inf_r <= upd_data_inf;
+                            nph_limit <= update_fc_hdr_limit;
+                            npd_limit <= update_fc_data_limit;
+                        end else begin
+                            if (!nph_inf_r) nph_limit <= update_fc_hdr_limit;
+                            if (!npd_inf_r) npd_limit <= update_fc_data_limit;
+                        end
                     end
                     2'b10: begin
-                        cplh_limit <= update_fc_hdr_limit;
-                        cpld_limit <= update_fc_data_limit;
+                        if (!cpl_init) begin
+                            cpl_init   <= 1'b1;
+                            cplh_inf_r <= upd_hdr_inf;
+                            cpld_inf_r <= upd_data_inf;
+                            cplh_limit <= update_fc_hdr_limit;
+                            cpld_limit <= update_fc_data_limit;
+                        end else begin
+                            if (!cplh_inf_r) cplh_limit <= update_fc_hdr_limit;
+                            if (!cpld_inf_r) cpld_limit <= update_fc_data_limit;
+                        end
                     end
                     default: ;
                 endcase

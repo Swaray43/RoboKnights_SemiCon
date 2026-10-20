@@ -5,18 +5,17 @@
 // issuance and isn't just inert plumbing.
 //
 // Sequence:
-//   1. Normal operation: send a beat, confirm it completes
-//      (gated_req_valid/credit_grant fire, TLP goes out) while
-//      credits are bootstrapped "infinite" (0x7F/0xFFF).
-//   2. Force ph_limit down to exactly ph_consumed (0 available,
-//      not the infinite sentinel) -- simulating a real, finite
-//      UpdateFC DLLP having arrived. Drive another beat and
-//      confirm the TX path genuinely stalls: split_valid stays
-//      high, credit_grant/gated_req_valid stay low, no new TLP
-//      is produced, for many cycles.
-//   3. Release the force back to the infinite sentinel
-//      (simulating a credit return) and confirm the stalled
-//      beat immediately proceeds and completes.
+//   0. G2: credits come from FC DLLPs over the self-loop. Wait for
+//      FC_INIT1/2 to finish and check the Posted pool came up
+//      infinite from the looped-back InitFC-P (HdrFC = DataFC = 0).
+//   1. Normal operation: send a beat, confirm it completes.
+//   2. Force the Posted header field finite with ph_limit ==
+//      ph_consumed (0 available) -- a real finite advertisement.
+//      Drive another beat and confirm the TX path genuinely stalls:
+//      split_valid stays high, credit_grant stays low, no new TLP,
+//      for many cycles.
+//   3. Return one header credit (ph_limit = ph_consumed + 1, still
+//      finite) and confirm the stalled beat proceeds and completes.
 // ============================================================
 module tb_credit_gate_proof;
 
@@ -104,6 +103,7 @@ module tb_credit_gate_proof;
 
     integer pass = 1;
     integer stall_cycles;
+    reg [7:0] lim_one;
 
     initial begin
         s_tvalid = 0; s_tdata = 0; s_tkeep = 0; s_tuser = 0; s_tlast = 0;
@@ -115,15 +115,22 @@ module tb_credit_gate_proof;
         @(negedge clk); cfg_wr = 1; cfg_id = 0; cfg_data = 64'h0000_0001_0000_0000;
         @(negedge clk); cfg_wr = 0;
 
-        // ---- Phase 1: normal operation under the infinite-credit
-        // bootstrap. Confirm credit_manager is actually in-line (grant
-        // toggles with the handshake) and the beat completes. ----
-        repeat (5) @(posedge clk);
-        if (!dut.u_credit_manager.is_ph_inf || !dut.u_credit_manager.is_pd_inf) begin
-            $display("FAIL: Posted pool did not bootstrap to the infinite sentinel");
-            pass = 0;
+        // ---- Phase 0: FC init over the self-loop (G2) ----
+        begin : fcwait
+            integer t;
+            for (t = 0; t < 5000 && !dut.fc_init_done; t = t + 1) @(posedge clk);
         end
+        if (!dut.fc_init_done || !dut.fc_credits_valid) begin
+            $display("FAIL Phase0: FC init did not complete over the loopback");
+            pass = 0;
+        end else if (!dut.u_credit_manager.p_init ||
+                     !dut.u_credit_manager.is_ph_inf || !dut.u_credit_manager.is_pd_inf) begin
+            $display("FAIL Phase0: Posted pool not initialised infinite from InitFC-P");
+            pass = 0;
+        end else
+            $display("Phase0 OK: FC_INIT1/2 done, Posted pool infinite from InitFC-P (HdrFC=DataFC=0)");
 
+        // ---- Phase 1: normal operation. ----
         send_beat(64'hAAAA_0000);
         repeat (300) @(posedge clk);
         if (n_tlp_out != 1) begin
@@ -140,6 +147,7 @@ module tb_credit_gate_proof;
         // for a sustained window, with split_valid asserted and
         // credit_grant held low the whole time. ----
         @(negedge clk);
+        force dut.u_credit_manager.ph_inf_r = 1'b0;
         force dut.u_credit_manager.ph_limit = dut.u_credit_manager.ph_consumed;
         @(posedge clk);
 
@@ -166,16 +174,21 @@ module tb_credit_gate_proof;
         end else
             $display("Phase2 OK: TX path genuinely stalled for %0d cycles with Posted credit exhausted, no TLP escaped", stall_cycles);
 
-        // ---- Phase 3: release the force (credit "returned" /
-        // advertised again as infinite) and confirm the stalled beat
-        // immediately proceeds and completes. ----
+        // ---- Phase 3: return exactly one header credit (still a
+        // finite pool) and confirm the stalled beat proceeds. ----
         @(negedge clk);
         release dut.u_credit_manager.ph_limit;
-        force dut.u_credit_manager.ph_limit = 8'h7F;
-        @(posedge clk);
+        lim_one = dut.u_credit_manager.ph_consumed + 8'd1;
+        force dut.u_credit_manager.ph_limit = lim_one;
 
         repeat (300) @(posedge clk);
+        if (dut.u_credit_manager.ph_consumed != lim_one) begin
+            $display("FAIL Phase3: expected exactly one header credit used (consumed=%0d limit=%0d)",
+                      dut.u_credit_manager.ph_consumed, lim_one);
+            pass = 0;
+        end
         release dut.u_credit_manager.ph_limit;
+        release dut.u_credit_manager.ph_inf_r;
 
         if (n_tlp_out != 2) begin
             $display("FAIL Phase3: stalled beat did not complete after credit was restored (n_tlp_out=%0d, expected 2)", n_tlp_out);

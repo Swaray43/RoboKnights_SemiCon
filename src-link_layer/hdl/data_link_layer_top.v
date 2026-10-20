@@ -34,6 +34,25 @@
 //                        Flits carry TLPs from both streams
 //   s_tx_axis_tready_ch  kept; both bits equal s_tx_axis_tready
 //   dllp_parser          no longer instantiated (ACK/NAK live in the DLP)
+//
+// G2 (P2-2): Flow Control DLLPs + FC initialisation
+//   FC DLLPs (InitFC1 / InitFC2 / UpdateFC, one each for P, NP, Cpl) ride in
+//   control Flits with DLP[28] set (layout in flit_defs.vh).
+//   * TX advertises INFINITE credits (HdrFC = DataFC = 0) for P, NP and Cpl.
+//     The RX side has no per-TLP buffer to account: a Flit that doesn't fit
+//     the RX Flit FIFO is NAKed and replayed. Endpoints must advertise
+//     infinite Cpl credits anyway. A finite advertisement would need RX
+//     credit return (count TLPs as they leave rx_tlp_delimiter) -- not built.
+//   * FC_INIT1: send InitFC1 x3 every FC_RESEND_CLKS until one full set has
+//     gone out AND InitFC1/InitFC2 for all three types has been received.
+//     Each type's first received value goes to the credit manager
+//     (fc_upd_*) -- that is the InitFC. fc_credits_valid goes high.
+//   * FC_INIT2: send InitFC2 x3 every FC_RESEND_CLKS until one set has gone
+//     out AND an InitFC2 / UpdateFC / payload Flit has been received.
+//   * FC_DONE: received UpdateFCs are forwarded to the credit manager.
+//     Nothing is sent (infinite advertisement needs no updates).
+//   Received FC Flits are used only if FEC/CRC passed (rx_ok); a lost one
+//   is covered by the resend timer.
 // ============================================================
 
 module data_link_layer_top #(
@@ -44,7 +63,8 @@ module data_link_layer_top #(
     parameter REPLAY_DEPTH   = 32,
     parameter REPLAY_TIMEOUT = 16384,
     parameter RX_FIFO_DEPTH  = 4,
-    parameter IDLE_FLUSH     = 8
+    parameter IDLE_FLUSH     = 8,
+    parameter FC_RESEND_CLKS = 256     // G2: InitFC resend interval during FC init
 )(
     input  wire                     clk,
     input  wire                     rst_n,
@@ -82,7 +102,15 @@ module data_link_layer_top #(
     output wire                     crc_err,
     output wire                     fec_err,
     output wire                     fec_corrected,
-    output wire                     replay_event
+    output wire                     replay_event,
+
+    // G2: far-end FC credits -> credit_manager (InitFC, then UpdateFC)
+    output reg                      fc_upd_valid,
+    output reg  [1:0]               fc_upd_type,      // 00 P, 01 NP, 10 Cpl
+    output reg  [7:0]               fc_upd_hdr,
+    output reg  [11:0]              fc_upd_data,
+    output wire                     fc_credits_valid, // FC_INIT1 done: InitFC recorded for P/NP/Cpl
+    output wire                     fc_init_done      // FC_INIT2 done
 );
 
     localparam FL_W = 1888;
@@ -145,6 +173,10 @@ module data_link_layer_top #(
     reg [SEQ_WIDTH-1:0]  ackn_seq_r;
     wire                 ackn_taken;
 
+    reg                  fc_tx_req;
+    wire [95:0]          fc_tx_data;
+    wire                 fc_tx_taken;
+
     link_layer_tx #(
         .SYS_BUS_W(SYS_BUS_W),
         .SEQ_W    (SEQ_WIDTH)
@@ -159,6 +191,9 @@ module data_link_layer_top #(
         .nak_req        (nak_pend),
         .ackn_seq       (ackn_seq_r),
         .ackn_taken     (ackn_taken),
+        .dllp_req       (fc_tx_req),
+        .dllp_data      (fc_tx_data),
+        .dllp_taken     (fc_tx_taken),
         .m_sys_bus_valid(m_phy_tx_valid),
         .m_sys_bus_data (m_phy_tx_data),
         .m_sys_bus_sof  (m_phy_tx_sof),
@@ -175,6 +210,7 @@ module data_link_layer_top #(
     wire                 rx_ack_v, rx_nak_v;
     wire [SEQ_WIDTH-1:0] rx_ackn_seq;
     wire [FL_W-1:0]      rx_payload;
+    wire                 rx_fc_dllp;
 
     link_layer_rx #(
         .SYS_BUS_W(SYS_BUS_W),
@@ -194,6 +230,7 @@ module data_link_layer_top #(
         .rx_nak_valid   (rx_nak_v),
         .rx_ackn_seq    (rx_ackn_seq),
         .rx_payload     (rx_payload),
+        .rx_fc_dllp     (rx_fc_dllp),
         .crc_err        (crc_err),
         .fec_err        (fec_err),
         .fec_corrected  (fec_corrected)
@@ -265,6 +302,142 @@ module data_link_layer_top #(
             end
         end
     end
+
+    // ---------------- G2: FC DLLPs / FC initialisation ----------------
+    localparam [1:0] FC_INIT1 = 2'd0, FC_INIT2 = 2'd1, FC_DONE = 2'd2;
+    localparam [7:0] ADV_HDR  = 8'd0;     // infinite (see header note)
+    localparam [11:0] ADV_DATA = 12'd0;   // infinite
+    localparam FC_CNT_W = (FC_RESEND_CLKS > 1) ? $clog2(FC_RESEND_CLKS + 1) : 1;
+
+    reg  [1:0]          fc_state;
+    reg  [FC_CNT_W-1:0] fc_timer;
+    reg                 fc_sent;          // one full DLLP set sent in this state
+    reg  [2:0]          fc_seen;          // InitFC recorded per type (P, NP, Cpl)
+    reg                 fc_fi2;           // FC_INIT2 exit event seen
+
+    // TX DLLP set for the current state (only INIT1/INIT2 send)
+    wire [1:0]  fc_tx_class = (fc_state == FC_INIT1) ? 2'b01 : 2'b11;   // InitFC1 : InitFC2
+    function [31:0] fc_dllp;
+        input [1:0]  cls;      // 01 InitFC1, 11 InitFC2, 10 UpdateFC
+        input [1:0]  pool;     // 00 P, 01 NP, 10 Cpl
+        input [7:0]  hdr;
+        input [11:0] data;
+        begin
+            fc_dllp = {cls, pool, 4'b0000, 2'b00, hdr, 2'b00, data};
+        end
+    endfunction
+    assign fc_tx_data = {fc_dllp(fc_tx_class, 2'b10, ADV_HDR, ADV_DATA),
+                         fc_dllp(fc_tx_class, 2'b01, ADV_HDR, ADV_DATA),
+                         fc_dllp(fc_tx_class, 2'b00, ADV_HDR, ADV_DATA)};
+
+    // RX: decode the three DLLP slots of a good FC control Flit
+    wire fc_rx_flit = rx_v && rx_ok && (rx_kind == 2'd1) && rx_fc_dllp;
+    reg  [2:0]  rxs_init;     // slot k: InitFC1/InitFC2 for a valid pool on VC0
+    reg  [2:0]  rxs_upd;      // slot k: UpdateFC
+    reg  [2:0]  rxs_i2;       // slot k: InitFC2
+    reg  [5:0]  rxs_pool;
+    integer     k;
+    always @(*) begin
+        for (k = 0; k < 3; k = k + 1) begin
+            rxs_pool[2*k +: 2] = rx_payload[32*k + 28 +: 2];
+            rxs_init[k] = fc_rx_flit && rx_payload[32*k + 30] &&                 // 01 / 11
+                          (rx_payload[32*k + 28 +: 2] != 2'b11) &&
+                          (rx_payload[32*k + 24 +: 4] == 4'b0000);
+            rxs_i2[k]   = rxs_init[k] && rx_payload[32*k + 31];
+            rxs_upd[k]  = fc_rx_flit && (rx_payload[32*k + 30 +: 2] == 2'b10) &&
+                          (rx_payload[32*k + 28 +: 2] != 2'b11) &&
+                          (rx_payload[32*k + 24 +: 4] == 4'b0000);
+        end
+    end
+
+    // Per-pool pending update to the credit manager (one per clk)
+    reg  [2:0]  fcq_v;
+    reg  [23:0] fcq_hdr;
+    reg  [35:0] fcq_data;
+    wire [1:0]  fcq_sel = fcq_v[0] ? 2'd0 : (fcq_v[1] ? 2'd1 : 2'd2);
+
+    integer j;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            fc_state     <= FC_INIT1;
+            fc_timer     <= {FC_CNT_W{1'b0}};
+            fc_tx_req    <= 1'b0;
+            fc_sent      <= 1'b0;
+            fc_seen      <= 3'b000;
+            fc_fi2       <= 1'b0;
+            fcq_v        <= 3'b000;
+            fcq_hdr      <= 24'h0;
+            fcq_data     <= 36'h0;
+            fc_upd_valid <= 1'b0;
+            fc_upd_type  <= 2'b00;
+            fc_upd_hdr   <= 8'h0;
+            fc_upd_data  <= 12'h0;
+        end else begin
+            // ---- TX: resend timer ----
+            if (fc_tx_taken) begin
+                fc_tx_req <= 1'b0;
+                fc_sent   <= 1'b1;
+            end
+            if (fc_state != FC_DONE) begin
+                if (fc_timer == {FC_CNT_W{1'b0}}) begin
+                    if (!fc_tx_req || fc_tx_taken) fc_tx_req <= 1'b1;
+                    fc_timer <= FC_RESEND_CLKS[FC_CNT_W-1:0];
+                end else begin
+                    fc_timer <= fc_timer - 1'b1;
+                end
+            end
+
+            // ---- RX: InitFC / UpdateFC ----
+            for (j = 0; j < 3; j = j + 1) begin
+                if (rxs_init[j] && !fc_seen[rxs_pool[2*j +: 2]]) begin
+                    fc_seen[rxs_pool[2*j +: 2]]          <= 1'b1;
+                    fcq_v[rxs_pool[2*j +: 2]]            <= 1'b1;
+                    fcq_hdr[8*rxs_pool[2*j +: 2] +: 8]   <= rx_payload[32*j + 14 +: 8];
+                    fcq_data[12*rxs_pool[2*j +: 2] +: 12] <= rx_payload[32*j +: 12];
+                end
+                if (rxs_upd[j] && fc_state != FC_INIT1 && fc_seen[rxs_pool[2*j +: 2]]) begin
+                    fcq_v[rxs_pool[2*j +: 2]]            <= 1'b1;
+                    fcq_hdr[8*rxs_pool[2*j +: 2] +: 8]   <= rx_payload[32*j + 14 +: 8];
+                    fcq_data[12*rxs_pool[2*j +: 2] +: 12] <= rx_payload[32*j +: 12];
+                end
+            end
+            if (fc_state == FC_INIT2 &&
+                ((|rxs_i2) || (|rxs_upd) || (rx_v && rx_ok && is_payload)))
+                fc_fi2 <= 1'b1;
+
+            // ---- one pending update per clk -> credit manager ----
+            fc_upd_valid <= 1'b0;
+            if (fcq_v != 3'b000) begin
+                fc_upd_valid <= 1'b1;
+                fc_upd_type  <= fcq_sel;
+                fc_upd_hdr   <= fcq_hdr[8*fcq_sel +: 8];
+                fc_upd_data  <= fcq_data[12*fcq_sel +: 12];
+                // clear the served pool unless a new value lands this cycle
+                fcq_v[fcq_sel] <= 1'b0;
+                for (j = 0; j < 3; j = j + 1)
+                    if ((rxs_init[j] && !fc_seen[rxs_pool[2*j +: 2]]) ||
+                        (rxs_upd[j] && fc_state != FC_INIT1 && fc_seen[rxs_pool[2*j +: 2]]))
+                        if (rxs_pool[2*j +: 2] == fcq_sel) fcq_v[fcq_sel] <= 1'b1;
+            end
+
+            // ---- state ----
+            case (fc_state)
+                FC_INIT1: if (fc_sent && (fc_seen == 3'b111)) begin
+                              fc_state <= FC_INIT2;
+                              fc_sent  <= 1'b0;
+                              fc_timer <= {FC_CNT_W{1'b0}};   // send InitFC2 right away
+                          end
+                FC_INIT2: if (fc_sent && fc_fi2) begin
+                              fc_state  <= FC_DONE;
+                              fc_tx_req <= 1'b0;
+                          end
+                default:  ;
+            endcase
+        end
+    end
+
+    assign fc_credits_valid = (fc_state != FC_INIT1);
+    assign fc_init_done     = (fc_state == FC_DONE);
 
     // ---------------- RX TLP delimiter ----------------
     wire dl_ready;

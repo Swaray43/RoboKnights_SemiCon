@@ -54,6 +54,7 @@ module tb_link_layer_loopback;
         .clk(clk), .rst_n(rst_n),
         .s_valid(s_valid), .s_payload(s_payload), .s_seq(s_seq), .s_ready(s_ready),
         .ack_req(ack_req), .nak_req(nak_req), .ackn_seq(ackn_seq), .ackn_taken(ackn_taken),
+        .dllp_req(1'b0), .dllp_data(96'd0), .dllp_taken(),
         .m_sys_bus_valid(tx_valid), .m_sys_bus_data(tx_data),
         .m_sys_bus_sof(tx_sof), .m_sys_bus_eof(tx_eof), .m_sys_bus_ready(tx_ready)
     );

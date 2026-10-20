@@ -61,11 +61,18 @@ module axi_pcie_reorder_buffer #(
 
     assign req_ready = (occupancy < NUM_SLOTS);
 
+    // G6 (P2-7): each of this module's three for-loops used to share one
+    // module-level `integer i`, which Yosys's `check` flags as the same
+    // variable driven by multiple processes (2 warnings: this
+    // combinational block and the sequential block below both assigned
+    // it) -- harmless for simulation (loop index, not real hardware) but
+    // noise in signoff logs. Each loop now declares its own index,
+    // scoped to where it's used.
     reg [SLOT_BITS-1:0] match_idx;
     reg                 match_found;
-    integer i;
 
-    always @(*) begin
+    always @(*) begin : match_find
+        integer i;
         match_found = 1'b0;
         match_idx   = 0;
         for (i = 0; i < NUM_SLOTS; i = i + 1) begin
@@ -100,12 +107,15 @@ module axi_pcie_reorder_buffer #(
             m_axis_tkeep      <= 4'hf;
             m_axis_tuser      <= 0;
             
-            for (i = 0; i < NUM_SLOTS; i = i + 1) begin
-                slot_valid[i]         <= 0;
-                slot_rx_cnt[i]        <= 0;
-                slot_done[i]          <= 0;
-                slot_timeout_timer[i] <= 0;
-                slot_timeout_err[i]   <= 0;
+            begin : reset_slots
+                integer i;
+                for (i = 0; i < NUM_SLOTS; i = i + 1) begin
+                    slot_valid[i]         <= 0;
+                    slot_rx_cnt[i]        <= 0;
+                    slot_done[i]          <= 0;
+                    slot_timeout_timer[i] <= 0;
+                    slot_timeout_err[i]   <= 0;
+                end
             end
         end else begin
             
@@ -142,12 +152,15 @@ module axi_pcie_reorder_buffer #(
             // Gap fix R1: every outstanding slot counts down toward
             // timeout independently, not just whichever slot happens
             // to be at head_ptr right now.
-            for (i = 0; i < NUM_SLOTS; i = i + 1) begin
-                if (slot_valid[i] && !slot_done[i] && !slot_timeout_err[i]) begin
-                    if (slot_timeout_timer[i] >= TIMEOUT_CYCLES - 1)
-                        slot_timeout_err[i] <= 1'b1;
-                    else
-                        slot_timeout_timer[i] <= slot_timeout_timer[i] + 1;
+            begin : timeout_tick
+                integer i;
+                for (i = 0; i < NUM_SLOTS; i = i + 1) begin
+                    if (slot_valid[i] && !slot_done[i] && !slot_timeout_err[i]) begin
+                        if (slot_timeout_timer[i] >= TIMEOUT_CYCLES - 1)
+                            slot_timeout_err[i] <= 1'b1;
+                        else
+                            slot_timeout_timer[i] <= slot_timeout_timer[i] + 1;
+                    end
                 end
             end
 

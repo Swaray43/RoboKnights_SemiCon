@@ -9,6 +9,8 @@
 //   2. MWr outside the window (translation_err expected)
 //   3. CplD for a tag the reorder buffer actually allocated
 //   4. A malformed TLP (unrecognised Type field)
+//   5. G4 (P2-5): a genuine MRd (Type 0_0000, Fmt has-data=0) must NOT
+//      be misrouted through the address translator as a write
 // and a RESULT: PASS/FAIL line.
 // ============================================================
 module tb_pcie_rx_engine;
@@ -31,6 +33,7 @@ module tb_pcie_rx_engine;
     reg [6:0]               tlp_lower_addr;
     reg [2:0]               tlp_cpl_status;
     reg [PCIE_ADDR_W-1:0]   tlp_addr;
+    reg                     tlp_has_data;   // G4
 
     reg                     req_alloc_valid;
     reg [TAG_WIDTH-1:0]     req_alloc_tag;
@@ -75,6 +78,7 @@ module tb_pcie_rx_engine;
         .tlp_lower_addr(tlp_lower_addr),
         .tlp_cpl_status(tlp_cpl_status),
         .tlp_addr(tlp_addr), .tlp_hdr_done(1'b0),
+        .tlp_has_data(tlp_has_data),
         .req_alloc_valid(req_alloc_valid),
         .req_alloc_tag(req_alloc_tag),
         .req_alloc_len(req_alloc_len),
@@ -128,7 +132,7 @@ module tb_pcie_rx_engine;
         clk = 0; rst_n = 0;
         tlp_rx_valid = 0; tlp_rx_sof = 0; tlp_rx_eof = 0; tlp_rx_data = 0;
         tlp_type = 0; tlp_length_dw = 0; tlp_tag = 0; tlp_lower_addr = 0;
-        tlp_cpl_status = 0; tlp_addr = 0;
+        tlp_cpl_status = 0; tlp_addr = 0; tlp_has_data = 0;
         req_alloc_valid = 0; req_alloc_tag = 0; req_alloc_len = 0;
         m_axi_awready = 1;
         m_axis_cpl_tready = 1;
@@ -150,7 +154,8 @@ module tb_pcie_rx_engine;
         // m_axi_awready is held high here) -- check it right at the
         // negedge following that one posedge, before it clears.
         @(negedge clk);
-        tlp_type       = 5'b00000;              // MWr
+        tlp_type       = 5'b00000;              // MWr (Type 0, has_data=1)
+        tlp_has_data   = 1;
         tlp_addr       = 64'h0000_0000_2000_1004;
         tlp_rx_valid   = 1; tlp_rx_sof = 1; tlp_rx_eof = 1;
         tlp_rx_data    = 32'hCAFE_0001;
@@ -167,6 +172,7 @@ module tb_pcie_rx_engine;
         // ============================================================
         @(negedge clk);
         tlp_type     = 5'b00000; // MWr
+        tlp_has_data = 1;
         tlp_addr     = 64'h0000_0000_3000_1004; // different upper bits -> miss
         tlp_rx_valid = 1; tlp_rx_sof = 1; tlp_rx_eof = 1;
         tlp_rx_data  = 32'hBAD0_0000;
@@ -219,6 +225,23 @@ module tb_pcie_rx_engine;
         tlp_rx_valid = 0; tlp_rx_sof = 0; tlp_rx_eof = 0;
         @(posedge clk);
         check_eq(malformed_tlp_err, 0, "T4: malformed flag is a one-cycle pulse");
+
+        // ============================================================
+        // Test 5 (G4/P2-5): genuine MRd (Type 0_0000, has_data=0) inside
+        // the configured window must NOT produce an AXI write -- it used
+        // to be indistinguishable from MWr and decode a bogus write.
+        // ============================================================
+        @(negedge clk);
+        tlp_type     = 5'b00000; // MRd: same Type as MWr, no data
+        tlp_has_data = 0;
+        tlp_addr     = 64'h0000_0000_2000_2004; // inside the window
+        tlp_rx_valid = 1; tlp_rx_sof = 1; tlp_rx_eof = 1;
+        tlp_rx_data  = 32'h0000_0000;
+        @(posedge clk);
+        @(negedge clk);
+        tlp_rx_valid = 0; tlp_rx_sof = 0; tlp_rx_eof = 0;
+        check_eq(m_axi_awvalid, 0, "T5: MRd must not drive AWVALID (no misrouted write)");
+        @(posedge clk);
 
         if (errors == 0) $display("RESULT: PASS");
         else              $display("RESULT: FAIL (%0d errors)", errors);

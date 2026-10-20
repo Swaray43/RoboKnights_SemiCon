@@ -140,7 +140,11 @@ module stream_tx_path_top #(
     output wire  crc_err,
     output wire  fec_err,
     output wire  fec_corrected,
-    output wire  replay_event
+    output wire  replay_event,
+
+    // G2: flow-control status (from data_link_layer_top)
+    output wire  fc_credits_valid,   // far-end InitFC recorded (FC_INIT1 done)
+    output wire  fc_init_done        // FC_INIT2 done
 );
 
     // ==================================================================
@@ -215,35 +219,24 @@ module stream_tx_path_top #(
     wire        credit_stall_unused;
     wire        gated_req_valid    = split_valid && credit_grant;
 
-    // One-shot Flow-Control bootstrap: no DLLP/UpdateFC source is wired
-    // to the RX side yet (DLLP_parser.v is parked under legacy/, not
-    // part of the active data_link_layer_top RX chain), so there is no
-    // real link-partner-advertised Posted limit to track. Until that
-    // exists, seed the Posted header/data limits to the PCIe "infinite
-    // credits" sentinel (0x7F / 0xFFF) exactly once, one cycle after
-    // reset. credit_manager is then genuinely live -- it is in the real
-    // request/grant path and will correctly gate and stall the TX path
-    // the moment a real (finite) UpdateFC arrives on this same port --
-    // but with nothing yet advertising a finite limit it imposes no
-    // back-pressure of its own, so today's throughput/behavior is
-    // unchanged. Replace this block with the real DLLP RX path once
-    // that side is wired up.
-    reg credit_init_done;
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n)
-            credit_init_done <= 1'b0;
-        else if (!credit_init_done)
-            credit_init_done <= 1'b1;
-    end
-    wire credit_init_valid = !credit_init_done;
+    // G2 (P2-2): credits come from the link partner's FC DLLPs.
+    // data_link_layer_top runs FC_INIT1/FC_INIT2 over control Flits and
+    // forwards each type's InitFC (first value) and later UpdateFCs here.
+    // 0 = infinite is decided inside credit_manager; the old one-shot
+    // 0x7F/0xFFF "infinite" bootstrap is gone. Until the far end's InitFC-P
+    // arrives the Posted pool grants nothing, so no MWr leaves before FC init.
+    wire        fc_upd_valid;
+    wire [1:0]  fc_upd_type;
+    wire [7:0]  fc_upd_hdr;
+    wire [11:0] fc_upd_data;
 
     credit_manager u_credit_manager (
         .clk                 (clk),
         .rst_n               (rst_n),
-        .update_fc_valid     (credit_init_valid),
-        .update_fc_type      (2'b00),            // Posted
-        .update_fc_hdr_limit (8'h7F),            // infinite (PCIe spec sentinel)
-        .update_fc_data_limit(12'hFFF),          // infinite (PCIe spec sentinel)
+        .update_fc_valid     (fc_upd_valid),
+        .update_fc_type      (fc_upd_type),
+        .update_fc_hdr_limit (fc_upd_hdr),
+        .update_fc_data_limit(fc_upd_data),
         .alloc_req_valid     (credit_alloc_valid),
         .alloc_req_type      (2'b00),            // Posted (MWr-only TX path)
         .alloc_req_dw_len    (split_len_dw[9:0]),
@@ -575,7 +568,13 @@ module stream_tx_path_top #(
         .crc_err            (crc_err),
         .fec_err            (fec_err),
         .fec_corrected      (fec_corrected),
-        .replay_event       (replay_event)
+        .replay_event       (replay_event),
+        .fc_upd_valid       (fc_upd_valid),
+        .fc_upd_type        (fc_upd_type),
+        .fc_upd_hdr         (fc_upd_hdr),
+        .fc_upd_data        (fc_upd_data),
+        .fc_credits_valid   (fc_credits_valid),
+        .fc_init_done       (fc_init_done)
     );
 
 `ifdef SIMULATION
