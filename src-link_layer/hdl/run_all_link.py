@@ -17,6 +17,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 PHY_RTL = HERE.parent.parent / "protocol_PHY_layer" / "rtl"
+SHARED = HERE.parent.parent / "shared"   # ticket G7: axis_tuser_defs.vh lives here
 RESULT_RE = re.compile(r"RESULT:\s*(PASS|FAIL)")
 # Older benches print "ALL TESTS PASSED" / "Results: N PASSED, M FAILED" instead.
 ALT_PASS_RE = re.compile(r"ALL TESTS PASSED")
@@ -53,8 +54,8 @@ def run_one(rtl, name, bench, deps, timeout):
         return "FAIL", "missing sources: " + ", ".join(missing)
     with tempfile.TemporaryDirectory() as td:
         vvp = Path(td) / f"{name}.vvp"
-        cmd = ["iverilog", "-g2012", "-DSIMULATION", "-I", str(HERE), "-s", bench_p.stem,
-               "-o", str(vvp)] + [str(s) for s in srcs]
+        cmd = ["iverilog", "-g2012", "-DSIMULATION", "-I", str(HERE), "-I", str(SHARED),
+               "-s", bench_p.stem, "-o", str(vvp)] + [str(s) for s in srcs]
         c = subprocess.run(cmd, capture_output=True, text=True)
         if c.returncode != 0:
             return "FAIL", "compile error: " + c.stderr.strip().splitlines()[-1]

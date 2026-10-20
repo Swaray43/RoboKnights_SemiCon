@@ -2,6 +2,7 @@
 // Paths are relative to the repo root. Use this list, NOT 'add directory':
 // protocol_PHY_layer/ still contains stale duplicate files (e.g. pcie_tag_man.v) that clash.
 +incdir+src-link_layer/hdl
++incdir+shared
 interconnect_layer/src/axi4s_ingest_port.v
 interconnect_layer/src/cdc_fifo_async.v
 interconnect_layer/src/interconnect_top.v

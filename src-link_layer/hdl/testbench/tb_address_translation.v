@@ -132,13 +132,20 @@ reg               cap_got;      // 1 = capture_output succeeded
 
 // ============================================================
 // Helper: make_tuser
+// Ticket G7 (Aditya + Swaray): this used to hardcode the field order
+// itself ({tlast, sess_offset, stream_id}), a second hand-written copy
+// of the layout the DUT assumes -- exactly the kind of copy that can
+// silently drift from the DUT's own. Now built via shared/
+// axis_tuser_defs.vh's tuser_pack, the one place the layout is defined.
 // ============================================================
+`include "axis_tuser_defs.vh"
+
 function [TUSER_W-1:0] make_tuser;
     input              stream_id;
     input [SOFF_W-1:0] sess_offset;
     input              tlast;
     begin
-        make_tuser = {tlast, sess_offset, stream_id};
+        make_tuser = tuser_pack(tlast, sess_offset, stream_id);
     end
 endfunction
 
