@@ -70,7 +70,7 @@ module link_phy_bridge_top #(
     // ---- Upstream AXI4-Stream (from interconnect_top) ----
     input  wire [DATA_W-1:0]   s_axis_tdata,
     input  wire [KEEP_W-1:0]   s_axis_tkeep,
-    input  wire [SOFF_W:0]     ic_tuser,        // {session_offset, stream_id}, no tlast bit yet
+    input  wire [TUSER_W-1:0]  s_axis_tuser,    // {tlast_flag, session_offset, stream_id} -- emitted natively by interconnect_top
     input  wire                s_axis_tlast,
     input  wire                s_axis_tvalid,
     output wire                s_axis_tready,
@@ -120,7 +120,7 @@ module link_phy_bridge_top #(
     // ---- BAR0 DMA registers, external/test access (straight to pcie_phy_top) ----
     input  wire         bar0_wr_en,
     input  wire         bar0_rd_en,
-    input  wire [11:0]  bar0_addr,
+    input  wire [15:0]  bar0_addr,       // 0x0000 DMA regs, 0x1000 MSI-X table, 0x1800 PBA
     input  wire [31:0]  bar0_wdata,
     output wire [31:0]  bar0_rdata,
     output wire         bar0_rd_valid,
@@ -270,7 +270,8 @@ module link_phy_bridge_top #(
     // 3. link_layer_top -- Swaray's layer: TX stream chain + Flit DLL +
     //    the new RX decode (unpacker -> tlp_header_parser -> pcie_rx_engine)
     // ================================================================
-    wire [TUSER_W-1:0] ll_s_axis_tuser = {s_axis_tlast, ic_tuser};  // add tlast_flag mirror bit
+    // TUSER arrives already in the link's native {tlast_flag, session_offset,
+    // stream_id} order from interconnect_top -- passed straight through, no remap.
  
     link_layer_top #(
         .DATA_W      (DATA_W),
@@ -287,7 +288,7 @@ module link_phy_bridge_top #(
  
         .s_axis_tdata       (s_axis_tdata),
         .s_axis_tkeep       (s_axis_tkeep),
-        .s_axis_tuser       (ll_s_axis_tuser),
+        .s_axis_tuser       (s_axis_tuser),
         .s_axis_tlast       (s_axis_tlast),
         .s_axis_tvalid      (s_axis_tvalid),
         .s_axis_tready      (s_axis_tready),
@@ -338,15 +339,18 @@ module link_phy_bridge_top #(
         .fec_err            (fec_err),
         .fec_corrected      (fec_corrected),
         .replay_event       (replay_event),
-        .malformed_tlp_err  (malformed_tlp_err)
+        .malformed_tlp_err  (malformed_tlp_err),
+
+        .mon_rx_axis_tvalid (m_rx_axis_tvalid),
+        .mon_rx_axis_tdata  (m_rx_axis_tdata),
+        .mon_rx_axis_tkeep  (m_rx_axis_tkeep),
+        .mon_rx_axis_tlast  (m_rx_axis_tlast)
     );
  
-    // RX TLP stream out of the link layer (raw bytes, not yet BAR0-decoded
-    // on the m_rx_axis_* path -- that happens via m_axi_awvalid above;
-    // m_rx_axis_* is kept for whatever still consumes the raw byte stream).
-    assign m_rx_axis_tvalid = 1'b0;
-    assign m_rx_axis_tdata  = {DATA_W{1'b0}};
-    assign m_rx_axis_tkeep  = {KEEP_W{1'b0}};
-    assign m_rx_axis_tlast  = 1'b0;
+    // m_rx_axis_* is a MONITOR copy of the inbound TLP byte stream (every beat
+    // the RX decode accepts). The decode inside link_layer_top owns flow
+    // control, so m_rx_axis_tready is ignored. bridge_top's testbenches check
+    // TLP contents/order on this tap.
+    wire unused_rx_tready = m_rx_axis_tready;
  
 endmodule

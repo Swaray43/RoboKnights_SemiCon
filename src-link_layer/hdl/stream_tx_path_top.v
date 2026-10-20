@@ -91,7 +91,7 @@ module stream_tx_path_top #(
 
     // Upstream AXI4-Stream (interconnect CDC output)
     // TUSER = {tlast_flag, session_offset[23:0], stream_id}
-    // (use ic2link_tuser_remap to convert the interconnect's order)
+    // (interconnect_top emits exactly this order since Phase 2; no remap needed)
     input  wire [DATA_W-1:0]   s_axis_tdata,
     input  wire [KEEP_W-1:0]   s_axis_tkeep,
     input  wire [TUSER_W-1:0]  s_axis_tuser,

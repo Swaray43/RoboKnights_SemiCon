@@ -99,7 +99,7 @@ function [10:0] fl_cw_syn;
         for (b = j; b < FL_FEC_BYTES; b = b + 3) begin
             for (k = 0; k < 8; k = k + 1) begin
                 p = p + 11'd1;
-                while (fl_is_pow2(p)) p = p + 11'd1;
+                if (fl_is_pow2(p)) p = p + 11'd1;   // "if" not "while": p starts at 3, never two powers of 2 in a row past 2; Yosys rejects while here
                 if (d[b*8+k]) begin
                     s   = s ^ p[9:0];
                     par = ~par;
@@ -160,7 +160,7 @@ function [FL_PROT_W+1:0] flit_fec_decode;
                     for (b = j; b < FL_FEC_BYTES; b = b + 3) begin
                         for (k = 0; k < 8; k = k + 1) begin
                             p = p + 11'd1;
-                            while (fl_is_pow2(p)) p = p + 11'd1;
+                            if (fl_is_pow2(p)) p = p + 11'd1;   // "if" not "while": p starts at 3, never two powers of 2 in a row past 2; Yosys rejects while here
                             if (p[9:0] == s && p[10] == 1'b0) begin
                                 fixed[b*8+k] = ~fixed[b*8+k];
                                 found = 1'b1;

@@ -5,7 +5,7 @@
 //
 // Since interconnect_top.v does not exist anywhere in the project,
 // this bench plays its role directly: it drives link_phy_bridge_top's
-// top-level s_axis_*/ic_tuser inputs exactly as bridge_top.v would
+// top-level s_axis_* inputs (TUSER in link-native order) exactly as bridge_top.v would
 // feed them from interconnect_top, and the bar0_*/session_* ports
 // exactly as pcie_config_space/host software would via bridge_top.v's
 // own pass-through ports.
@@ -52,7 +52,7 @@ module tb_link_phy_bridge_top;
     // ---------------- DUT I/O ----------------
     reg  [DATA_W-1:0] s_tdata;
     reg  [KEEP_W-1:0] s_tkeep;
-    reg  [SOFF_W:0]   ic_tuser;      // {session_offset[23:0], stream_id}
+    reg  [SOFF_W+1:0] s_tuser;       // {tlast_flag, session_offset[23:0], stream_id} -- link-native, as interconnect_top emits it
     reg               s_tlast;
     reg               s_tvalid;
     wire              s_tready;
@@ -87,7 +87,7 @@ module tb_link_phy_bridge_top;
     reg  [2:0] dma_complete_vector = 0;
  
     reg  bar0_wr_en = 0, bar0_rd_en = 0;
-    reg  [11:0] bar0_addr = 0;
+    reg  [15:0] bar0_addr = 0;     // 0x0000 DMA regs, 0x1000 MSI-X table, 0x1800 PBA
     reg  [31:0] bar0_wdata = 0;
     wire [31:0] bar0_rdata;
     wire bar0_rd_valid;
@@ -124,7 +124,7 @@ module tb_link_phy_bridge_top;
     ) dut (
         .clk(clk), .perst_n(perst_n), .aclk(aclk), .aclk_rst_n(aclk_rst_n),
  
-        .s_axis_tdata(s_tdata), .s_axis_tkeep(s_tkeep), .ic_tuser(ic_tuser),
+        .s_axis_tdata(s_tdata), .s_axis_tkeep(s_tkeep), .s_axis_tuser(s_tuser),
         .s_axis_tlast(s_tlast), .s_axis_tvalid(s_tvalid), .s_axis_tready(s_tready),
  
         .m_rx_axis_tvalid(m_rx_axis_tvalid), .m_rx_axis_tdata(m_rx_axis_tdata),
@@ -208,7 +208,14 @@ module tb_link_phy_bridge_top;
     always @(posedge clk) cyc <= cyc + 1;
  
     // ---------------- session-arm via bar0 regs (host-software path) ----------------
-    task bar0_write(input [11:0] addr, input [31:0] data);
+    task cfg_write(input [11:0] a, input [31:0] d);
+        begin
+            @(negedge clk); cfg_addr = a; cfg_wdata = d; cfg_wr_en = 1;
+            @(negedge clk); cfg_wr_en = 0;
+        end
+    endtask
+
+    task bar0_write(input [15:0] addr, input [31:0] data);
         begin
             @(negedge clk);
             bar0_wr_en = 1; bar0_addr = addr; bar0_wdata = data;
@@ -218,16 +225,21 @@ module tb_link_phy_bridge_top;
     endtask
  
     initial begin
-        s_tvalid = 0; s_tdata = 0; s_tkeep = 0; ic_tuser = 0; s_tlast = 0;
+        s_tvalid = 0; s_tdata = 0; s_tkeep = 0; s_tuser = 0; s_tlast = 0;
  
         repeat (5) @(posedge clk);
         perst_n = 1;
+        // PHY LTSSM trains over the loopback by itself (~1700 clk), then the
+        // host enables Memory Space (BAR0 is ignored until it is set).
+        wait (link_trained === 1'b1);
+        wait (axi_rst_n === 1'b1);
+        cfg_write(12'h004, 32'h0000_0006);
         repeat (5) @(posedge clk);
  
         // Program base_addr_ch0 (lo/hi words) then arm channel 0.
-        bar0_write(12'h020, PCIE_BASE[31:0]);   // addr word 0x008 -> byte addr 0x020
-        bar0_write(12'h024, PCIE_BASE[63:32]);  // addr word 0x009 -> byte addr 0x024
-        bar0_write(12'h000, 32'h0000_0001);     // arm_pulse[0] = 1
+        bar0_write(16'h0020, PCIE_BASE[31:0]);   // addr word 0x008 -> byte addr 0x020
+        bar0_write(16'h0024, PCIE_BASE[63:32]);  // addr word 0x009 -> byte addr 0x024
+        bar0_write(16'h0000, 32'h0000_0001);     // arm_pulse[0] = 1
  
         // Let the arm pulse drain through session_arm_ctrl -> this module's
         // cfg_base_addr arbiter -> link_layer_top's base register.
@@ -238,7 +250,7 @@ module tb_link_phy_bridge_top;
         s_tdata        = {DATA_W{1'b0}};
         s_tdata[31:0]  = 32'hA5A5_1234;
         s_tkeep        = {{(KEEP_W-4){1'b0}}, 4'hF};
-        ic_tuser       = {24'd0, 1'b0}; // session_offset=0, stream_id=0
+        s_tuser        = {1'b1, 24'd0, 1'b0}; // {tlast_flag=1, session_offset=0, stream_id=0}
         s_tlast        = 1;
         s_tvalid       = 1;
         @(negedge clk);

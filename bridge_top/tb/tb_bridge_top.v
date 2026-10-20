@@ -33,7 +33,8 @@ module tb_bridge_top;
     reg updatefc_received = 0;
     wire link_trained, datapath_rst_n, axi_rst_n;
 
-    reg bar0_wr_en = 0; reg [11:0] bar0_addr = 0; reg [31:0] bar0_wdata = 0;
+    reg bar0_wr_en = 0; reg [15:0] bar0_addr = 0; reg [31:0] bar0_wdata = 0;
+    reg cfg_wr_en = 0; reg [11:0] cfg_addr = 0; reg [31:0] cfg_wdata = 0;
     reg tbl_wr_en = 0; reg [2:0] tbl_wr_vec = 0; reg [63:0] tbl_wr_addr = 0; reg [31:0] tbl_wr_data = 0;
 
     wire [11:0] lvl; wire [3:0] lvl_v;
@@ -50,6 +51,8 @@ module tb_bridge_top;
         .ts_byte_l2(ts_byte_l2), .ts_byte_l3(ts_byte_l3), .link_trained(link_trained),
         .hot_reset_request(1'b0), .flr_request(1'b0), .updatefc_received(updatefc_received),
         .datapath_rst_n(datapath_rst_n), .axi_rst_n(axi_rst_n),
+        .cfg_wr_en(cfg_wr_en), .cfg_rd_en(1'b0), .cfg_addr(cfg_addr), .cfg_wdata(cfg_wdata),
+        .cfg_rdata(), .cfg_cpl_valid(),
         .bar0_wr_en(bar0_wr_en), .bar0_rd_en(1'b0), .bar0_addr(bar0_addr), .bar0_wdata(bar0_wdata),
         .bar0_rdata(), .bar0_rd_valid(),
         .tbl_wr_en(tbl_wr_en), .tbl_wr_vec(tbl_wr_vec), .tbl_wr_addr(tbl_wr_addr),
@@ -133,7 +136,10 @@ module tb_bridge_top;
         for (j = 10; j <= 15; j = j + 1) begin {ts_byte_l0, ts_byte_l1, ts_byte_l2, ts_byte_l3} = {4{8'h4A}}; @(negedge clk); end
         ts_byte_valid = 0;
     end endtask
-    task bar0_write(input [11:0] a, input [31:0] d); begin
+    task cfg_write(input [11:0] a, input [31:0] d); begin
+        @(negedge clk); cfg_addr = a; cfg_wdata = d; cfg_wr_en = 1; @(negedge clk); cfg_wr_en = 0;
+    end endtask
+    task bar0_write(input [15:0] a, input [31:0] d); begin
         @(negedge clk); bar0_addr = a; bar0_wdata = d; bar0_wr_en = 1; @(negedge clk); bar0_wr_en = 0;
     end endtask
     task msix_entry(input [2:0] v, input [63:0] a, input [31:0] d); begin
@@ -183,9 +189,14 @@ module tb_bridge_top;
         exp_wr[0] = 0; exp_wr[1] = 0; exp_rd[0] = 0; exp_rd[1] = 0; msix_cnt[0] = 0; msix_cnt[1] = 0;
 
         repeat (5) @(negedge clk); perst_n = 1;
-        send_ts1; send_ts1;
+        // Link trains by itself over the SerDes loopback (LTSSM: Detect -> Polling/TS1
+        // -> Configuration/TS2 -> L0, ~1700 clk); no TS1 injection needed any more.
+        wait (link_trained === 1'b1);
         repeat (3) @(negedge clk); updatefc_received = 1; @(negedge clk); updatefc_received = 0;
         wait (axi_rst_n === 1'b1);
+        // What a host driver does first: Memory Space + Bus Master, then MSI-X Enable.
+        cfg_write(12'h004, 32'h0000_0006);
+        cfg_write(12'h050, 32'h8000_0000);
         repeat (20) @(negedge clk);
         $display("[%0t] link_trained=%b datapath_rst_n=%b axi_rst_n=%b", $time, link_trained, datapath_rst_n, axi_rst_n);
 

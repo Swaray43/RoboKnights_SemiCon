@@ -52,8 +52,11 @@ module interconnect_top #(
     // ---- PCIe-clock-domain output to Swaray's link layer ----
     // Port shape matches Swaray's stated AXI4-Stream slave contract exactly:
     // s_tdata(512b)/s_tkeep(64b)/s_tvalid/s_tlast/s_tuser/s_tready(from him).
-    // TUSER = {stream_id, session_offset} -- see TUSER_WIDTH below. TLAST is
-    // its own signal per AXI4-Stream convention, not folded into TUSER.
+    // TUSER = {tlast_flag, session_offset, stream_id} (OFFSET_WIDTH+2 bits):
+    // the link layer's native 26-bit TUSER, emitted here so no remap/shim is
+    // needed between the layers (Phase 2 change; ic2link_tuser_remap retired).
+    // tlast_flag is a copy of m_tlast; m_tlast is still driven as the normal
+    // AXI4-Stream TLAST.
     // session_offset stays per-beat and TLAST stays at true session end --
     // Swaray coalesces into FLITs himself in his own per-stream buffers, so
     // his TUSER-latch-per-burst and interleaving-detector rules apply to
@@ -63,13 +66,13 @@ module interconnect_top #(
     input  wire                     pcie_rstn,
     output wire [DATA_WIDTH-1:0]    m_tdata,
     output wire [KEEP_WIDTH-1:0]    m_tkeep,
-    output wire [OFFSET_WIDTH:0]    m_tuser,            // {stream_id, session_offset}, width = OFFSET_WIDTH+1
+    output wire [OFFSET_WIDTH+1:0]  m_tuser,            // {tlast_flag, session_offset, stream_id}, width = OFFSET_WIDTH+2
     output wire                     m_tlast,
     output wire                     m_tvalid,
     input  wire                     m_tready
 );
 
-    localparam TUSER_WIDTH = 1 + OFFSET_WIDTH;
+    localparam TUSER_WIDTH = 2 + OFFSET_WIDTH;   // link-native TUSER width
 
     // ---- shared downstream backpressure: CDC FIFO almost-full gates both channels ----
     wire fifo_almost_full;
@@ -157,7 +160,7 @@ module interconnect_top #(
     wire m_stream_id_i;
     wire [OFFSET_WIDTH-1:0] m_session_offset_i;
     assign {m_tdata, m_tkeep, m_stream_id_i, m_session_offset_i, m_tlast} = fifo_rd_data;
-    assign m_tuser = {m_stream_id_i, m_session_offset_i};
+    assign m_tuser = {m_tlast, m_session_offset_i, m_stream_id_i};   // link-native order
     assign m_tvalid = !fifo_empty;
 
 endmodule

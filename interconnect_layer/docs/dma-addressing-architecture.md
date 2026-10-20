@@ -77,6 +77,11 @@ real_addr_ch[N] = base_addr_ch[N] + session_offset_ch[N]
 | `session_offset` | ~16–24 bits (sized to max session/slice size — not 64 bits) | Running byte position within the current session, per channel. Increments by 64 (beat size) per accepted beat. |
 | `TLAST` | 1 bit | Marks the final beat of the current session/packet. **Not in the original bullet list — confirmed necessary** so downstream FLIT logic knows when to flush and zero-pad a partial Flit. |
 
+**Bit layout on the wire (Phase 2, fixed):** `m_tuser[25:0] = {tlast_flag[25], session_offset[24:1], stream_id[0]}`,
+which is the link layer's native TUSER, so `interconnect_top.m_tuser` connects straight to
+`link_phy_bridge_top.s_axis_tuser` with no remap. `tlast_flag` is a copy of `m_tlast` (which is still driven).
+The FIFO stays 602 bits wide; the extra bit is a wire, not a register.
+
 `addr64` as originally scoped (a raw 64-bit address carried per beat) **is dropped** — replaced by the base-plus-offset split above.
 
 Open: whether `attr`, `TC`, `reqtype` (from the original interface contract) are still needed per-beat, or can be fixed per channel / omitted since `reqtype` is always MWr for both streams. Worth confirming with Swaray rather than assuming.

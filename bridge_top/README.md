@@ -41,16 +41,24 @@ Use the file list rather than adding whole folders. Stale and superseded files n
 | `tb_ingest_overflow_leak` | Ingest-port unit test: no data beat past the session limit | — |
 
 The SerDes is a wire loopback (`rx_level = tx_level`); the link ACKs its own Flits.
+The link trains by itself over that loopback (PHY LTSSM: Detect → Polling/TS1 → Configuration/TS2 → L0,
+about 1,700 clk); the benches just wait for `link_trained`, send UpdateFC, then enable Memory Space
+(config 0x004 = 0x6) and MSI-X (config 0x050 bit 31) like a host driver would. The `ts_byte_*`
+injection port is still there but no longer needed.
 
 ## Verified (Icarus Verilog 12, Yosys 0.33)
 
 - `tb_bridge_top`, `tb_bridge_ovf`, `tb_ingest_overflow_leak`: PASS
-- Interconnect unit tests 4/4, PHY benches 24/24, link `tb_stream_path` with bit errors: PASS
+- Interconnect unit tests 4/4, PHY benches 24/24 (+ 9 cocotb), link `tb_stream_path` with bit errors: PASS
+- PHY updated to the LTSSM / lane-deskew / config-gating version (see `protocol_PHY_layer/CHANGELOG.md`, Update 8):
+  `tb_bridge_top` 144/144 TLPs and 6/6 MSI-X (also 600/600 with `+SESS=6 +BEATS=50`), `tb_bridge_ovf` PASS
 - Yosys elaboration of `bridge_top` from `bridge_top.f`: 0 problems, 0 latches
 - **Not run here:** Vivado or Quartus synthesis/implementation, timing closure
 
 ## Ports to note
 
 - No pin constraints: `tx_level`/`rx_level` are meant for SerDes IP, outside this project.
-- `bar0_*` and `tbl_*` are driven by the testbench until an inbound MWr/MRd decoder exists.
+- `cfg_*`, `bar0_*` and `tbl_*` are driven by the testbench until an inbound TLP decoder exists.
+  `bar0_addr` is 16 bits: 0x0000 DMA/session regs, 0x1000 MSI-X table, 0x1800 PBA.
+  BAR0 is ignored until Command.Memory Space Enable is set; MSI-X is silent until MSI-X Enable is set.
 - Clocks: `clk` (pcie_clk, 4 ns) and `aclk` (5.4 ns) are asynchronous; see `bridge_top.xdc` / `.sdc`.

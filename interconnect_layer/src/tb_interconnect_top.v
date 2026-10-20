@@ -43,13 +43,23 @@ module tb_interconnect_top;
 
     wire [DATA_WIDTH-1:0] m_tdata;
     wire [KEEP_WIDTH-1:0] m_tkeep;
-    wire [OFFSET_WIDTH:0] m_tuser;
-    wire m_stream_id = m_tuser[OFFSET_WIDTH];
-    wire [OFFSET_WIDTH-1:0] m_session_offset = m_tuser[OFFSET_WIDTH-1:0];
+    wire [OFFSET_WIDTH+1:0] m_tuser;                       // {tlast_flag, session_offset, stream_id}
+    wire m_stream_id = m_tuser[0];
+    wire [OFFSET_WIDTH-1:0] m_session_offset = m_tuser[OFFSET_WIDTH:1];
+    wire m_tuser_tlast = m_tuser[OFFSET_WIDTH+1];
     wire m_tlast, m_tvalid;
     reg  m_tready;
 
     integer errors = 0;
+
+    // TUSER is link-native {tlast_flag, session_offset, stream_id}:
+    // tlast_flag must always mirror m_tlast.
+    integer tuser_tlast_mismatch = 0;
+    always @(posedge pcie_clk) if (m_tvalid && (m_tuser_tlast !== m_tlast)) begin
+        tuser_tlast_mismatch = tuser_tlast_mismatch + 1;
+        errors = errors + 1;
+        $display("ERROR: m_tuser tlast_flag (%b) != m_tlast (%b)", m_tuser_tlast, m_tlast);
+    end
     integer i;
 
     interconnect_top #(

@@ -5,7 +5,12 @@ module pcie_rx_engine #(
     parameter TAG_WIDTH      = 10,
     parameter MAX_DW_PER_REQ = 16,
     parameter PCIE_ADDR_W    = 64,
-    parameter AXI_ADDR_W     = 32
+    parameter AXI_ADDR_W     = 32,
+    // 1: issue the MWr address request on tlp_hdr_done (address is complete,
+    //    i.e. driven by tlp_header_parser.parsed_hdr_done). 0: legacy, request
+    //    on SOF (only correct if tlp_addr is already valid at SOF, as in the
+    //    unit bench). link_layer_top sets 1.
+    parameter REQ_ON_HDR_DONE = 0
 )(
     input wire clk,
     input wire rst_n,
@@ -21,6 +26,7 @@ module pcie_rx_engine #(
     input wire [6:0]               tlp_lower_addr,
     input wire [2:0]               tlp_cpl_status,
     input wire [PCIE_ADDR_W-1:0]   tlp_addr,
+    input wire                     tlp_hdr_done,    // see REQ_ON_HDR_DONE
 
     input  wire                    req_alloc_valid,
     input  wire [TAG_WIDTH-1:0]    req_alloc_tag,
@@ -138,6 +144,10 @@ module pcie_rx_engine #(
         .m_axis_tready(m_axis_cpl_tready)
     );
 
+    // MWr address request: on header-done (address complete) or legacy SOF.
+    wire mwr_req = REQ_ON_HDR_DONE ? (tlp_hdr_done && is_mwr)
+                                   : (tlp_rx_valid && tlp_rx_sof && is_mwr);
+
     pcie_address_translator #(
         .PCIE_ADDR_WIDTH(PCIE_ADDR_W),
         .AXI_ADDR_WIDTH(AXI_ADDR_W)
@@ -147,7 +157,7 @@ module pcie_rx_engine #(
         .trans_window_base(cfg_window_base),
         .trans_window_mask(cfg_window_mask),
         .trans_axi_base(cfg_axi_base),
-        .req_valid(tlp_rx_valid && tlp_rx_sof && is_mwr),
+        .req_valid(mwr_req),
         .req_pcie_addr(tlp_addr),
         .axi_addr_ready(m_axi_awready), // Connected AXI4 ready
         .axi_addr_valid(m_axi_awvalid),
