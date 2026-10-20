@@ -1,6 +1,16 @@
 `timescale 1ns/1ps
-
-module tb_axi_backpressure;
+// ============================================================
+// tb_axi_pcie_reorder_buffer -- S7 (rank 9)
+//
+// File was tb_axi_pcie_reorder_buffer.v but its module was named
+// tb_axi_backpressure, so scripted runs couldn't find the top.
+// Renamed to match, and real checks added: out-of-order
+// completions (received out of allocation order on the "wire")
+// must still drain to the AXI master in tag/allocation order,
+// with tlast correct on each slot's last beat, plus the original
+// AXI backpressure (TREADY stall) coverage.
+// ============================================================
+module tb_axi_pcie_reorder_buffer;
 
     reg clk;
     reg rst_n;
@@ -16,7 +26,7 @@ module tb_axi_backpressure;
     reg [9:0]  rx_offset;
     reg [9:0]  rx_tag;
     reg [31:0] rx_data;
-    
+
     // Egress AXI-S
     wire        m_axis_tvalid;
     wire [31:0] m_axis_tdata;
@@ -24,6 +34,8 @@ module tb_axi_backpressure;
     wire [3:0]  m_axis_tkeep;
     wire        m_axis_tuser;
     reg         m_axis_tready;
+
+    integer errors;
 
     axi_pcie_reorder_buffer dut (
         .clk(clk), .rst_n(rst_n),
@@ -38,69 +50,126 @@ module tb_axi_backpressure;
 
     always #5 clk = ~clk;
 
-    // AXI Protocol Monitor
-    always @(posedge clk) begin
-        if (m_axis_tvalid) begin
-            if (m_axis_tready) begin
-                $display("[%8.3f ns] AXI OUT ACCEPTED : Data=0x%08h | TLAST=%b", $time, m_axis_tdata, m_axis_tlast);
-            end else begin
-                $display("[%8.3f ns] AXI OUT STALLED  : Data=0x%08h | TLAST=%b (Waiting for TREADY)", $time, m_axis_tdata, m_axis_tlast);
+    task check_eq(input [31:0] got, input [31:0] exp, input [255:0] label);
+        begin
+            if (got !== exp) begin
+                $display("FAIL %0s: got=0x%0h expected=0x%0h", label, got, exp);
+                errors = errors + 1;
             end
         end
+    endtask
+
+    // -------- capture every AXI output beat --------
+    reg [31:0] cap_data [0:63];
+    reg        cap_last [0:63];
+    integer    cap_cnt;
+
+    always @(posedge clk) begin
+        if (m_axis_tvalid && m_axis_tready) begin
+            cap_data[cap_cnt] = m_axis_tdata;
+            cap_last[cap_cnt] = m_axis_tlast;
+            cap_cnt = cap_cnt + 1;
+        end
     end
+
+    task alloc(input [9:0] tag, input [9:0] len);
+        begin
+            @(negedge clk);
+            req_valid = 1; req_tag = tag; req_len_dw = len;
+            @(posedge clk);
+            while (!req_ready) @(posedge clk);
+            @(negedge clk);
+            req_valid = 0;
+        end
+    endtask
+
+    // Deliver one completion DW for `tag` at dw offset `off`.
+    task cpld_word(input [9:0] tag, input [9:0] off, input [31:0] data, input last);
+        begin
+            @(negedge clk);
+            rx_valid = 1;
+            rx_sof   = (off == 0);
+            rx_offset = off;
+            rx_tag   = tag;
+            rx_data  = data;
+            rx_dvalid = 1;
+            rx_last_dw = last;
+            @(negedge clk);
+            rx_valid = 0; rx_sof = 0; rx_dvalid = 0; rx_last_dw = 0;
+        end
+    endtask
 
     initial begin
         clk = 0; rst_n = 0;
         req_valid = 0; req_tag = 0; req_len_dw = 0;
         rx_valid = 0; rx_sof = 0; rx_offset = 0; rx_tag = 0; rx_data = 0; rx_dvalid = 0; rx_last_dw = 0;
-        m_axis_tready = 1; // Initially ready
+        m_axis_tready = 1;
+        errors = 0; cap_cnt = 0;
 
-        #20 rst_n = 1; #20;
+        @(negedge clk); @(negedge clk);
+        rst_n = 1;
+        @(negedge clk);
 
-        $display("\n--- TEST: AXI Backpressure (Egress Stall) ---");
-        
-        // 1. Allocate a 4-DW Request (Tag 0x020)
-        @(posedge clk);
-        req_valid <= 1; req_tag <= 10'h020; req_len_dw <= 10'd4;
-        @(posedge clk) req_valid <= 0;
+        // ============================================================
+        // Test 1: out-of-order wire arrival -> in-order AXI drain
+        // ============================================================
+        // Allocate tag A (2 DW) then tag B (2 DW), in that order.
+        alloc(10'h0A0, 10'd2);
+        alloc(10'h0B0, 10'd2);
 
-        #30;
-        // 2. Inject all 4 DWs in order (simulate normal reception)
-        $display("[%8.3f ns] RX: Injecting 4 DWs...", $time);
-        @(posedge clk);
-        rx_valid <= 1; rx_sof <= 1; rx_offset <= 10'd0; rx_tag <= 10'h020; rx_dvalid <= 1; rx_data <= 32'hDDDD_0000;
-        @(posedge clk) rx_sof <= 0; rx_data <= 32'hDDDD_1111;
-        @(posedge clk) rx_data <= 32'hDDDD_2222;
-        @(posedge clk) rx_data <= 32'hDDDD_3333; rx_last_dw <= 1;
-        @(posedge clk) rx_valid <= 0; rx_dvalid <= 0; rx_last_dw <= 0;
+        // Completion data for B arrives first on the wire...
+        cpld_word(10'h0B0, 10'd0, 32'hB000_0000, 1'b0);
+        cpld_word(10'h0B0, 10'd1, 32'hB000_0001, 1'b1);
+        // ...then A's completion data arrives.
+        cpld_word(10'h0A0, 10'd0, 32'hA000_0000, 1'b0);
+        cpld_word(10'h0A0, 10'd1, 32'hA000_0001, 1'b1);
 
-        // 3. Play with m_axis_tready during output
-        // Wait for the first DW to appear on the AXI bus
-        wait(m_axis_tvalid == 1'b1);
-        
-        @(posedge clk); 
-        // Drop TREADY just as DW 1 is about to be presented
-        $display("[%8.3f ns] TB: Dropping TREADY to 0 (Stall downstream)...", $time);
-        m_axis_tready <= 0;
-        
-        // Hold stall for 4 clock cycles
-        #40; 
-        
-        $display("[%8.3f ns] TB: Raising TREADY to 1 (Resume downstream)...", $time);
-        m_axis_tready <= 1;
+        repeat (10) @(negedge clk);
 
-        // Wait a couple cycles, then stall again right before the LAST beat
-        @(posedge clk);
-        @(posedge clk);
-        $display("[%8.3f ns] TB: Dropping TREADY to 0 (Stall on TLAST)...", $time);
-        m_axis_tready <= 0;
-        
-        #20;
-        $display("[%8.3f ns] TB: Raising TREADY to 1 (Resume)...", $time);
-        m_axis_tready <= 1;
+        // Expect A's 2 words first (allocation order), then B's 2 words,
+        // even though B's data arrived on the wire first.
+        check_eq(cap_cnt, 4, "T1: 4 completion beats drained");
+        check_eq(cap_data[0], 32'hA000_0000, "T1: tag A word0 drains first (alloc order)");
+        check_eq(cap_last[0], 0, "T1: tag A word0 not tlast");
+        check_eq(cap_data[1], 32'hA000_0001, "T1: tag A word1");
+        check_eq(cap_last[1], 1, "T1: tag A word1 is tlast (end of A)");
+        check_eq(cap_data[2], 32'hB000_0000, "T1: tag B word0 drains second");
+        check_eq(cap_last[2], 0, "T1: tag B word0 not tlast");
+        check_eq(cap_data[3], 32'hB000_0001, "T1: tag B word1");
+        check_eq(cap_last[3], 1, "T1: tag B word1 is tlast (end of B)");
 
-        #50;
-        $display("\n--- SIMULATION COMPLETE ---");
+        // ============================================================
+        // Test 2: AXI backpressure (egress stall) mid-completion
+        // ============================================================
+        cap_cnt = 0;
+        alloc(10'h020, 10'd4);
+        cpld_word(10'h020, 10'd0, 32'hDDDD_0000, 1'b0);
+        cpld_word(10'h020, 10'd1, 32'hDDDD_1111, 1'b0);
+        cpld_word(10'h020, 10'd2, 32'hDDDD_2222, 1'b0);
+        cpld_word(10'h020, 10'd3, 32'hDDDD_3333, 1'b1);
+
+        wait (m_axis_tvalid == 1'b1);
+        @(negedge clk);
+        m_axis_tready = 0; // stall right as the completion starts draining
+        repeat (4) @(negedge clk);
+        m_axis_tready = 1;
+
+        repeat (10) @(negedge clk);
+        check_eq(cap_cnt, 4, "T2: all 4 beats eventually drained despite stall");
+        check_eq(cap_data[0], 32'hDDDD_0000, "T2: beat0 intact after stall");
+        check_eq(cap_data[3], 32'hDDDD_3333, "T2: beat3 intact after stall");
+        check_eq(cap_last[3], 1, "T2: tlast correct after stall");
+
+        if (errors == 0) $display("RESULT: PASS");
+        else              $display("RESULT: FAIL (%0d errors)", errors);
         $finish;
     end
+
+    initial begin
+        #20000;
+        $display("[ERROR] Watchdog timeout");
+        $display("RESULT: FAIL (watchdog)");
+        $finish;
+    end
+
 endmodule
