@@ -1,0 +1,14 @@
+[options]
+mode prove
+depth 20
+multiclock off
+
+[engines]
+smtbmc boolector
+
+[script]
+read -formal module_with_properties.sv
+prep -top flit_sof_strip
+
+[files]
+module_with_properties.sv

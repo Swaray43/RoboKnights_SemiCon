@@ -1,0 +1,16 @@
+[options]
+mode prove
+depth 1
+
+[engines]
+smtbmc
+
+[script]
+# Use -sv here to enable the bind keyword in Yosys
+read -sv pam4.v pam4_specy.v pam4_formal_top.v
+prep -top pam4_formal_top
+
+[files]
+pam4.v
+pam4_specy.v
+pam4_formal_top.v
