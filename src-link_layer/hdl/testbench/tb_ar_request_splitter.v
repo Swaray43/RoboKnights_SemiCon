@@ -117,13 +117,18 @@ integer             cap_count;
 
 // ============================================================
 // Helper: build a TUSER word
+// Ticket G7 (Aditya + Swaray): now built via shared/axis_tuser_defs.vh's
+// tuser_pack instead of a second hand-written copy of the field order
+// (see that file's header for why this matters).
 // ============================================================
+`include "axis_tuser_defs.vh"
+
 function [TUSER_W-1:0] make_tuser;
     input               stream_id;
     input [SOFF_W-1:0]  session_offset;
     input               tlast_flag;
     begin
-        make_tuser = {tlast_flag, session_offset, stream_id};
+        make_tuser = tuser_pack(tlast_flag, session_offset, stream_id);
     end
 endfunction
 

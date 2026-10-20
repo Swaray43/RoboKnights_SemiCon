@@ -62,6 +62,16 @@ module interconnect_top #(
     // his TUSER-latch-per-burst and interleaving-detector rules apply to
     // HIS downstream hand-off, not to this interface. Confirmed resolved;
     // see ticket_response_and_docs.md PART 1.
+    //
+    // Ticket G7 (Aditya + Swaray): the layout comment above used to be the
+    // ONLY place this order was written down on our side, with the link
+    // layer's own files each re-deriving it by hand -- exactly the
+    // duplication that caused the Phase 1 misrouting bug ic2link_tuser_remap.v
+    // was built to fix. The actual pack below now goes through
+    // shared/axis_tuser_defs.vh, the one place the layout is defined;
+    // see that file's header for the full writeup. Building this module
+    // standalone (outside bridge_top.f, which already carries
+    // +incdir+shared) needs `-I <repo_root>/shared` added to the compile.
     input  wire                     pcie_clk,
     input  wire                     pcie_rstn,
     output wire [DATA_WIDTH-1:0]    m_tdata,
@@ -72,7 +82,12 @@ module interconnect_top #(
     input  wire                     m_tready
 );
 
-    localparam TUSER_WIDTH = 2 + OFFSET_WIDTH;   // link-native TUSER width
+    // axis_tuser_defs.vh expects SOFF_W / TUSER_W to already be in scope --
+    // alias them onto this module's own OFFSET_WIDTH parameter rather than
+    // introducing a second name for the same thing.
+    localparam SOFF_W  = OFFSET_WIDTH;
+    localparam TUSER_W = OFFSET_WIDTH + 2;         // link-native TUSER width
+    `include "axis_tuser_defs.vh"
 
     // ---- shared downstream backpressure: CDC FIFO almost-full gates both channels ----
     wire fifo_almost_full;
@@ -160,7 +175,7 @@ module interconnect_top #(
     wire m_stream_id_i;
     wire [OFFSET_WIDTH-1:0] m_session_offset_i;
     assign {m_tdata, m_tkeep, m_stream_id_i, m_session_offset_i, m_tlast} = fifo_rd_data;
-    assign m_tuser = {m_tlast, m_session_offset_i, m_stream_id_i};   // link-native order
+    assign m_tuser = tuser_pack(m_tlast, m_session_offset_i, m_stream_id_i);   // via shared/axis_tuser_defs.vh (G7)
     assign m_tvalid = !fifo_empty;
 
 endmodule

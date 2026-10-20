@@ -74,7 +74,10 @@ end
 
 localparam FIFO_AW = $clog2(FIFO_D);
 localparam ENTRY_W = DATA_W + KEEP_W + 1 + TUSER_W;
-localparam STREAM_ID_BIT  = 0;
+// Ticket G7 (Aditya + Swaray): STREAM_ID_BIT used to be re-derived here by
+// hand; now sourced from shared/axis_tuser_defs.vh, the one place the
+// TUSER layout is defined (see that file's header for the full writeup).
+`include "axis_tuser_defs.vh"
 reg [ENTRY_W-1:0]    mem [0:FIFO_D-1];
 reg [FIFO_AW-1:0]    wr_ptr;
 reg [FIFO_AW-1:0]    rd_ptr;
@@ -98,7 +101,7 @@ function automatic tkeep_has_gap;
 endfunction
 wire gap_detected = s_tvalid && s_tready && tkeep_has_gap(s_tkeep, s_tlast);
 wire wr_en        = s_tvalid && s_tready && !gap_detected;
-wire ch_sel_w     = s_tuser[STREAM_ID_BIT];
+wire ch_sel_w     = tuser_stream_id(s_tuser);
 always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
         wr_ptr               <= {FIFO_AW{1'b0}};

@@ -116,17 +116,17 @@ module address_translation #(
 );
 
 // ============================================================
-// TUSER field extraction
-// TUSER[0]              = stream_id
-// TUSER[SOFF_W:1]       = session_offset  (SOFF_W bits)
-// TUSER[TUSER_W-1]      = tlast_flag
+// TUSER field extraction -- ticket G7 (Aditya + Swaray): this used to
+// re-derive the slice positions by hand, duplicating the layout that
+// interconnect_top.v packs on the other side of the seam. Now sourced
+// from shared/axis_tuser_defs.vh, the one place the layout is defined;
+// see that file's header for the full writeup.
 // ============================================================
-localparam SOFF_LO = 1;
-localparam SOFF_HI = SOFF_W;   // inclusive: bits [SOFF_W:1]
+`include "axis_tuser_defs.vh"
 
-wire                  s_stream_id     = s_tuser[0];
-wire [SOFF_W-1:0]     s_sess_offset   = s_tuser[SOFF_HI:SOFF_LO];
-wire                  s_tlast_flag    = s_tuser[TUSER_W-1];
+wire                  s_stream_id     = tuser_stream_id(s_tuser);
+wire [SOFF_W-1:0]     s_sess_offset   = tuser_session_offset(s_tuser);
+wire                  s_tlast_flag    = tuser_tlast_flag(s_tuser);
 
 // ============================================================
 // Base address register file
