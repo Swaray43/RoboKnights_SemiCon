@@ -201,6 +201,56 @@ module stream_tx_path_top #(
     wire err_burst_interleave_unused;
     wire xlat_busy_unused;
 
+    // ---- S6: credit_manager (Posted pool) gating ---------------------
+    // Inserted between ar_request_splitter's output and tlp_packetizer's
+    // request input, on the existing split_valid/split_ready handshake.
+    // Every MWr sub-TLP (post-split, one TLP each) must be granted a
+    // Posted header+data credit before it is allowed to fire into the
+    // packetizer; the grant is what actually drives req_valid, and
+    // split_ready (fed back to the splitter) is gated the same way so
+    // back-pressure matches reality instead of just hiding it.
+    wire        pkt_req_ready;
+    wire        credit_alloc_valid = split_valid && pkt_req_ready;
+    wire        credit_grant;
+    wire        credit_stall_unused;
+    wire        gated_req_valid    = split_valid && credit_grant;
+
+    // One-shot Flow-Control bootstrap: no DLLP/UpdateFC source is wired
+    // to the RX side yet (DLLP_parser.v is parked under legacy/, not
+    // part of the active data_link_layer_top RX chain), so there is no
+    // real link-partner-advertised Posted limit to track. Until that
+    // exists, seed the Posted header/data limits to the PCIe "infinite
+    // credits" sentinel (0x7F / 0xFFF) exactly once, one cycle after
+    // reset. credit_manager is then genuinely live -- it is in the real
+    // request/grant path and will correctly gate and stall the TX path
+    // the moment a real (finite) UpdateFC arrives on this same port --
+    // but with nothing yet advertising a finite limit it imposes no
+    // back-pressure of its own, so today's throughput/behavior is
+    // unchanged. Replace this block with the real DLLP RX path once
+    // that side is wired up.
+    reg credit_init_done;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            credit_init_done <= 1'b0;
+        else if (!credit_init_done)
+            credit_init_done <= 1'b1;
+    end
+    wire credit_init_valid = !credit_init_done;
+
+    credit_manager u_credit_manager (
+        .clk                 (clk),
+        .rst_n               (rst_n),
+        .update_fc_valid     (credit_init_valid),
+        .update_fc_type      (2'b00),            // Posted
+        .update_fc_hdr_limit (8'h7F),            // infinite (PCIe spec sentinel)
+        .update_fc_data_limit(12'hFFF),          // infinite (PCIe spec sentinel)
+        .alloc_req_valid     (credit_alloc_valid),
+        .alloc_req_type      (2'b00),            // Posted (MWr-only TX path)
+        .alloc_req_dw_len    (split_len_dw[9:0]),
+        .alloc_req_grant     (credit_grant),
+        .stall               (credit_stall_unused)
+    );
+
     // ==================================================================
     // 1. write_data_buffer
     // ==================================================================
@@ -367,9 +417,14 @@ module stream_tx_path_top #(
         .m_split_flag       (split_split_flag),
         .m_sub_index        (split_sub_index),
         .m_valid            (split_valid),
-        .m_ready            (split_ready),
+        .m_ready            (split_ready),           // gated by credit_grant below
         .stat_split_occurred(stat_split_occurred)
     );
+
+    // Posted credit must be held before a sub-TLP is allowed to advance
+    // past the splitter: back-pressure the splitter exactly when the
+    // packetizer would otherwise have accepted but no credit is granted.
+    assign split_ready = pkt_req_ready && credit_grant;
 
     // ==================================================================
     // 6. 512 -> 32 write-data serialiser (L1)
@@ -445,13 +500,13 @@ module stream_tx_path_top #(
     ) u_tlp_packetizer (
         .clk          (clk),
         .rst_n        (rst_n),
-        .req_valid    (split_valid),
+        .req_valid    (gated_req_valid),
         .req_is_write (1'b1),
         .req_addr     (split_addr),
         .req_length   (split_len_dw[9:0]),
         .req_rid      (REQ_ID),
         .req_tag      (8'h00),
-        .req_ready    (split_ready),
+        .req_ready    (pkt_req_ready),
         .wdata_tdata  (wdata_tdata),
         .wdata_tvalid (wdata_tvalid),
         .wdata_tready (wdata_tready),
