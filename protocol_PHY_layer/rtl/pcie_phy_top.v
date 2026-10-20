@@ -233,7 +233,7 @@ bar0_dma_regs #(.WW(WW), .LW(LW)) u_bar0 (
 session_arm_ctrl u_sess0 (
   .clk(clk), .rst_n(datapath_rst_n),
   .base_addr_in(base_ch0), .tc_in(tc_ch0),
-  .session_arm(arm_pulse[0]), .session_end(session_end_clk[0]),
+  .session_arm(arm_pulse[0]), .session_end(session_done[0]),
   .base_addr_latched(cfg_base_addr_ch0), .tc_latched(cfg_tc_ch0),
   .session_valid(session_valid[0]), .session_arm_while_active_cnt(arm_dbg0)
 );
@@ -241,7 +241,7 @@ session_arm_ctrl u_sess0 (
 session_arm_ctrl u_sess1 (
   .clk(clk), .rst_n(datapath_rst_n),
   .base_addr_in(base_ch1), .tc_in(tc_ch1),
-  .session_arm(arm_pulse[1]), .session_end(session_end_clk[1]),
+  .session_arm(arm_pulse[1]), .session_end(session_done[1]),
   .base_addr_latched(cfg_base_addr_ch1), .tc_latched(cfg_tc_ch1),
   .session_valid(session_valid[1]), .session_arm_while_active_cnt(arm_dbg1)
 );

@@ -77,11 +77,17 @@ module axi4s_ingest_port #(
     wire would_overflow = session_active && s_tvalid &&
                            ((session_offset + beat_bytes) > session_limit);
 
-    assign req      = s_tvalid && session_active && !session_overflow && !would_overflow;
-    assign s_tready  = grant && session_active && !session_overflow && !ds_backpressure;
+    // FIX: on overflow abort, send one zero-length TLAST marker (tkeep=0) down
+    // the same path so the link layer closes the session in order (session_done
+    // -> MSI-X, session_arm_ctrl -> idle) after every beat already accepted.
+    reg abort_pend;
+    assign req      = (s_tvalid && session_active && !session_overflow && !would_overflow) || abort_pend;
+    // FIX: the offending beat must never handshake (grant is registered and may still be high)
+    assign s_tready  = grant && session_active && !session_overflow && !would_overflow && !ds_backpressure && !abort_pend;
 
     wire beat_hs = s_tvalid && s_tready;   // AXI4-Stream handshake fires
-    assign accepted = beat_hs;             // downstream must gate on this, not on grant alone --
+    wire marker_hs = abort_pend && grant && !ds_backpressure;
+    assign accepted = beat_hs || marker_hs;             // downstream must gate on this, not on grant alone --
                                             // grant can be high while backpressure/overflow still
                                             // blocks the actual handshake, in which case the master
                                             // is legitimately holding the SAME beat steady and must
@@ -92,13 +98,16 @@ module axi4s_ingest_port #(
             session_active   <= 1'b0;
             session_overflow <= 1'b0;
             session_offset   <= {OFFSET_WIDTH{1'b0}};
+            abort_pend       <= 1'b0;
         end else begin
+            if (marker_hs) abort_pend <= 1'b0;
             if (session_start) begin
                 session_active   <= 1'b1;
                 session_overflow <= 1'b0;
                 session_offset   <= {OFFSET_WIDTH{1'b0}};
             end else if (would_overflow) begin
                 session_overflow <= 1'b1;
+                abort_pend       <= 1'b1;
                 session_active   <= 1'b0;   // abort: hold TREADY low until re-armed
             end else if (beat_hs) begin
                 session_offset <= session_offset + beat_bytes;
@@ -111,8 +120,8 @@ module axi4s_ingest_port #(
     // Pass-through data path; only forwarded when actually accepted (beat_hs)
     // is implied by the crossbar only sampling this on a grant cycle.
     assign out_tdata          = s_tdata;
-    assign out_tkeep           = s_tkeep;
-    assign out_tlast           = s_tlast;
+    assign out_tkeep           = abort_pend ? {KEEP_WIDTH{1'b0}} : s_tkeep;
+    assign out_tlast           = abort_pend ? 1'b1 : s_tlast;
     assign out_session_offset  = session_offset;
 
 endmodule

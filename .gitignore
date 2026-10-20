@@ -11,3 +11,4 @@ vivado_project/**/sim/
 *.sim/
 *.jou
 *.log
+vivado_project/
