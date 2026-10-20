@@ -11,8 +11,11 @@
 //
 // Checks grant/stall for each credit type (Posted, Non-Posted,
 // Completion), credit exhaustion causing a stall, UpdateFC
-// replenishment releasing the stall, and infinite-credit mode
-// (0x7F header / 0xFFF data) always granting.
+// replenishment releasing the stall, and infinite-credit mode.
+//
+// G2 (P2-2): the first update per pool is the InitFC; 0 there means
+// infinite (header and data independently). 0x7F / 0xFFF are ordinary
+// finite limits (T7). UpdateFC to an infinite field is ignored (T8).
 // ============================================================
 module tb_credit_manager;
 
@@ -135,7 +138,7 @@ module tb_credit_manager;
         check_eq(last_stall, 0, "T5: no stall after replenishment");
 
         // ---- Test 6: infinite credit mode (Completion pool) ----
-        send_update_fc(2'b10, 8'h7F, 12'hFFF); // 0x7F header / 0xFFF data = infinite
+        send_update_fc(2'b10, 8'd0, 12'd0);    // InitFC 0 / 0 = infinite
         do_alloc(2'b10, 10'd1000); // huge request -- infinite credits must still grant
         check_eq(last_grant, 1, "T6: Completion request under infinite credits -> grant");
         check_eq(last_stall, 0, "T6: infinite credits never stall");
@@ -144,6 +147,37 @@ module tb_credit_manager;
         // credits never get consumed down).
         do_alloc(2'b10, 10'd1000);
         check_eq(last_grant, 1, "T6b: infinite credits still grant on repeated huge requests");
+
+        // ---- Test 8: UpdateFC to an infinite pool is ignored ----
+        send_update_fc(2'b10, 8'd1, 12'd1);
+        do_alloc(2'b10, 10'd1000);
+        check_eq(last_grant, 1, "T8: UpdateFC does not turn an infinite pool finite");
+
+        // ---- Test 7: 0x7F is a real, finite header limit ----
+        rst_n = 0; @(negedge clk); rst_n = 1; @(negedge clk);
+        send_update_fc(2'b00, 8'h7F, 12'hFFF);   // InitFC-P: 127 hdr, 4095 data
+        check_eq(dut.is_ph_inf, 0, "T7: 0x7F header is not infinite");
+        check_eq(dut.is_pd_inf, 0, "T7: 0xFFF data is not infinite");
+        begin : t7
+            integer n;
+            for (n = 0; n < 127; n = n + 1) begin
+                do_alloc(2'b00, 10'd1);
+                if (!last_grant) begin
+                    $display("FAIL T7: request %0d of 127 not granted", n);
+                    errors = errors + 1;
+                end
+            end
+        end
+        do_alloc(2'b00, 10'd1);
+        check_eq(last_grant, 0, "T7: 128th Posted request stalls at a 0x7F limit");
+        check_eq(last_stall, 1, "T7: stall asserted at a 0x7F limit");
+
+        // ---- Test 9: header infinite, data finite (independent fields) ----
+        send_update_fc(2'b01, 8'd0, 12'd2);      // InitFC-NP: hdr infinite, 2 data credits
+        do_alloc(2'b01, 10'd8);                  // 2 data credits -> grant
+        check_eq(last_grant, 1, "T9: NP within data credits");
+        do_alloc(2'b01, 10'd1);                  // data exhausted -> stall although hdr infinite
+        check_eq(last_grant, 0, "T9: NP data exhausted stalls even with infinite header");
 
         if (errors == 0) $display("RESULT: PASS");
         else              $display("RESULT: FAIL (%0d errors)", errors);

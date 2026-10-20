@@ -8,7 +8,8 @@
 // FEC, ACK/NAK) and adds the RX decode: unpack the wide inbound TLP stream
 // to 32-bit DWs, parse it with tlp_header_parser, and run it through
 // pcie_rx_engine (reorder buffer + address translator inside) to produce
-// AXI BAR0 writes (m_axi_aw*).
+// AXI BAR0 writes (m_axi_aw*). G1: also reports every inbound MWr's first
+// data DW on inb_mwr_* (raw address + data + BE) for the BAR0 register path.
 //
 // This module issues no non-posted (MRd) requests of its own -- the stream
 // path is MWr-only -- so pcie_rx_engine's tag-allocation input is tied off
@@ -118,6 +119,25 @@ module link_layer_top #(
     output wire  replay_event,
     output wire  malformed_tlp_err,
 
+    // ---- G2: flow-control status ----
+    output wire  fc_credits_valid,   // far-end InitFC recorded -> "UpdateFC received"
+    output wire  fc_init_done,
+
+    // ---- G3: inbound address-translation miss count + clear ----
+    output wire [7:0] err_xlat_miss_cnt,
+    input  wire        err_xlat_miss_clr,
+
+    // ---- G1 (P2-1): decoded inbound MWr, first data DW (host -> BAR0) ----
+    // One-cycle pulse per inbound Memory Write (Fmt[1]=1, Type=0_0000) when
+    // its first payload DW arrives. Raw PCIe address (DW-aligned) + first DW
+    // + first-DW byte enables. No window/BAR decode here -- the BAR hit check
+    // lives in link_phy_bridge_top against the config-space BAR0. Only the
+    // first DW of a multi-DW MWr is reported.
+    output reg                     inb_mwr_valid,
+    output reg  [ADDR_W-1:0]       inb_mwr_addr,
+    output reg  [31:0]             inb_mwr_data,
+    output reg  [3:0]              inb_mwr_be,
+
     // ---- Monitor tap: inbound TLP byte stream, one pulse per beat the RX
     //      decode accepts (observe-only, no backpressure) ----
     output wire                     mon_rx_axis_tvalid,
@@ -199,7 +219,9 @@ module link_layer_top #(
         .crc_err           (crc_err),
         .fec_err           (fec_err),
         .fec_corrected     (fec_corrected),
-        .replay_event      (replay_event)
+        .replay_event      (replay_event),
+        .fc_credits_valid  (fc_credits_valid),
+        .fc_init_done      (fc_init_done)
     );
 
     // ================================================================
@@ -274,6 +296,67 @@ module link_layer_top #(
     end
 
     // ================================================================
+    // 2b. G1: inbound MWr first-DW tracker (BAR0 write source)
+    //     Runs on the unpacked DW stream (rx_word_*), independent of
+    //     tlp_header_parser / pcie_address_translator timing.
+    //       DW0: Fmt/Type -> is it an MWr (with data)? 3DW or 4DW?
+    //       DW1: first-DW byte enables
+    //       DW2/DW3: address
+    //       DW at index hdr_len: first payload DW -> pulse inb_mwr_*
+    // ================================================================
+    reg  [2:0]        ib_idx;        // DW index inside the TLP, saturates at 7
+    reg               ib_is_mwr;
+    reg               ib_4dw;
+    reg               ib_done;       // first payload DW already reported
+    reg  [3:0]        ib_first_be;
+    reg  [ADDR_W-1:0] ib_addr;
+    wire [2:0]        ib_hdr_len = ib_4dw ? 3'd4 : 3'd3;
+    wire [31:0]       ib_dw      = rx_shift[31:0];
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            ib_idx        <= 3'd0;
+            ib_is_mwr     <= 1'b0;
+            ib_4dw        <= 1'b0;
+            ib_done       <= 1'b0;
+            ib_first_be   <= 4'h0;
+            ib_addr       <= {ADDR_W{1'b0}};
+            inb_mwr_valid <= 1'b0;
+            inb_mwr_addr  <= {ADDR_W{1'b0}};
+            inb_mwr_data  <= 32'h0;
+            inb_mwr_be    <= 4'h0;
+        end else begin
+            inb_mwr_valid <= 1'b0;
+            if (rx_word_valid) begin
+                if (rx_word_sof) begin                          // DW0
+                    ib_idx    <= 3'd1;
+                    ib_is_mwr <= ib_dw[30] && (ib_dw[28:24] == 5'b00000);
+                    ib_4dw    <= ib_dw[29];
+                    ib_done   <= 1'b0;
+                    ib_addr   <= {ADDR_W{1'b0}};
+                end else begin
+                    if (ib_idx != 3'd7) ib_idx <= ib_idx + 3'd1;
+                    if (ib_idx == 3'd1)
+                        ib_first_be <= ib_dw[3:0];
+                    if (ib_idx == 3'd2) begin
+                        if (ib_4dw) ib_addr[ADDR_W-1:32] <= ib_dw[ADDR_W-33:0];
+                        else        ib_addr <= {{(ADDR_W-32){1'b0}}, ib_dw[31:2], 2'b00};
+                    end
+                    if (ib_idx == 3'd3 && ib_4dw)
+                        ib_addr[31:0] <= {ib_dw[31:2], 2'b00};
+                    if (ib_is_mwr && !ib_done && ib_idx == ib_hdr_len) begin
+                        inb_mwr_valid <= 1'b1;
+                        inb_mwr_addr  <= ib_addr;
+                        inb_mwr_data  <= ib_dw;
+                        inb_mwr_be    <= ib_first_be;
+                        ib_done       <= 1'b1;
+                    end
+                end
+            end
+        end
+    end
+
+    // ================================================================
     // 3. TLP header parser
     // ================================================================
     wire        parsed_rx_valid, parsed_rx_sof, parsed_rx_eof;
@@ -285,6 +368,7 @@ module link_layer_top #(
     wire [2:0]  parsed_cpl_status;
     wire [ADDR_W-1:0] parsed_addr;
     wire        parsed_hdr_done;
+    wire        parsed_has_data;   // G4
 
     tlp_header_parser #(
         .TAG_WIDTH  (TAG_WIDTH),
@@ -306,7 +390,8 @@ module link_layer_top #(
         .parsed_lower_addr(parsed_lower_addr),
         .parsed_cpl_status(parsed_cpl_status),
         .parsed_addr      (parsed_addr),
-        .parsed_hdr_done  (parsed_hdr_done)
+        .parsed_hdr_done  (parsed_hdr_done),
+        .parsed_has_data  (parsed_has_data)
     );
 
     // ================================================================
@@ -334,6 +419,7 @@ module link_layer_top #(
         .tlp_cpl_status    (parsed_cpl_status),
         .tlp_addr          (parsed_addr),
         .tlp_hdr_done      (parsed_hdr_done),
+        .tlp_has_data      (parsed_has_data),
 
         // No MRd source on this (MWr-only) path
         .req_alloc_valid   (1'b0),
@@ -363,7 +449,10 @@ module link_layer_top #(
         .cfg_req_len_dw    (),
         .cfg_req_addr      (),
 
-        .malformed_tlp_err (malformed_tlp_err)
+        .malformed_tlp_err (malformed_tlp_err),
+
+        .err_xlat_miss_cnt (err_xlat_miss_cnt),
+        .err_xlat_miss_clr (err_xlat_miss_clr)
     );
 
 `ifdef SIMULATION

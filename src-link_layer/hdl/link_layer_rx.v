@@ -45,6 +45,7 @@ module link_layer_rx #(
     output reg                   rx_nak_valid,
     output reg  [SEQ_W-1:0]      rx_ackn_seq,
     output reg  [1887:0]         rx_payload,
+    output reg                   rx_fc_dllp,        // G2: DLP[28] -- control Flit carries FC DLLPs
 
     // Status pulses
     output reg                   crc_err,           // CRC mismatch after FEC
@@ -112,6 +113,7 @@ module link_layer_rx #(
             rx_nak_valid  <= 1'b0;
             rx_ackn_seq   <= {SEQ_W{1'b0}};
             rx_payload    <= {FL_TLP_W{1'b0}};
+            rx_fc_dllp    <= 1'b0;
             crc_err       <= 1'b0;
             fec_err       <= 1'b0;
             fec_corrected <= 1'b0;
@@ -128,6 +130,7 @@ module link_layer_rx #(
                 rx_nak_valid <= dlp[15];
                 rx_ackn_seq  <= dlp[27:16];
                 rx_payload   <= fixed[FL_TLP_W-1:0];
+                rx_fc_dllp   <= dlp[FL_DLP_FC_BIT];
             end
         end
     end

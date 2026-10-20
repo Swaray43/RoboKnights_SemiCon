@@ -12,6 +12,11 @@
 //   parsed_tag is written at phase 1.
 // ============================================================
 // ------------------------------------------------------------
+// Gap fix G4 (P2-5): parsed_has_data (Fmt[1], DW0 bit 30) exported so
+//   the RX engine can tell a genuine MWr (Type 0_0000, Fmt has-data=1)
+//   apart from a genuine MRd (same Type 0_0000, Fmt has-data=0) -- the
+//   Type field alone never distinguished them.
+// ------------------------------------------------------------
 // Fix P1 (Phase 2 review): address/tag DW indexing + header-done strobe
 //   PCIe request header: DW0 = Fmt/Type/Len, DW1 = ReqID/Tag/BE,
 //   DW2 = Addr (3DW) or Addr[63:32] (4DW), DW3 = Addr[31:0] (4DW).
@@ -43,7 +48,8 @@ module tlp_header_parser #(
     output reg  [6:0]              parsed_lower_addr,
     output reg  [2:0]              parsed_cpl_status,
     output reg  [PCIE_ADDR_W-1:0]  parsed_addr,
-    output reg                     parsed_hdr_done
+    output reg                     parsed_hdr_done,
+    output reg                     parsed_has_data   // G4: Fmt[1], DW0 bit 30
 );
     reg [2:0] header_phase;      // 1 = next is DW1, 2 = DW2, 3 = DW3, 4 = payload
     reg       is_4dw_header;
@@ -63,6 +69,7 @@ module tlp_header_parser #(
             parsed_cpl_status <= 0;
             parsed_addr       <= 0;
             parsed_hdr_done   <= 0;
+            parsed_has_data   <= 0;
             header_phase      <= 0;
             is_4dw_header     <= 0;
             is_cpl            <= 0;
@@ -80,6 +87,7 @@ module tlp_header_parser #(
                     is_4dw_header    <= rx_tlp_data[29];
                     is_cpl           <= (rx_tlp_data[28:24] == 5'b01010);
                     parsed_length_dw <= rx_tlp_data[9:0];
+                    parsed_has_data  <= rx_tlp_data[30];
                     tag_ext          <= {rx_tlp_data[23], rx_tlp_data[19]};
                 end else if (header_phase == 3'd1) begin    // DW1
                     header_phase      <= 3'd2;

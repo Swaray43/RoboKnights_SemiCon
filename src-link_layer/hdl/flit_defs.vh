@@ -23,7 +23,17 @@
 //     [14]    ack_valid    } piggy-backed ACK/NAK for the reverse
 //     [15]    nak_valid    } direction (the far end's replay buffer)
 //     [27:16] ack/nak sequence number = last Flit received in order
-//     [47:28] reserved (0)
+//     [28]    fc_dllp      (G2) control Flit only: TLP area DW0/DW1/DW2
+//                          carry Flow-Control DLLPs for P / NP / Cpl
+//     [47:29] reserved (0)
+//
+//   FC DLLP (one per DW, PCIe DLLP byte order, DW bit 31 = byte 0 bit 7):
+//     [31:24] type  InitFC1 0100_0vvv / InitFC2 1100_0vvv / UpdateFC 1000_0vvv
+//                   with [5:4] = 00 P, 01 NP, 10 Cpl and vvv = VC (0 only)
+//     [23:22] HdrScale (0)   [21:14] HdrFC
+//     [13:12] DataScale (0)  [11:0]  DataFC      HdrFC/DataFC 0 = infinite
+//   Control Flits are not sequenced or replayed: a lost FC Flit is covered
+//   by the InitFC resend timer in data_link_layer_top.
 //
 //   CRC-64: CRC-64/ECMA-182 (poly 0x42F0E1EBA9EA3693, init and xorout
 //   all-ones) over flit[1935:0] (TLP area + DLP).
@@ -56,6 +66,7 @@ localparam FEC_CW_BITS  = 11;
 
 localparam [1:0] FLIT_KIND_PAYLOAD = 2'd0;
 localparam [1:0] FLIT_KIND_CONTROL = 2'd1;
+localparam       FL_DLP_FC_BIT     = 28;
 
 // ---------------- CRC-64/ECMA-182 ----------------
 function [63:0] flit_crc64;

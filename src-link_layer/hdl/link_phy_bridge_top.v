@@ -39,11 +39,31 @@
 //   below rather than a port, so this module's own port list doesn't
 //   have to change later -- override the parameters at this instance if
 //   a different window is needed.
-//   Likewise m_axi_awready has no real BAR0-write slave wired to it yet
-//   (bar0_dma_regs only takes the external/cocotb-driven bar0_wr_en path
-//   today) -- it's tied high here so the decode never stalls. Wiring the
-//   decoded m_axi_awvalid/awaddr into bar0_dma_regs as a second write
-//   source is a pcie_phy_top change, out of scope for this glue module.
+//   m_axi_awready is tied high (no AXI slave behind the window yet).
+//
+// G1 (P2-1): host-driven BAR0 writes
+//   link_layer_top reports every inbound MWr's first data DW on inb_mwr_*
+//   (raw PCIe address, data, first-DW BE). This module checks it against
+//   the BAR0 the host programmed in config space (pcie_phy_top
+//   cfg_bar0_addr, 32-bit memory BAR, 64 KB) and, on a hit with all four
+//   byte enables set, drives pcie_phy_top's existing BAR0 write port with
+//   offset = addr[15:0]. That port already decodes 0x0000 DMA/session regs
+//   (bar0_dma_regs), 0x1000 MSI-X table, 0x1800 PBA and gates on Memory
+//   Space Enable -- so host MWrs now reach all three.
+//   * The external bar0_* ports stay (cocotb / benches). A test-port
+//     access (read or write) in the same cycle wins; the inbound write
+//     waits one cycle in a 1-deep holding register (ib_pend).
+//   * BAR0 base 0 is treated as "not assigned": no inbound hits. Keeps
+//     loopback benches (which never program BAR0) from having their own
+//     DMA MWrs land in the registers.
+//   * Partial-BE writes are dropped and flagged (err_bar0_partial_wr):
+//     the BAR0 blocks are whole-DW registers with no byte merge.
+//   * Only the first DW of a multi-DW MWr is written.
+//   * CfgWr is not covered here (still the cfg_* test port).
+//
+// G2 (P2-2): pcie_phy_top's updatefc_received (gates axi_rst_n) is now
+//   driven by the link layer's FC init (InitFC recorded for P/NP/Cpl),
+//   OR'd with the old external input so existing benches still work.
 // ============================================================
  
 module link_phy_bridge_top #(
@@ -157,7 +177,14 @@ module link_phy_bridge_top #(
     output wire                   m_axi_awvalid,
     output wire [AXI_ADDR_W-1:0]  m_axi_awaddr,
     output wire                   m_axi_awerr,
-    output wire                   malformed_tlp_err
+    output wire                   malformed_tlp_err,
+
+    // ---- G1: inbound MWr -> BAR0 status (1-cycle pulses) ----
+    output wire                   inb_bar0_wr,          // an inbound MWr was written into BAR0
+    output wire                   err_bar0_partial_wr,  // BAR0 hit with first-DW BE != 4'hF, dropped
+
+    // ---- G2: flow control ----
+    output wire                   fc_init_done          // link-layer FC_INIT2 complete
 );
  
     // synthesis translate_off
@@ -188,6 +215,21 @@ module link_phy_bridge_top #(
     wire        pt_mwr_ready;
  
     wire [1:0]  ll_session_done;
+    wire        ll_fc_credits_valid;   // G2
+    wire [7:0]  ll_xlat_miss_cnt;       // G3
+    wire        ll_xlat_miss_clr;       // G3
+
+    // G1: BAR0 base from config space, inbound MWr from link_layer_top
+    wire [31:0] pt_bar0_base;
+    wire        ll_inb_mwr_valid;
+    wire [63:0] ll_inb_mwr_addr;
+    wire [31:0] ll_inb_mwr_data;
+    wire [3:0]  ll_inb_mwr_be;
+
+    // G1: BAR0 write port as seen by pcie_phy_top (test port or inbound MWr)
+    wire        pt_bar0_wr_en;
+    wire [15:0] pt_bar0_addr;
+    wire [31:0] pt_bar0_wdata;
  
     pcie_phy_top #(
         .WW(WW), .LW(LW)
@@ -203,7 +245,7 @@ module link_phy_bridge_top #(
  
         .hot_reset_request (hot_reset_request),
         .flr_request       (flr_request),
-        .updatefc_received (updatefc_received),
+        .updatefc_received (updatefc_received | ll_fc_credits_valid),   // G2: real FC init, test input kept
         .datapath_rst_n    (datapath_rst_n),
         .axi_rst_n         (axi_rst_n),
         .flr_active        (flr_active),
@@ -230,8 +272,10 @@ module link_phy_bridge_top #(
         .phy_rx_sof        (phy_rx_sof),  .phy_rx_eof(phy_rx_eof),
         .phy_tx_idle       (phy_tx_idle), .phy_framing_err(phy_framing_err), .phy_lane_err(phy_lane_err),
  
-        .bar0_wr_en        (bar0_wr_en), .bar0_rd_en(bar0_rd_en), .bar0_addr(bar0_addr),
-        .bar0_wdata        (bar0_wdata), .bar0_rdata(bar0_rdata), .bar0_rd_valid(bar0_rd_valid),
+        .bar0_wr_en        (pt_bar0_wr_en), .bar0_rd_en(bar0_rd_en), .bar0_addr(pt_bar0_addr),
+        .bar0_wdata        (pt_bar0_wdata), .bar0_rdata(bar0_rdata), .bar0_rd_valid(bar0_rd_valid),
+        .cfg_bar0_addr     (pt_bar0_base),
+        .xlat_miss_cnt     (ll_xlat_miss_cnt), .xlat_miss_clr(ll_xlat_miss_clr),
  
         .cfg_base_addr_ch0 (pt_base_ch0), .cfg_base_addr_ch1(pt_base_ch1),
         .cfg_base_addr_wr  (pt_base_wr),
@@ -341,12 +385,75 @@ module link_phy_bridge_top #(
         .replay_event       (replay_event),
         .malformed_tlp_err  (malformed_tlp_err),
 
+        .fc_credits_valid   (ll_fc_credits_valid),
+        .fc_init_done       (fc_init_done),
+
+        .err_xlat_miss_cnt  (ll_xlat_miss_cnt),
+        .err_xlat_miss_clr  (ll_xlat_miss_clr),
+
+        .inb_mwr_valid      (ll_inb_mwr_valid),
+        .inb_mwr_addr       (ll_inb_mwr_addr),
+        .inb_mwr_data       (ll_inb_mwr_data),
+        .inb_mwr_be         (ll_inb_mwr_be),
+
         .mon_rx_axis_tvalid (m_rx_axis_tvalid),
         .mon_rx_axis_tdata  (m_rx_axis_tdata),
         .mon_rx_axis_tkeep  (m_rx_axis_tkeep),
         .mon_rx_axis_tlast  (m_rx_axis_tlast)
     );
  
+    // ================================================================
+    // 4. G1: inbound MWr -> BAR0 write port (see header note)
+    // ================================================================
+    localparam BAR0_AW = 16;                       // 64 KB BAR0 (pcie_config_space BAR0_SIZE)
+
+    wire ib_bar0_assigned = (pt_bar0_base[31:BAR0_AW] != {(32-BAR0_AW){1'b0}});
+    wire ib_bar0_hit      = ll_inb_mwr_valid && ib_bar0_assigned &&
+                            (ll_inb_mwr_addr[63:BAR0_AW] == {32'h0, pt_bar0_base[31:BAR0_AW]});
+    wire ib_wr_req        = ib_bar0_hit && (ll_inb_mwr_be == 4'hF);
+    assign err_bar0_partial_wr = ib_bar0_hit && (ll_inb_mwr_be != 4'hF);
+
+    // Test port has the shared addr/data bus this cycle -> inbound waits.
+    wire tb_bar0_busy = bar0_wr_en || bar0_rd_en;
+
+    reg         ib_pend;
+    reg  [15:0] ib_pend_addr;
+    reg  [31:0] ib_pend_data;
+
+    wire        ib_fire     = !tb_bar0_busy && (ib_pend || ib_wr_req);
+    wire [15:0] ib_fire_addr = ib_pend ? ib_pend_addr : ll_inb_mwr_addr[BAR0_AW-1:0];
+    wire [31:0] ib_fire_data = ib_pend ? ib_pend_data : ll_inb_mwr_data;
+
+    always @(posedge clk or negedge datapath_rst_n) begin
+        if (!datapath_rst_n) begin
+            ib_pend      <= 1'b0;
+            ib_pend_addr <= 16'h0;
+            ib_pend_data <= 32'h0;
+        end else if (ib_wr_req && !(ib_fire && !ib_pend)) begin
+            // new request not served directly: hold it (if a pending one
+            // fires this cycle the slot frees as the new one enters)
+            ib_pend      <= 1'b1;
+            ib_pend_addr <= ll_inb_mwr_addr[BAR0_AW-1:0];
+            ib_pend_data <= ll_inb_mwr_data;
+        end else if (ib_fire) begin
+            ib_pend      <= 1'b0;
+        end
+    end
+
+    assign pt_bar0_wr_en = bar0_wr_en || ib_fire;
+    assign pt_bar0_addr  = ib_fire ? ib_fire_addr : bar0_addr;
+    assign pt_bar0_wdata = ib_fire ? ib_fire_data : bar0_wdata;
+    assign inb_bar0_wr   = ib_fire;
+
+`ifdef SIMULATION
+    // Inbound MWrs are >= 4 DW apart on the 1-DW/clk RX unpacker, so the
+    // 1-deep holding register only overflows if the test port is held
+    // busy for several cycles while host writes stream in.
+    always @(posedge clk)
+        if (datapath_rst_n && ib_wr_req && ib_pend && !ib_fire)
+            $error("[link_phy_bridge_top] G1: inbound BAR0 write lost (test port busy, holding register full)");
+`endif
+
     // m_rx_axis_* is a MONITOR copy of the inbound TLP byte stream (every beat
     // the RX decode accepts). The decode inside link_layer_top owns flow
     // control, so m_rx_axis_tready is ignored. bridge_top's testbenches check
