@@ -37,7 +37,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: [link, interconnect, phy, cocotb, bridge, errors, asic]
+        suite: [link, interconnect, phy, cocotb, bridge, errors, asic, rand]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -62,6 +62,26 @@ jobs:
         with: { python-version: "3.12" }
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq iverilog
       - run: python3 ci/run_regression.py long
+
+  rand-sweep:
+    name: sim / rand sweep (nightly, 40 seeds)
+    needs: guards
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        block: [100, 110, 120, 130]          # 4 runners x 10 seeds
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq iverilog
+      - run: python3 ci/run_regression.py rand
+        env:
+          RAND_SEEDS: "10"
+          RAND_BASE: ${{ matrix.block }}
 
   formal:
     name: formal (SymbiYosys)
