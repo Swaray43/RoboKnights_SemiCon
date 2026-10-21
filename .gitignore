@@ -13,3 +13,8 @@ vivado_project/**/sim/
 *.log
 vivado_project/
 .patch
+# Vivado build output (never commit)
+vivado_bridge/
+.Xil/
+*.dcp
+quartus_bridge/
