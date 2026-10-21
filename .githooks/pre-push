@@ -1,0 +1,33 @@
+#!/bin/sh
+# .githooks/pre-push -- local merge gate (free private repos can't enforce
+# GitHub rulesets). Enable once per clone:   git config core.hooksPath .githooks
+#
+#  1. Refuses a direct push to main: changes go through a pull request.
+#     (Emergency override: ALLOW_MAIN_PUSH=1 git push ...)
+#  2. Runs the 1-second guard (ci/check_protected.py) on every push, so a
+#     branch that lost an earlier fix never reaches GitHub.
+#     (Skip, e.g. for a docs-only push: SKIP_GUARDS=1 git push ...)
+
+while read local_ref local_sha remote_ref remote_sha; do
+    if [ "$remote_ref" = "refs/heads/main" ] && [ "$ALLOW_MAIN_PUSH" != "1" ]; then
+        echo ""
+        echo "pre-push: direct pushes to main are blocked."
+        echo "  Push a branch and open a pull request:  git push -u origin <branch>"
+        echo "  (emergency only: ALLOW_MAIN_PUSH=1 git push ...)"
+        echo ""
+        exit 1
+    fi
+done
+
+if [ "$SKIP_GUARDS" = "1" ]; then exit 0; fi
+root=$(git rev-parse --show-toplevel)
+if [ -f "$root/ci/check_protected.py" ]; then
+    py=python3; command -v python3 >/dev/null 2>&1 || py=python
+    if ! "$py" "$root/ci/check_protected.py"; then
+        echo ""
+        echo "pre-push: guards failed (see above). Push blocked."
+        echo "  A required fix is missing -- usually an edit made on an old copy of a file."
+        exit 1
+    fi
+fi
+exit 0
