@@ -1,0 +1,68 @@
+# ci/protected_lines.txt -- fixes that must never silently disappear.
+#
+# Checked by ci/check_protected.py on every push / pull request. Each rule is
+#   <ID> | <file> | require | <text>     the text must appear in the file
+#   <ID> | <file> | forbid  | <text>     the text must NOT appear in the file
+# Matching ignores whitespace differences (runs of spaces/tabs count as one
+# space) and line endings, so reformatting is fine; deleting or reverting is not.
+#
+# Why this exists: twice in Phase 2 a change was made on an old copy of a file
+# and silently undid earlier fixes (G1-G3 on 2026-10-21, the TUSER order and the
+# FEC while->if before that). If a rule here fails, either the fix was lost
+# (restore it) or it was deliberately redesigned (update the rule in the same PR
+# and say why in the PR description).
+
+# ---- plumbing fixes (round 1) ----
+OVF-1  | interconnect_layer/src/axi4s_ingest_port.v | require | && !would_overflow && !ds_backpressure && !abort_pend;
+K1     | protocol_PHY_layer/rtl/pcie_phy_top.v      | require | .session_end(session_done[0])
+K1     | protocol_PHY_layer/rtl/pcie_phy_top.v      | require | .session_end(session_done[1])
+FEC-if | src-link_layer/hdl/flit_defs.vh            | require | if (fl_is_pow2(p)) p = p + 11'd1;
+FEC-if | src-link_layer/hdl/flit_defs.vh            | forbid  | while (fl_is_pow2(p))
+
+# ---- R2 / G7: link-native TUSER {tlast_flag, session_offset, stream_id}, one definition ----
+G7     | interconnect_layer/src/interconnect_top.v  | require | assign m_tuser = tuser_pack(m_tlast, m_session_offset_i, m_stream_id_i);
+G7     | interconnect_layer/src/interconnect_top.v  | require | `include "axis_tuser_defs.vh"
+G7     | src-link_layer/hdl/link_phy_bridge_top.v   | require | .s_axis_tuser       (s_axis_tuser),
+G7     | src-link_layer/hdl/link_phy_bridge_top.v   | forbid  | {s_axis_tlast, ic_tuser}
+
+# ---- R3 / P1: RX parser address from DW2/DW3, request on header-done ----
+P1     | src-link_layer/hdl/tlp_header_parser.v     | require | output reg                     parsed_hdr_done
+P1     | src-link_layer/hdl/tlp_header_parser.v     | require | parsed_hdr_done   <= 1'b1;
+P1     | src-link_layer/hdl/pcie_rx_engine.v        | require | wire mwr_req = REQ_ON_HDR_DONE ? (tlp_hdr_done && is_mwr)
+P1     | src-link_layer/hdl/link_layer_top.v        | require | .REQ_ON_HDR_DONE(1)
+
+# ---- R4: RX monitor tap feeding m_rx_axis (tb_bridge_top's checker) ----
+R4     | src-link_layer/hdl/link_layer_top.v        | require | assign mon_rx_axis_tvalid = rx_wide_valid && rx_wide_ready;
+
+# ---- G1: host MWr -> BAR0 ----
+G1     | protocol_PHY_layer/rtl/pcie_phy_top.v      | require | output wire [31:0]  cfg_bar0_addr,
+G1     | protocol_PHY_layer/rtl/pcie_phy_top.v      | require | .bar_addr_0(cfg_bar0_addr)
+G1     | src-link_layer/hdl/link_layer_top.v        | require | output reg                     inb_mwr_valid,
+G1     | src-link_layer/hdl/link_phy_bridge_top.v   | require | wire ib_bar0_hit      = ll_inb_mwr_valid && ib_bar0_assigned &&
+
+# ---- G2: real flow-control credits ----
+G2     | src-link_layer/hdl/credit_manager.v        | require | wire upd_hdr_inf  = (update_fc_hdr_limit  == 8'd0);
+G2     | src-link_layer/hdl/stream_tx_path_top.v    | require | .update_fc_valid     (fc_upd_valid),
+G2     | src-link_layer/hdl/data_link_layer_top.v   | require | output wire                     fc_credits_valid,
+G2     | src-link_layer/hdl/link_layer_tx.v         | require | assign dllp_taken = (state == ST_IDLE) && dllp_req;
+G2     | src-link_layer/hdl/link_phy_bridge_top.v   | require | .updatefc_received (updatefc_received | ll_fc_credits_valid),
+
+# ---- G3: sticky address-translation miss counter in BAR0 ----
+G3     | src-link_layer/hdl/pcie_address_translator.v | require | output reg  [7:0]                 err_xlat_miss_cnt,
+G3     | protocol_PHY_layer/rtl/pcie_phy_top.v      | require | .xlat_miss_cnt(xlat_miss_cnt), .xlat_miss_clr(xlat_miss_clr)
+G3     | protocol_PHY_layer/rtl/bar0_dma_regs.v     | require | 10'h007: bar0_rdata <= {24'h0, xlat_miss_cnt};
+
+# ---- G4 / F5: MWr vs MRd by Fmt[1] ----
+F5     | src-link_layer/hdl/tlp_header_parser.v     | require | parsed_has_data  <= rx_tlp_data[30];
+F5     | src-link_layer/hdl/pcie_rx_engine.v        | require | wire is_mwr  = (tlp_type == 5'b00000) && tlp_has_data;
+F5     | src-link_layer/hdl/link_layer_top.v        | require | .tlp_has_data      (parsed_has_data),
+
+# ---- F6: CplLk / CplDLk are completions ----
+F6     | src-link_layer/hdl/tlp_header_parser.v     | require | is_cpl           <= (rx_tlp_data[28:25] == 4'b0101);
+F6     | src-link_layer/hdl/pcie_rx_engine.v        | require | wire is_cpld = (tlp_type[4:1] == 4'b0101);
+
+# ---- F1: ingest offset compare one bit wider (no 16 MB wrap) ----
+F1     | interconnect_layer/src/axi4s_ingest_port.v | require | (({1'b0, session_offset} + beat_bytes) > {1'b0, session_limit});
+
+# ---- Step 4 rank 5: memory arrays outside async-reset blocks (RAM inference) ----
+OPT-5  | protocol_PHY_layer/rtl/pcie_phy_top.v      | require | reg  [1:0]  ic_end_seen;
