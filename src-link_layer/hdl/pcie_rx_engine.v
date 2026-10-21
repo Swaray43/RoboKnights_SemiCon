@@ -5,12 +5,7 @@ module pcie_rx_engine #(
     parameter TAG_WIDTH      = 10,
     parameter MAX_DW_PER_REQ = 16,
     parameter PCIE_ADDR_W    = 64,
-    parameter AXI_ADDR_W     = 32,
-    // 1: issue the MWr address request on tlp_hdr_done (address is complete,
-    //    i.e. driven by tlp_header_parser.parsed_hdr_done). 0: legacy, request
-    //    on SOF (only correct if tlp_addr is already valid at SOF, as in the
-    //    unit bench). link_layer_top sets 1.
-    parameter REQ_ON_HDR_DONE = 0
+    parameter AXI_ADDR_W     = 32
 )(
     input wire clk,
     input wire rst_n,
@@ -19,21 +14,20 @@ module pcie_rx_engine #(
     input wire                     tlp_rx_sof,
     input wire                     tlp_rx_eof,
     input wire [31:0]              tlp_rx_data,
-    
+
     input wire [4:0]               tlp_type,
+    input wire                     tlp_has_data,    // P2-5/F5: Fmt[1] from tlp_header_parser
     input wire [9:0]               tlp_length_dw,
     input wire [TAG_WIDTH-1:0]     tlp_tag,
     input wire [6:0]               tlp_lower_addr,
     input wire [2:0]               tlp_cpl_status,
     input wire [PCIE_ADDR_W-1:0]   tlp_addr,
-    input wire                     tlp_hdr_done,    // see REQ_ON_HDR_DONE
-    input wire                     tlp_has_data,    // G4 (P2-5): Fmt[1] -- disambiguates MWr from MRd
 
     input  wire                    req_alloc_valid,
     input  wire [TAG_WIDTH-1:0]    req_alloc_tag,
     input  wire [9:0]              req_alloc_len,
     output wire                    req_alloc_ready,
-    
+
     output wire                    m_axis_cpl_tvalid,
     output wire [31:0]             m_axis_cpl_tdata,
     output wire                    m_axis_cpl_tlast,
@@ -45,7 +39,7 @@ module pcie_rx_engine #(
     input  wire                    m_axi_awready, // AXI4 Handshake addition
     output wire [AXI_ADDR_W-1:0]   m_axi_awaddr,
     output wire                    m_axi_awerr,
-    
+
     input  wire [PCIE_ADDR_W-1:0]  cfg_window_base,
     input  wire [PCIE_ADDR_W-1:0]  cfg_window_mask,
     input  wire [AXI_ADDR_W-1:0]   cfg_axi_base,
@@ -61,25 +55,30 @@ module pcie_rx_engine #(
     output wire [PCIE_ADDR_W-1:0]  cfg_req_addr,
 
     // Gap fix X2: malformed TLP (unrecognised Type field) detection.
-    output wire                    malformed_tlp_err,
-
-    // G3 (P2-3): sticky inbound address-translation miss count + clear
-    output wire [7:0]              err_xlat_miss_cnt,
-    input  wire                    err_xlat_miss_clr
+    output wire                    malformed_tlp_err
 );
 
-    wire is_cpld = (tlp_type == 5'b01010);
-    // G4 (P2-5): Type 0_0000 is shared by MRd and MWr; only Fmt[1]
-    // (tlp_has_data, from tlp_header_parser's parsed_has_data) tells them
-    // apart. The old code also matched a 5'b10000 "non-standard encoding"
-    // that nothing in this project ever produced -- removed, not replaced.
-    // A real inbound MRd (Type 0, no data) is no longer misrouted through
-    // the address translator as if it carried a write (it used to decode
-    // to a bogus AXI write with whatever garbage DW followed the header);
-    // it now falls through to malformed_type_err below, since this
-    // MWr-only RX path has no completion-generating path for inbound
-    // reads yet (P2-8 / future work, not this fix).
-    wire is_mwr  = (tlp_type == 5'b00000) && tlp_has_data;
+    // Fix P2-5/F6: CplLk/CplDLk (Type 0_1011) share the top 4 bits of
+    // Type with Cpl/CplD (0_1010) and only differ in bit 0 (Locked).
+    // The old check (tlp_type == 5'b01010) missed CplLk/CplDLk
+    // entirely: they fell through to !(is_mwr || is_cpld || is_cfg)
+    // and were flagged malformed_tlp_err instead of being drained as
+    // completions. Widened to match both.
+    wire is_cpld = (tlp_type[4:1] == 4'b0101);
+
+    // Fix P2-5/F5: MWr and MRd share Type 0_0000 and differ only in
+    // Fmt[1] (tlp_has_data, from tlp_header_parser). Before, every
+    // MRd was decoded as an MWr, so a host READ of BAR0 issued a
+    // spurious AXI write. The old extra case 5'b10000 is a Message
+    // routed to the Root Complex in the spec, not a write; it is now
+    // classified separately as is_msg. MRd (and MRdLk, 0_0001) and
+    // messages (1_0rrr) are recognised and ignored here: not
+    // written, not flagged malformed. A completer for host reads
+    // (returning CplD) does not exist yet; the host would see a
+    // completion timeout on a BAR0 read.
+    wire is_mwr  = (tlp_type == 5'b00000) &&  tlp_has_data;
+    wire is_mrd  = ((tlp_type == 5'b00000) || (tlp_type == 5'b00001)) && !tlp_has_data;
+    wire is_msg  = (tlp_type[4:3] == 2'b10);
 
     // Gap fix X1: Cfg Type0 (0_0100) / Type1 (0_0101) detection.
     wire is_cfg      = (tlp_type == 5'b00100) || (tlp_type == 5'b00101);
@@ -87,8 +86,10 @@ module pcie_rx_engine #(
 
     // Gap fix X2: any TLP whose Type isn't one of the above is
     // outside what this bridge currently recognises.
+    // (P2-5: MRd vs MWr is resolved with tlp_has_data; CplLk/CplDLk
+    // folded into is_cpld -- see above.)
     wire malformed_type_err = tlp_rx_valid && tlp_rx_sof &&
-                               !(is_mwr || is_cpld || is_cfg);
+                               !(is_mwr || is_mrd || is_msg || is_cpld || is_cfg);
     assign malformed_tlp_err = malformed_type_err;
 
     // Gap fix X1: delay cfg_req_valid to one cycle after SOF so
@@ -107,7 +108,7 @@ module pcie_rx_engine #(
 
     reg in_cpld_pkt;
     reg in_mwr_pkt;
-    
+
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             in_cpld_pkt <= 0;
@@ -154,10 +155,6 @@ module pcie_rx_engine #(
         .m_axis_tready(m_axis_cpl_tready)
     );
 
-    // MWr address request: on header-done (address complete) or legacy SOF.
-    wire mwr_req = REQ_ON_HDR_DONE ? (tlp_hdr_done && is_mwr)
-                                   : (tlp_rx_valid && tlp_rx_sof && is_mwr);
-
     pcie_address_translator #(
         .PCIE_ADDR_WIDTH(PCIE_ADDR_W),
         .AXI_ADDR_WIDTH(AXI_ADDR_W)
@@ -167,14 +164,12 @@ module pcie_rx_engine #(
         .trans_window_base(cfg_window_base),
         .trans_window_mask(cfg_window_mask),
         .trans_axi_base(cfg_axi_base),
-        .req_valid(mwr_req),
+        .req_valid(tlp_rx_valid && tlp_rx_sof && is_mwr),
         .req_pcie_addr(tlp_addr),
         .axi_addr_ready(m_axi_awready), // Connected AXI4 ready
         .axi_addr_valid(m_axi_awvalid),
         .axi_addr(m_axi_awaddr),
-        .translation_err(m_axi_awerr),
-        .err_xlat_miss_cnt(err_xlat_miss_cnt),
-        .err_xlat_miss_clr(err_xlat_miss_clr)
+        .translation_err(m_axi_awerr)
     );
 
 endmodule
