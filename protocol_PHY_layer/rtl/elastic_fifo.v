@@ -28,21 +28,23 @@ assign fill_count = count;
 assign empty = (count == 0);
 assign full  = (count == DEPTH);
 
+// OPT-5: the array and its registered read port sit in a block WITHOUT reset,
+// so synthesis can map them to RAM (an array under async reset is built from
+// flip-flops). rd_data is only consumed one clock after a read, so its reset
+// value was never used.
+always @(posedge clk) begin
+  if (wr_en && !full)  mem[wr_ptr] <= wr_data;
+  if (rd_en && !empty) rd_data     <= mem[rd_ptr];
+end
+
 always @(posedge clk or negedge rst_n) begin
   if (!rst_n) begin
     wr_ptr  <= 0;
     rd_ptr  <= 0;
     count   <= 0;
-    rd_data <= 8'd0;
   end else begin
-    if (wr_en && !full) begin
-      mem[wr_ptr] <= wr_data;
-      wr_ptr <= wr_ptr + 1'b1;
-    end
-    if (rd_en && !empty) begin
-      rd_data <= mem[rd_ptr];
-      rd_ptr <= rd_ptr + 1'b1;
-    end
+    if (wr_en && !full)  wr_ptr <= wr_ptr + 1'b1;
+    if (rd_en && !empty) rd_ptr <= rd_ptr + 1'b1;
     case ({wr_en && !full, rd_en && !empty})
       2'b10: count <= count + 1'b1;
       2'b01: count <= count - 1'b1;

@@ -76,6 +76,17 @@ wire too_far = !locked && ((cnt0 > MAX_SKEW) || (cnt1 > MAX_SKEW) ||
 
 wire [3:0] full = {cnt3 == DEPTH, cnt2 == DEPTH, cnt1 == DEPTH, cnt0 == DEPTH};
 
+// OPT-5: the four lane arrays are written in their own reset-free block so they
+// map to RAM. Same write condition as before: not on a too_far flush (that
+// resets the pointers, so a write there was discarded anyway).
+wire mem_we_ok = rst_n && !too_far;
+always @(posedge clk) begin
+  if (mem_we_ok && wr[0] && !full[0]) mem0[wp0] <= b0;
+  if (mem_we_ok && wr[1] && !full[1]) mem1[wp1] <= b1;
+  if (mem_we_ok && wr[2] && !full[2]) mem2[wp2] <= b2;
+  if (mem_we_ok && wr[3] && !full[3]) mem3[wp3] <= b3;
+end
+
 always @(posedge clk or negedge rst_n) begin
   if (!rst_n) begin
     wp0 <= 0; wp1 <= 0; wp2 <= 0; wp3 <= 0;
@@ -98,10 +109,10 @@ always @(posedge clk or negedge rst_n) begin
     if (!locked && ((armed | arm_now) == 4'b1111) && align_en)
       locked <= 1'b1;   // all heads are the same COM from the next cycle on
 
-    if (wr[0] && !full[0]) begin mem0[wp0] <= b0; wp0 <= wp0 + 1'b1; end
-    if (wr[1] && !full[1]) begin mem1[wp1] <= b1; wp1 <= wp1 + 1'b1; end
-    if (wr[2] && !full[2]) begin mem2[wp2] <= b2; wp2 <= wp2 + 1'b1; end
-    if (wr[3] && !full[3]) begin mem3[wp3] <= b3; wp3 <= wp3 + 1'b1; end
+    if (wr[0] && !full[0]) wp0 <= wp0 + 1'b1;
+    if (wr[1] && !full[1]) wp1 <= wp1 + 1'b1;
+    if (wr[2] && !full[2]) wp2 <= wp2 + 1'b1;
+    if (wr[3] && !full[3]) wp3 <= wp3 + 1'b1;
     if (locked && |(wr & full)) overflow <= 1'b1;
 
     out_valid <= pop;

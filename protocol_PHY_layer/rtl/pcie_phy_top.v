@@ -132,16 +132,8 @@ module pcie_phy_top #(
     input  wire [31:0]  bar0_wdata,
     output wire [31:0]  bar0_rdata,
     output wire         bar0_rd_valid,
-    // G1 (P2-1): BAR0 base as programmed by the host (config 0x10, 32-bit
-    // memory BAR, 64 KB). The link side uses it to decide whether a decoded
-    // inbound MWr hits BAR0 before driving bar0_wr_en/addr/wdata above.
-    output wire [31:0]  cfg_bar0_addr,
 
     // ==== NEW: to link layer (clk domain) ====
-    // G3 (P2-3): inbound address-translation miss status (BAR0 XLAT_MISS)
-    input  wire [7:0]   xlat_miss_cnt,
-    output wire          xlat_miss_clr,
-
     output wire [63:0]  cfg_base_addr_ch0,
     output wire [63:0]  cfg_base_addr_ch1,
     output wire [1:0]   cfg_base_addr_wr,        // 1-cycle pulse when a channel's base is (re)latched
@@ -265,7 +257,7 @@ pcie_config_space #(.BAR0_SIZE(32'h0001_0000)) u_cfg (
   .cfg_wr_en(cfg_wr_en), .cfg_rd_en(cfg_rd_en), .cfg_addr(cfg_addr), .cfg_wdata(cfg_wdata),
   .cfg_rdata(cfg_rdata), .cfg_cpl_valid(cfg_cpl_valid),
   .link_training_bit(link_trained), .link_width(6'd4), .link_speed(4'd6),
-  .bar_addr_0(cfg_bar0_addr), .bar_addr_1(), .bar_addr_2(), .bar_addr_3(), .bar_addr_4(), .bar_addr_5(),
+  .bar_addr_0(), .bar_addr_1(), .bar_addr_2(), .bar_addr_3(), .bar_addr_4(), .bar_addr_5(),
   .max_payload_size(), .max_read_req_size(),
   .mem_space_enable(mem_space_en), .bus_master_enable(),
   .msix_enable(msix_en), .msix_func_mask(msix_fmask)
@@ -279,6 +271,7 @@ wire [63:0] base_ch0, base_ch1;
 wire [2:0]  msix_vec_ch0, msix_vec_ch1, tc_ch0, tc_ch1;
 wire [7:0]  arm_dbg0, arm_dbg1;
 wire [1:0]  session_end_clk;
+reg  [1:0]  ic_end_seen;     // OPT-5: declared before u_bar0 uses it (was declared after: implicit net)
 
 // overflow flags are levels in aclk: plain 2-flop synchroniser into clk
 (* ASYNC_REG = "TRUE" *) reg [1:0] ovf_s1, ovf_s2;
@@ -311,8 +304,7 @@ bar0_dma_regs #(.WW(WW), .LW(LW)) u_bar0 (
   .msix_vec_ch0(msix_vec_ch0), .msix_vec_ch1(msix_vec_ch1),
   .tc_ch0(tc_ch0), .tc_ch1(tc_ch1),
   .session_valid(session_valid), .status_in(ovf_s2), .ic_end_seen(ic_end_seen),
-  .arm_dbg_ch0(arm_dbg0), .arm_dbg_ch1(arm_dbg1),
-  .xlat_miss_cnt(xlat_miss_cnt), .xlat_miss_clr(xlat_miss_clr)
+  .arm_dbg_ch0(arm_dbg0), .arm_dbg_ch1(arm_dbg1)
 );
 
 session_arm_ctrl u_sess0 (
@@ -359,7 +351,6 @@ pulse_sync u_end_cdc1   (.src_clk(aclk), .src_rst_n(aclk_rst_n),     .src_pulse(
 // session_end_aclk is kept as a debug signal: ic_end_seen = "the interconnect
 // has finished accepting this session, its data is still draining". It is
 // shown in BAR0 STATUS[5:4] and clears when the session ends (or on a new arm).
-reg [1:0] ic_end_seen;
 always @(posedge clk or negedge datapath_rst_n) begin
   if (!datapath_rst_n) ic_end_seen <= 2'b00;
   else                 ic_end_seen <= (ic_end_seen | session_end_clk) & session_valid & ~arm_pulse;

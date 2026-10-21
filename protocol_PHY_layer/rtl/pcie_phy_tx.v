@@ -88,16 +88,18 @@ wire          ff_push = flit_valid && flit_ready;
 wire          ff_pop;
 wire [256:0]  ff_head = ff_mem[ff_rd_ptr];
 
+// OPT-5: array write in its own reset-free block so it maps to RAM (16 x 257,
+// asynchronous FWFT read -> distributed/LUT RAM) instead of 4,112 flip-flops.
+always @(posedge clk)
+  if (ff_push) ff_mem[ff_wr_ptr] <= {flit_sof, flit_data};
+
 always @(posedge clk or negedge rst_n) begin
   if (!rst_n) begin
     ff_wr_ptr <= {FAW{1'b0}};
     ff_rd_ptr <= {FAW{1'b0}};
     ff_count  <= {(FAW+1){1'b0}};
   end else begin
-    if (ff_push) begin
-      ff_mem[ff_wr_ptr] <= {flit_sof, flit_data};
-      ff_wr_ptr <= ff_wr_ptr + 1'b1;
-    end
+    if (ff_push) ff_wr_ptr <= ff_wr_ptr + 1'b1;
     if (ff_pop) ff_rd_ptr <= ff_rd_ptr + 1'b1;
     case ({ff_push, ff_pop})
       2'b10:   ff_count <= ff_count + 1'b1;
