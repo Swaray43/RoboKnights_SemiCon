@@ -155,7 +155,18 @@ module tb_link_layer_loopback;
     endtask
 
     // Wait for a full Flit to clear the pipeline (CALC + 8 SEND beats).
-    task wait_flit_drain; begin repeat (12) @(negedge clk); end endtask
+    // Wait until the Flit has been decoded on the RX side, then a few more
+    // clocks for the status flags. Event-driven, not a fixed count: the
+    // pipelined CRC/FEC in link_layer_tx (Step 4 rank 4) added 8 cycles of
+    // ST_CALC latency, which broke the old fixed 12-clock wait.
+    task wait_flit_drain;
+        integer n;
+        begin
+            n = 0;
+            while (!rx_ev_valid && n < 200) begin @(negedge clk); n = n + 1; end
+            repeat (4) @(negedge clk);
+        end
+    endtask
 
     initial begin
         clk = 0; rst_n = 0;

@@ -128,11 +128,14 @@ module link_layer_tx #(
         reg [63:0] c;
         begin
             c = c_in;
-            for (i = 0; i < len; i = i + 1) begin
-                if (c[63] ^ chunk[i])
-                    c = (c << 1) ^ 64'h42F0E1EBA9EA3693;
-                else
-                    c = c << 1;
+            // constant loop bound (Yosys/LibreLane need one); len gates the step
+            for (i = 0; i < 256; i = i + 1) begin
+                if (i < len) begin
+                    if (c[63] ^ chunk[i])
+                        c = (c << 1) ^ 64'h42F0E1EBA9EA3693;
+                    else
+                        c = c << 1;
+                end
             end
             flit_crc64_step = c;
         end
@@ -188,9 +191,11 @@ module link_layer_tx #(
             p = calc_p_at(calc_j_cnt(byte_lo, j) * 8);
             s = 10'd0; par = 1'b0;
             last_byte = byte_lo + (len_bits / 8) - 1;
-            for (b = byte_lo; b <= last_byte; b = b + 1) begin
-                if ((b % 3) == j) begin
-                    bb = (b - byte_lo) * 8;
+            // constant loop bound (Yosys/LibreLane need one): walk the 32
+            // bytes of the 256-bit chunk, skipping those past len_bits
+            for (bb = 0; bb < 256; bb = bb + 8) begin
+                b = byte_lo + (bb / 8);
+                if ((b <= last_byte) && ((b % 3) == j)) begin
                     for (k = 0; k < 8; k = k + 1) begin
                         p = p + 11'd1;
                         if (fl_is_pow2(p)) p = p + 11'd1;
