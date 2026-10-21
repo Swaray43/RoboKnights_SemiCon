@@ -48,7 +48,7 @@ module cdc_fifo_async #(
     localparam DEPTH = (1 << ADDR_WIDTH);
     localparam ALMOST_FULL_THRESH = (DEPTH * ALMOST_FULL_PCT) / 100;
 
-    reg [WIDTH-1:0] mem [0:DEPTH-1];
+    (* ram_style = "distributed" *) reg [WIDTH-1:0] mem [0:DEPTH-1];
 
     // ---- write-side pointers ----
     reg  [ADDR_WIDTH:0] wr_ptr_bin;
@@ -102,10 +102,23 @@ module cdc_fifo_async #(
             wr_ptr_bin  <= {(ADDR_WIDTH+1){1'b0}};
             wr_ptr_gray <= {(ADDR_WIDTH+1){1'b0}};
         end else if (wr_en && !wr_full) begin
-            mem[wr_ptr_bin[ADDR_WIDTH-1:0]] <= wr_data;
             wr_ptr_bin  <= wr_ptr_bin + 1'b1;
             wr_ptr_gray <= (wr_ptr_bin_lookahead >> 1) ^ wr_ptr_bin_lookahead;
         end
+    end
+
+    // ---- memory write: its own clocked block, NO reset (ticket #5) ----
+    // A memory array inside an async-reset always block cannot map to a RAM
+    // primitive (RAM has no reset), so Vivado builds it from flip-flops.
+    // Contents need no reset: rd_empty/wr_full gate every access. Same
+    // enable (wr_en && !wr_full) as the pointer advance, so behaviour is
+    // identical. Read stays combinational (FWFT), so synthesis maps this to
+    // distributed (LUT) RAM, the right fit at depth 16; a block-RAM mapping
+    // would need a registered read port (extra latency) and is only worth
+    // it for much deeper FIFOs.
+    always @(posedge wr_clk) begin
+        if (wr_en && !wr_full)
+            mem[wr_ptr_bin[ADDR_WIDTH-1:0]] <= wr_data;
     end
 
     // ---- read logic: first-word-fall-through ----
