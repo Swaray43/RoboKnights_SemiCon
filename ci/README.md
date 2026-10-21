@@ -29,12 +29,28 @@ Needs Python 3 and Icarus Verilog 12 on PATH (cocotb: `pip install cocotb==2.1.0
 ModelSim stays the day-to-day simulator; CI uses Icarus because GitHub's runners
 have no ModelSim licence. Every bench must print `RESULT: PASS` or `RESULT: FAIL`.
 
-## Making it a merge gate (one-time, repo admin)
+## The merge gate (free private repo: no enforced rulesets)
 
-GitHub -> Settings -> Branches -> Add rule for `main`:
-- Require a pull request before merging
-- Require status checks to pass: select `guards` and every `sim / ...` job
-- (optional) Require branches to be up to date before merging
+GitHub only enforces branch rulesets on private repos for paid plans, so the
+gate has two halves that need no plan:
+
+1. **Before pushing: `.githooks/pre-push`.** Blocks direct pushes to `main` and
+   runs the guard on every push. Each person enables it once per clone:
+
+       git config core.hooksPath .githooks
+
+   Emergency override: `ALLOW_MAIN_PUSH=1 git push ...` (PowerShell:
+   `$env:ALLOW_MAIN_PUSH=1; git push ...; Remove-Item env:ALLOW_MAIN_PUSH`).
+2. **After merging: `.github/workflows/main-guard.yml`.** Every push to `main`
+   runs guards + interconnect + bridge + link + errors (~15 min). If any fails,
+   `main` is put back to the previous commit with one "Auto-revert" commit and
+   an issue names the commit, its author and the failing log.
+
+Team rule on top: merge a pull request only when its Checks tab is green.
+
+If the repo ever moves to a paid plan, public visibility, or the owner's GitHub
+Pro (free in the GitHub Student Developer Pack), import
+`main_protection_ruleset.json` instead and keep the hook as a fast local check.
 
 ## When a guard fails
 
