@@ -1,0 +1,30 @@
+# tlp_header_parser (link layer RX decode): hdr_done exactly once per TLP, on its
+# last header DW, with the address from DW2 (3DW) or DW2/DW3 (4DW), and the
+# right type, length, 10-bit tag and has-data (Fmt[1]) flag.
+# Harness: fv_tlp_header_parser.v.
+#
+# prove : well-formed DW stream with gaps, free payload length, all completion
+#         types (incl. CplLk). PASS.
+# cover : 3DW MWr, 4DW request, completion, back-to-back TLPs, gaps.
+[tasks]
+prove
+cover
+
+[options]
+prove: mode prove
+prove: aigsmt z3
+cover: mode cover
+cover: depth 16
+
+[engines]
+prove: abc pdr
+cover: smtbmc z3
+
+[script]
+read -formal tlp_header_parser.v
+read -formal fv_tlp_header_parser.v
+prep -top fv_tlp_header_parser
+
+[files]
+../../src-link_layer/hdl/tlp_header_parser.v
+fv_tlp_header_parser.v
