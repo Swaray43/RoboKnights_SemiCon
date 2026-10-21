@@ -116,12 +116,21 @@ always @(posedge clk or negedge rst_n) begin
             if (gap_detected) begin
                 err_tkeep_gap <= 1'b1;
             end else if (s_tready) begin
-                mem[wr_ptr] <= {s_tuser, s_tlast, s_tkeep, s_tdata};
+                // mem[] write moved below (OPT-5, BRAM inference)
                 wr_ptr      <= wr_ptr + 1'b1;
                 burst_active_ch[ch_sel_w] <= !s_tlast;
             end
         end
     end
+end
+// OPT-5: mem[] write lives in its own clocked-only block (no reset in the
+// sensitivity list) so Vivado infers block RAM for this FIFO_D-entry
+// array instead of flip-flops. wr_ptr/burst_active_ch stay above, async
+// reset and all -- only the array write itself needed to move. wr_en is
+// the exact same guard the write used above (s_tvalid && s_tready && !gap_detected).
+always @(posedge clk) begin
+    if (wr_en)
+        mem[wr_ptr] <= {s_tuser, s_tlast, s_tkeep, s_tdata};
 end
 always @(posedge clk or negedge rst_n) begin
     if (!rst_n) s_tready <= 1'b0;

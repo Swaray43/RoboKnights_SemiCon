@@ -12,3 +12,4 @@ vivado_project/**/sim/
 *.jou
 *.log
 vivado_project/
+.patch
