@@ -133,9 +133,9 @@ module axi_pcie_reorder_buffer #(
             if (rx_cpld_valid && match_found) begin
                 if (rx_cpld_dvalid) begin
                     if (write_dw_offset < MAX_DW_PER_REQ) begin
-                        buffer_data[(match_idx * MAX_DW_PER_REQ) + write_dw_offset] <= rx_cpld_data;
+                        // buffer_data[] write moved below (OPT-5, BRAM inference)
                         current_rx_offset <= write_dw_offset + 1;
-                        
+
                         slot_rx_cnt[match_idx] <= slot_rx_cnt[match_idx] + 1;
                         
                         if (slot_rx_cnt[match_idx] + 1 >= slot_len[match_idx]) begin
@@ -209,5 +209,18 @@ module axi_pcie_reorder_buffer #(
                 end
             end
         end
+    end
+
+    // OPT-5: buffer_data[] write lives in its own clocked-only block (no
+    // reset in the sensitivity list) so Vivado infers block RAM for the
+    // NUM_SLOTS*MAX_DW_PER_REQ-entry array instead of flip-flops. The
+    // per-slot control arrays (slot_valid/slot_tag/slot_len/slot_rx_cnt/
+    // slot_done/slot_timeout_*) stay in the async-reset block above --
+    // they're small, per-slot control state, not the bulk storage this
+    // ticket targets. Same write guard as before: rx_cpld_valid &&
+    // match_found && rx_cpld_dvalid && write_dw_offset < MAX_DW_PER_REQ.
+    always @(posedge clk) begin
+        if (rx_cpld_valid && match_found && rx_cpld_dvalid && (write_dw_offset < MAX_DW_PER_REQ))
+            buffer_data[(match_idx * MAX_DW_PER_REQ) + write_dw_offset] <= rx_cpld_data;
     end
 endmodule

@@ -283,7 +283,7 @@ module data_link_layer_top #(
             end
 
             if (rx_accept) begin
-                rxf_mem[rxf_wp[RXF_AW-1:0]] <= rx_payload;
+                // rxf_mem[] write moved below (OPT-5, BRAM inference)
                 rxf_wp     <= rxf_wp + 1'b1;
                 exp_seq    <= exp_seq + 1'b1;
                 nak_sent   <= 1'b0;
@@ -301,6 +301,15 @@ module data_link_layer_top #(
                 ackn_seq_r <= exp_seq - 1'b1;
             end
         end
+    end
+
+    // OPT-5: rxf_mem[] write lives in its own clocked-only block (no
+    // reset in the sensitivity list) so Vivado infers block RAM instead
+    // of flip-flops. rxf_wp/exp_seq/nak_sent/ack_pend/nak_pend/ackn_seq_r
+    // stay in the async-reset block above -- only the array write moved.
+    always @(posedge clk) begin
+        if (rx_accept)
+            rxf_mem[rxf_wp[RXF_AW-1:0]] <= rx_payload;
     end
 
     // ---------------- G2: FC DLLPs / FC initialisation ----------------

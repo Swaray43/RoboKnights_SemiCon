@@ -67,6 +67,11 @@ module replay_buffer #(
     reg [SEQ_WIDTH-1:0]  tx_seq;     // next Flit to transmit
     reg [TMR_W-1:0]      timer;
 
+    // OPT-5: mem[] write lives in its own clocked-only block below (no
+    // reset in the sensitivity list) so Vivado infers block RAM for the
+    // 1888x32 = 60,416-bit array instead of 60,416 flip-flops. head_seq
+    // (the pointer) stays in the async-reset control block -- only the
+    // array write itself needed to move.
     assign outstanding = head_seq - tail_seq;
 
     assign s_ready = (outstanding < BUF_DEPTH);
@@ -92,9 +97,8 @@ module replay_buffer #(
         end else begin
             replay_event <= 1'b0;
 
-            // ---- store new Flit ----
+            // ---- store new Flit (pointer only; mem write moved out, see below) ----
             if (s_valid && s_ready) begin
-                mem[head_seq[ADDR_W-1:0]] <= s_data;
                 head_seq <= head_seq + 1'b1;
             end
 
@@ -133,6 +137,12 @@ module replay_buffer #(
             tail_seq <= tail_n;
             tx_seq   <= tx_n;
         end
+    end
+
+    // OPT-5: BRAM-inference-friendly write -- clocked only, no reset.
+    always @(posedge clk) begin
+        if (s_valid && s_ready)
+            mem[head_seq[ADDR_W-1:0]] <= s_data;
     end
 
     // synthesis translate_off
