@@ -75,7 +75,7 @@ module axi4s_ingest_port #(
     reg [OFFSET_WIDTH-1:0] session_offset;
 
     wire would_overflow = session_active && s_tvalid &&
-                           ((session_offset + beat_bytes) > session_limit);
+                           (({1'b0, session_offset} + beat_bytes) > {1'b0, session_limit});   // F1: compare one bit wider, no 2^OFFSET_WIDTH wrap
 
     // FIX: on overflow abort, send one zero-length TLAST marker (tkeep=0) down
     // the same path so the link layer closes the session in order (session_done
