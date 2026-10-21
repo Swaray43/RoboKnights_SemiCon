@@ -17,7 +17,7 @@ project_new semicon_bridge -overwrite
 set_global_assignment -name FAMILY $family
 set_global_assignment -name DEVICE $device
 set_global_assignment -name TOP_LEVEL_ENTITY bridge_top
-set_global_assignment -name SEARCH_PATH "$root/src-link_layer/hdl"
+set_global_assignment -name SEARCH_PATH "$root/src-link_layer/hdl;$root/shared"
 set_global_assignment -name VERILOG_INPUT_VERSION SYSTEMVERILOG_2005
 set_global_assignment -name SDC_FILE "$here/bridge_top.sdc"
 

@@ -32,6 +32,25 @@ Applied to the repo in this zip (already done; `plumbing_fixes.patch` is include
 Use the file list rather than adding whole folders. Stale and superseded files now live in
 `legacy/` folders, which redefine some modules; never add a `legacy/` folder to a build.
 
+## Phase 2 baseline (Step 2)
+
+**Vivado** (batch, from anywhere; ~1–3 h on an Alveo part, mostly CRC-64/FEC):
+
+    vivado -mode batch -source bridge_top/vivado_baseline.tcl -log baseline.log -journal baseline.jou
+    # optional: VIVADO_PART=xcu250-figd2104-2L-e  BASELINE_IMPL=0 (synth only)  BASELINE_SIM=0  BASELINE_JOBS=8
+
+It creates a fresh project, runs `tb_bridge_top` with the performance monitor in XSim (stops if it
+doesn't PASS), then out-of-context synthesis and place & route at 4 ns `clk` / 5.4 ns `aclk`.
+Results: `vivado_bridge/baseline/baseline_summary.txt` (LUT/FF/BRAM/DSP, WNS and Fmax per clock,
+worst path endpoints) plus full reports next to it (`*_util_hier.rpt` = area per module).
+Out of context because `bridge_top` has ~1,900 ports: it is an IP block, not a chip.
+
+**Simulation numbers only** (Icarus, ~10 s):
+
+    iverilog -g2012 -DSIMULATION -DPERF -s tb_bridge_top -o p.vvp -c bridge_top/bridge_top.f -c bridge_top/bridge_top_tb.f bridge_top/tb/perf_monitor.v && vvp p.vvp | grep -E "RESULT|PERF"
+
+`PERF` lines: bytes/clock per stage, beat latency (min/median/p99/max), FIFO peaks, replays.
+
 ## Testbenches (`bridge_top/tb/`)
 
 | Top | Checks | Plusargs |

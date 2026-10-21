@@ -6,6 +6,8 @@ VERILOG_FILES:
   - dir::../../interconnect_layer/src/rr_arbiter_2ch.v
   - dir::../../interconnect_layer/src/cdc_fifo_async.v
   - dir::../../interconnect_layer/src/interconnect_top.v
+VERILOG_INCLUDE_DIRS:
+  - dir::../../shared                             # axis_tuser_defs.vh (G7)
 CLOCK_PORT: [aclk, pcie_clk]
 CLOCK_PERIOD: 10            # ns. 100 MHz is a realistic first target in sky130; tighten after the first run.
 PNR_SDC_FILE: dir::interconnect.sdc

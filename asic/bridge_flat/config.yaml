@@ -58,6 +58,7 @@ VERILOG_FILES:
   - dir::../../src-link_layer/hdl/write_data_buffer.v
   - dir::../../bridge_top/rtl/bridge_top.v
 VERILOG_INCLUDE_DIRS:
+  - dir::../../shared                             # axis_tuser_defs.vh (G7)
   - dir::../../src-link_layer/hdl
 CLOCK_PORT: [clk, aclk]
 CLOCK_PERIOD: 10

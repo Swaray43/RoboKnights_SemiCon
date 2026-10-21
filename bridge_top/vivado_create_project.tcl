@@ -34,6 +34,18 @@ puts "Using part: $part"
 
 create_project -force semicon_bridge "$root/vivado_bridge" -part $part
 
+# +incdir+ lines in a .f file -> absolute include directories
+proc read_incdirs {root f} {
+    set out {}
+    set fh [open $f r]
+    foreach line [split [read $fh] "\n"] {
+        set line [string trim $line]
+        if {[string match "+incdir+*" $line]} { lappend out "$root/[string range $line 8 end]" }
+    }
+    close $fh
+    return $out
+}
+
 proc read_list {root f} {
     set out {}
     set fh [open $f r]
@@ -48,9 +60,10 @@ proc read_list {root f} {
 
 # ---- synthesis sources ----
 add_files -norecurse -fileset sources_1 [read_list $root "$here/bridge_top.f"]
-add_files -norecurse -fileset sources_1 "$root/src-link_layer/hdl/flit_defs.vh"
-set_property file_type {Verilog Header} [get_files flit_defs.vh]
-set_property include_dirs [list "$root/src-link_layer/hdl"] [get_filesets sources_1]
+set incdirs [read_incdirs $root "$here/bridge_top.f"]
+add_files -norecurse -fileset sources_1 [list "$root/src-link_layer/hdl/flit_defs.vh" "$root/shared/axis_tuser_defs.vh"]
+set_property file_type {Verilog Header} [get_files {flit_defs.vh axis_tuser_defs.vh}]
+set_property include_dirs $incdirs [get_filesets sources_1]
 set_property top bridge_top [get_filesets sources_1]
 
 # ---- constraints ----
@@ -58,7 +71,7 @@ add_files -norecurse -fileset constrs_1 "$here/bridge_top.xdc"
 
 # ---- simulation ----
 add_files -norecurse -fileset sim_1 [read_list $root "$here/bridge_top_tb.f"]
-set_property include_dirs [list "$root/src-link_layer/hdl"] [get_filesets sim_1]
+set_property include_dirs $incdirs [get_filesets sim_1]
 set_property verilog_define {SIMULATION} [get_filesets sim_1]
 set_property top tb_bridge_top [get_filesets sim_1]
 set_property -name {xsim.simulate.runtime} -value {all} -objects [get_filesets sim_1]

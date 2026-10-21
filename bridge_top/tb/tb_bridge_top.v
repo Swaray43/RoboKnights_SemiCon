@@ -254,4 +254,9 @@ module tb_bridge_top;
         if (err_addr_ovf)  $display("[%0t] err_addr_ovf pulse", $time);
     end
     initial begin #20_000_000; $display("GLOBAL TIMEOUT"); $display(" RESULT: FAIL"); $finish; end
+    // Phase 2 baseline counters: compile with +define+PERF (and bridge_top/tb/perf_monitor.v)
+`ifdef PERF
+    perf_monitor u_perf_monitor ();
+`endif
+
 endmodule

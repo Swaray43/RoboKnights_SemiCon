@@ -22,6 +22,7 @@ VERILOG_FILES:
   - dir::../../src-link_layer/hdl/tlp_packetizer.v
   - dir::../../src-link_layer/hdl/write_data_buffer.v
 VERILOG_INCLUDE_DIRS:
+  - dir::../../shared                             # axis_tuser_defs.vh (G7)
   - dir::../../src-link_layer/hdl                 # flit_defs.vh
 CLOCK_PORT: clk
 CLOCK_PERIOD: 10
