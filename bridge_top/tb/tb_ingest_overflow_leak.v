@@ -8,12 +8,18 @@ module tb_ingest_overflow_leak;
     .req(req0),.grant(g0),.ds_backpressure(1'b0),.out_tdata(od),.out_tkeep(ok),.out_tlast(ol),.out_session_offset(off),.accepted(acc));
   rr_arbiter_2ch #(.CREDIT_WIDTH(8),.STARVE_WIDTH(16),.STARVE_CYCLES(64)) a (.clk(clk),.rstn(rstn),.req0(req0),.req1(1'b0),
     .weight0(8'd1),.weight1(8'd1),.grant0(g0),.grant1(g1));
-  integer n=0, lim_hits=0;
-  always @(posedge clk) if (acc) begin n=n+1; $display("[%0t] #%0d %s offset %0d tkeep=%h tlast=%b%s", $time, n, (v&&rdy)?"DATA beat handshaked at":"marker (no data) at", off, ok, ol, ((v&&rdy) && off+64>200)?"  <-- DATA BEYOND LIMIT":""); end
+  integer n=0, lim_hits=0, ndata=0;
+  always @(posedge clk) if (acc) begin n=n+1;
+    if ((v&&rdy) && off+64>200) lim_hits=lim_hits+1;
+    if (v&&rdy) ndata=ndata+1; $display("[%0t] #%0d %s offset %0d tkeep=%h tlast=%b%s", $time, n, (v&&rdy)?"DATA beat handshaked at":"marker (no data) at", off, ok, ol, ((v&&rdy) && off+64>200)?"  <-- DATA BEYOND LIMIT":""); end
   initial begin
     repeat(3) @(posedge clk); rstn=1; @(negedge clk); start=1; @(negedge clk); start=0;
     v=1;                               // continuous valid, 64 B beats, limit 200 B -> only 3 beats fit
     repeat(20) @(posedge clk);
-    $display("accepted=%0d (3 fit in 200 B), overflow=%b", n, ovf); $finish;
+    $display("accepted=%0d (3 fit in 200 B), overflow=%b", n, ovf);
+    // pass: exactly the 3 beats that fit, none beyond the limit, overflow flagged
+    if (ndata == 3 && lim_hits == 0 && ovf === 1'b1) $display("RESULT: PASS");
+    else $display("RESULT: FAIL (data beats %0d, beyond limit %0d, overflow %b)", ndata, lim_hits, ovf);
+    $finish;
   end
 endmodule
