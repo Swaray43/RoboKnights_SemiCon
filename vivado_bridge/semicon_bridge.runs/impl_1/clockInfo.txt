@@ -1,0 +1,68 @@
+-------------------------------------
+| Tool Version : Vivado v.2026.1
+| Date         : Wed Oct 21 05:10:26 2026
+| Host         : LAPTOP-N3AM2GTH
+| Design       : checkpoint_bridge_top
+| Device       : xcu250-figd2104-2L-E-
+-------------------------------------
+
+For more information on clockInfo.txt clock routing debug file see https://support.xilinx.com/s/article/000035660?language=en_US
+
+***********************
+Running Pre-CRP Checker
+***********************
+Number of global clocks: 1
+	Number of BUFGCE: 1
+	Number of BUFGCE_HDIO: 0
+	Number of BUFG_CTRL: 0
+	Number of BUFGCE_DIV: 0
+	Number of BUFG_GT: 0
+	Number of BUFG_PS: 0
+	Number of BUFG_FABRIC: 0
+**************************************
+Clock Nets/Source Overview (CRP Input)
+**************************************
+Clock 1: u_lpb/u_link_layer_top/u_stream_tx_path_top/u_data_link_layer_top/u_link_layer_rx/raw_r[0]_bufg_place
+	Clock source type: BUFGCE
+	Clock source region: X4Y11
+	Clock regions with locked loads: X4Y10 X4Y11 X5Y10 
+	initial rect X4Y10:X5Y11
+
+
+
+*****************************
+Clocks With User Constraints:
+*****************************
+No clocks with user constraints found
+
+
+
+***********************
+Running Pre-CRP Checker
+***********************
+Number of global clocks: 1
+	Number of BUFGCE: 1
+	Number of BUFGCE_HDIO: 0
+	Number of BUFG_CTRL: 0
+	Number of BUFGCE_DIV: 0
+	Number of BUFG_GT: 0
+	Number of BUFG_PS: 0
+	Number of BUFG_FABRIC: 0
+**************************************
+Clock Nets/Source Overview (CRP Input)
+**************************************
+Clock 1: u_lpb/u_link_layer_top/u_stream_tx_path_top/u_data_link_layer_top/u_link_layer_rx/raw_r[0]
+	Clock source type: BUFGCE
+	Clock source region: X4Y11
+	Clock regions with locked loads: X4Y10 X4Y11 X5Y10 
+	initial rect X4Y10:X5Y11
+
+
+
+*****************************
+Clocks With User Constraints:
+*****************************
+No clocks with user constraints found
+
+
+
