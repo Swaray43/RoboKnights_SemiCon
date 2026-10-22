@@ -18,6 +18,12 @@
 //     queue slot is already full is still dropped (unavoidable with one
 //     slot and no upstream back-pressure port) and flagged in
 //     simulation.
+// S13: an inbound MWr that hits the function's own BAR0 (a host write to a
+// bridge register, G1) is claimed by BAR0, not by the DMA window. It used
+// to be counted as a translation miss and pulse translation_err, so every
+// host register write showed up as a false error in XLAT_MISS. Requests
+// inside the exclusion window (excl_en, excl_base/excl_mask = BAR0) are now
+// ignored here: no AXI write, no error, no count.
 // ============================================================
 module pcie_address_translator #(
     parameter PCIE_ADDR_WIDTH = 64,
@@ -29,6 +35,11 @@ module pcie_address_translator #(
     input  wire [PCIE_ADDR_WIDTH-1:0] trans_window_base,
     input  wire [PCIE_ADDR_WIDTH-1:0] trans_window_mask,
     input  wire [AXI_ADDR_WIDTH-1:0]  trans_axi_base,
+
+    // S13: addresses claimed elsewhere (BAR0): not translated, not a miss
+    input  wire                       excl_en,
+    input  wire [PCIE_ADDR_WIDTH-1:0] excl_base,
+    input  wire [PCIE_ADDR_WIDTH-1:0] excl_mask,
 
     input  wire                       req_valid,
     input  wire [PCIE_ADDR_WIDTH-1:0] req_pcie_addr,
@@ -55,6 +66,7 @@ module pcie_address_translator #(
     wire [PCIE_ADDR_WIDTH-1:0] proc_addr  = pend_valid ? pend_addr : req_pcie_addr;
     wire [PCIE_ADDR_WIDTH-1:0] proc_masked= proc_addr & trans_window_mask;
     wire                       proc_hit   = (proc_masked == trans_window_base);
+    wire                       proc_excl  = excl_en && ((proc_addr & excl_mask) == excl_base);   // S13
     wire [AXI_ADDR_WIDTH-1:0]  proc_offset= proc_addr[AXI_ADDR_WIDTH-1:0] &
                                             ~trans_window_mask[AXI_ADDR_WIDTH-1:0];
 
@@ -84,6 +96,9 @@ module pcie_address_translator #(
                 if (proc_hit) begin
                     axi_addr_valid  <= 1'b1;
                     axi_addr        <= trans_axi_base + proc_offset;
+                    translation_err <= 1'b0;
+                end else if (proc_excl) begin   // S13: BAR0 hit, handled by the BAR0 path
+                    axi_addr_valid  <= 1'b0;
                     translation_err <= 1'b0;
                 end else begin
                     axi_addr_valid  <= 1'b0;

@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 module lane_reversal_latch (
 input  wire clk,
 input  wire rst_n,

@@ -65,6 +65,7 @@ module tb_link_layer_top;
         .cfg_base_addr_data(cfg_data), .cfg_base_addr_clr(1'b0),
  
         .cfg_window_base(WIN_BASE), .cfg_window_mask(WIN_MASK), .cfg_axi_base(AXI_BASE),
+        .cfg_excl_en(1'b0), .cfg_excl_base(64'h0), .cfg_excl_mask(64'h0),
  
         .msix_req_valid(1'b0), .msix_req_addr(64'd0), .msix_req_data(32'd0),
         .msix_req_ready(), .session_done(),

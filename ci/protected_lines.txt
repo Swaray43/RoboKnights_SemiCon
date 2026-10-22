@@ -77,3 +77,7 @@ K6     | protocol_PHY_layer/rtl/pcie_reset_controller.v | require | if (LINKDOWN
 
 # ---- S7: a DLLP Flit wins the TX slot; the payload must not be consumed in the same cycle ----
 S7     | src-link_layer/hdl/link_layer_tx.v         | require | assign s_ready = (state == ST_IDLE) && !dllp_req;
+
+# ---- S13: an inbound MWr that hits BAR0 is not an address-translation miss ----
+S13    | src-link_layer/hdl/pcie_address_translator.v | require | wire                       proc_excl  = excl_en && ((proc_addr & excl_mask) == excl_base);
+S13    | src-link_layer/hdl/link_phy_bridge_top.v   | require | .cfg_excl_en        (ib_bar0_assigned),

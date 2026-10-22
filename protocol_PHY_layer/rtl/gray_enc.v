@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 // -----------------------------------------------------------------------------
 // gray_enc - 2-bit binary -> Gray encoder (PAM4 symbol coding)
 // Mapping convention (locked spec): a=00,01,10,11 -> g=00,01,11,10

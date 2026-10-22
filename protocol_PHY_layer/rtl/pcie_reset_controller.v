@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 // -----------------------------------------------------------------------------
 // Reset controller
 // Real inputs: perst_n (async, from connector), link_trained (from

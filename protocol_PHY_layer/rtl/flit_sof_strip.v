@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 // -----------------------------------------------------------------------------
 // FLIT-mode SOF token strip (PCIe 6.0 uses FLIT mode, not 128b/130b - see
 // design notes). SOF = 0xFB on all 4 lanes simultaneously, one full cycle,

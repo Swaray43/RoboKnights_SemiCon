@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 // =============================================================================
 // pcie_phy_tx - synthesizable TX datapath of the Protocol-to-PHY layer
 // (fixes P1, P2 TX half, P3 / Seam C)

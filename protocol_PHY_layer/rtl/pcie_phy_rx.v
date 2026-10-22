@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 // =============================================================================
 // pcie_phy_rx - synthesizable RX datapath of the Protocol-to-PHY layer
 // (fixes P1 RX half and P2 RX half)

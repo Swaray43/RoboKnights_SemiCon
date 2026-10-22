@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 //=============================================================================
 // rr_arbiter_2ch.v
 // Weighted round-robin arbiter, 2 channels, with starvation guard.

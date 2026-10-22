@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 module tx_elastic_deskew #(
 parameter DEPTH = 8,
 parameter THRESHOLD = 4,

@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 // ------------------------------------------------------------------
 // axi_mrd_generator: AXI4 Master read-address-channel FSM.
 // Consumes AR*, allocates a tag, forms an MRd TLP header, and

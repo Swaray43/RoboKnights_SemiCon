@@ -73,6 +73,10 @@ module link_layer_top #(
     input  wire [ADDR_W-1:0]     cfg_window_base,
     input  wire [ADDR_W-1:0]     cfg_window_mask,
     input  wire [AXI_ADDR_W-1:0] cfg_axi_base,
+    // S13: BAR0 window (inbound MWrs here are register writes, not misses)
+    input  wire                  cfg_excl_en,
+    input  wire [ADDR_W-1:0]     cfg_excl_base,
+    input  wire [ADDR_W-1:0]     cfg_excl_mask,
 
     // ---- MSI-X MWr injection ----
     input  wire                    msix_req_valid,
@@ -442,6 +446,9 @@ module link_layer_top #(
         .cfg_window_base   (cfg_window_base),
         .cfg_window_mask   (cfg_window_mask),
         .cfg_axi_base      (cfg_axi_base),
+        .cfg_excl_en       (cfg_excl_en),          // S13
+        .cfg_excl_base     (cfg_excl_base),
+        .cfg_excl_mask     (cfg_excl_mask),
 
         .cfg_req_valid     (),
         .cfg_req_type1     (),

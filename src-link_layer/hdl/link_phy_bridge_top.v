@@ -311,6 +311,10 @@ module link_phy_bridge_top #(
     wire [63:0]                             ll_cfg_base_addr_data = serve1 ? pt_base_ch1 : pt_base_ch0;
  
     // ================================================================
+    // G1/S13: BAR0 window (declared before use)
+    localparam BAR0_AW = 16;                       // 64 KB BAR0 (pcie_config_space BAR0_SIZE)
+    wire ib_bar0_assigned = (pt_bar0_base[31:BAR0_AW] != {(32-BAR0_AW){1'b0}});
+
     // 3. link_layer_top -- Swaray's layer: TX stream chain + Flit DLL +
     //    the new RX decode (unpacker -> tlp_header_parser -> pcie_rx_engine)
     // ================================================================
@@ -345,6 +349,9 @@ module link_phy_bridge_top #(
         .cfg_window_base    (WINDOW_BASE),
         .cfg_window_mask    (WINDOW_MASK),
         .cfg_axi_base       (AXI_BASE_DEFAULT),
+        .cfg_excl_en        (ib_bar0_assigned),                              // S13: BAR0 hits
+        .cfg_excl_base      ({32'h0, pt_bar0_base[31:BAR0_AW], {BAR0_AW{1'b0}}}),   //   are not
+        .cfg_excl_mask      ({{(64-BAR0_AW){1'b1}}, {BAR0_AW{1'b0}}}),                           //      xlat misses
  
         .msix_req_valid     (pt_mwr_valid),
         .msix_req_addr      (pt_mwr_addr),
@@ -405,9 +412,8 @@ module link_phy_bridge_top #(
     // ================================================================
     // 4. G1: inbound MWr -> BAR0 write port (see header note)
     // ================================================================
-    localparam BAR0_AW = 16;                       // 64 KB BAR0 (pcie_config_space BAR0_SIZE)
+    // (BAR0_AW / ib_bar0_assigned are declared above u_link_layer_top: S13 uses them)
 
-    wire ib_bar0_assigned = (pt_bar0_base[31:BAR0_AW] != {(32-BAR0_AW){1'b0}});
     wire ib_bar0_hit      = ll_inb_mwr_valid && ib_bar0_assigned &&
                             (ll_inb_mwr_addr[63:BAR0_AW] == {32'h0, pt_bar0_base[31:BAR0_AW]});
     wire ib_wr_req        = ib_bar0_hit && (ll_inb_mwr_be == 4'hF);
