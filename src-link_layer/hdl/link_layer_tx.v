@@ -254,7 +254,7 @@ module link_layer_tx #(
     wire have_ackn = ack_req || nak_req;
 
     // Accept a payload Flit only when idle
-    assign s_ready = (state == ST_IDLE);
+    assign s_ready = (state == ST_IDLE) && !dllp_req;   // a DLLP Flit wins the slot: do not also consume the payload
 
     // DLP for whatever is loaded this cycle
     function [FL_DLP_W-1:0] make_dlp;
