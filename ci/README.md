@@ -12,7 +12,7 @@ Every push and pull request runs `.github/workflows/regression.yml` on GitHub:
 | sim / bridge | `tb_bridge_top`, `tb_bridge_ovf`, `tb_ingest_overflow_leak` | <1 min |
 | sim / errors | `tb_stream_path` with bit-error injection and random backpressure | ~2 min |
 | sim / asic | same benches with the smaller ASIC buffer sizes | ~2 min |
-| sim / rand | `tb_bridge_rand`, 4 seeds: 2 clean, 2 with PAM4 noise (one bursty) | ~3 min |
+| sim / rand | `tb_bridge_rand` (F1-F7: random traffic, 4 KB splits, weights, PAM4 noise, overflow, lane reversal, hot reset), 4 seeds: 2 clean, 2 noisy | ~4 min |
 | sim / rand sweep | nightly: 40 more seeds | ~15 min |
 | long | `tb_bridge_top` 6 sessions x 50 beats (pull requests + nightly) | ~2 min |
 | formal | every `.sby` proof (OSS CAD Suite) | varies |

@@ -18,15 +18,28 @@
 //       clock, once traffic starts; +BURST=k makes each hit k symbols long.
 //       FEC must correct single errors, CRC + replay must recover the rest:
 //       every TLP must still arrive exactly once, in order, bit-exact.
-//   (F5..F9 -- overflow, lane reversal, resets, MSI-X masking, host-driven
-//    BAR0 -- come in later commits)
+//   F5  session-limit overflow at a random point (+OVF_PCT, default 20% of
+//       sessions): the limit is set below one channel's session size; the
+//       fabric gives up when session_overflow rises. No beat may be accepted
+//       past the limit, everything accepted must still arrive, and the
+//       session must still end with its MSI-X.
+//   F6  lane reversal (+REVERSE=0/1, default random 25%): the loopback swaps
+//       lanes 0<->3, 1<->2; training must detect it and data must still flow.
+//   F7  hot reset in the middle of a session (+HOTRESET_PCT, default 10% of
+//       sessions): in-flight data is lost by design, but the link must
+//       retrain, the host re-configures, nothing stale arrives afterwards and
+//       every later session must be clean.
+//   (F8 MSI-X masking, F9 host-driven BAR0 -- later commits)
+//   Not modelled in the RTL, so not tested: link down without hot reset
+//   (pcie_ltssm has no Recovery state; L0 is left only via reset).
 //
 // Reference model, per accepted beat at address A with N bytes:
 //   one MWr of N bytes, or -- if [A, A+N) crosses a 4 KB boundary -- two MWrs:
 //   (4096 - A%4096) bytes at A, then the rest at the boundary.
 //
 // plusargs: +SEED=n (default 1)  +SESS_MAX=n (6)  +BEATS_MAX=n (40)
-//           +GAP_MAX=pct (60)  +NOISE_PPM=n (0)  +BURST=k (1)  +VERBOSE=1
+//           +GAP_MAX=pct (60)  +NOISE_PPM=n (0)  +BURST=k (1)  +OVF_PCT=p (20)
+//           +REVERSE=0/1 (random)  +HOTRESET_PCT=p (10)  +VERBOSE=1
 // Ends with RESULT: PASS / RESULT: FAIL and prints the seed to replay it.
 // ============================================================
 module tb_bridge_rand;
@@ -36,7 +49,8 @@ module tb_bridge_rand;
     always #2   clk  = ~clk;     // 250 MHz
     always #2.7 aclk = ~aclk;    // ~185 MHz, unrelated
 
-    integer SEED, SEED0, SESS_MAX, BEATS_MAX, GAP_MAX, VERBOSE, NOISE_PPM, BURST;
+    integer SEED, SEED0, SESS_MAX, BEATS_MAX, GAP_MAX, VERBOSE, NOISE_PPM, BURST, OVF_PCT, REVERSE, HOTRESET_PCT;
+    reg hot_reset_request = 0;
 
     reg  [DATA_W-1:0] s0_tdata = 0, s1_tdata = 0;
     reg  [KEEP_W-1:0] s0_tkeep = 0, s1_tkeep = 0;
@@ -65,7 +79,7 @@ module tb_bridge_rand;
         .m_rx_axis_tlast(rx_tlast), .m_rx_axis_tready(1'b1),
         .ts_byte_valid(1'b0), .ts_byte_l0(8'd0), .ts_byte_l1(8'd0), .ts_byte_l2(8'd0), .ts_byte_l3(8'd0),
         .link_trained(link_trained),
-        .hot_reset_request(1'b0), .flr_request(1'b0), .updatefc_received(updatefc_received),
+        .hot_reset_request(hot_reset_request), .flr_request(1'b0), .updatefc_received(updatefc_received),
         .datapath_rst_n(datapath_rst_n), .axi_rst_n(axi_rst_n),
         .cfg_wr_en(cfg_wr_en), .cfg_rd_en(1'b0), .cfg_addr(cfg_addr), .cfg_wdata(cfg_wdata),
         .cfg_rdata(), .cfg_cpl_valid(),
@@ -81,6 +95,7 @@ module tb_bridge_rand;
     // ---------------- F4: PAM4 channel noise ----------------
     // Each lane carries a signed 3-bit level (-3,-1,+1,+3). A hit moves it to
     // an adjacent level, i.e. one Gray bit flips -- the common real-world error.
+    reg         lane_rev = 0;        // F6
     reg  [3:0]  noise_hit = 0;       // per lane, decided at negedge (race-free)
     reg  [3:0]  noise_dir = 0;
     integer     burst_left [0:3];
@@ -98,7 +113,9 @@ module tb_bridge_rand;
     wire [11:0] rx_lvl;
     genvar gl;
     generate for (gl = 0; gl < 4; gl = gl + 1) begin : g_noise
-        assign rx_lvl[gl*3 +: 3] = noise_hit[gl] ? adj_level(lvl[gl*3 +: 3], noise_dir[gl]) : lvl[gl*3 +: 3];
+        // F6: with lane_rev the receiver's lane gl is the transmitter's lane 3-gl
+        wire [2:0] tx_l = lane_rev ? lvl[(3-gl)*3 +: 3] : lvl[gl*3 +: 3];
+        assign rx_lvl[gl*3 +: 3] = noise_hit[gl] ? adj_level(tx_l, noise_dir[gl]) : tx_l;
     end endgenerate
     initial for (nl = 0; nl < 4; nl = nl + 1) burst_left[nl] = 0;
     always @(negedge clk) begin
@@ -180,7 +197,12 @@ module tb_bridge_rand;
     // ---------------- RX checker (same matching as tb_bridge_top) ----------------
     reg  [31:0] got [0:63];
     integer got_n = 0, ok = 0, bad = 0, extra = 0, k;
-    always @(posedge clk) if (rx_tvalid) begin
+    reg rx_ignore = 0;               // F7: between a hot reset and the end of re-configuration
+    integer n_ignored = 0;
+    always @(posedge clk) if (rx_tvalid && rx_ignore) begin
+        if (rx_tlast) n_ignored = n_ignored + 1;
+        got_n = 0;
+    end else if (rx_tvalid) begin
         for (k = 0; k < 16; k = k + 1)
             if (rx_tkeep[k*4]) begin got[got_n] = rx_tdata[k*32 +: 32]; got_n = got_n + 1; end
         if (rx_tlast) begin : chk
@@ -235,11 +257,14 @@ module tb_bridge_rand;
     endfunction
 
     // one channel's session on aclk: random beat count, last-beat size, gaps (F1)
+    integer leaked = 0, n_ovf = 0, n_hotreset = 0;
+    reg     abort_all = 0;            // F7: hot reset -> fabric stops driving
+    integer limit_now = 24'hFF_FFFF;  // F5: current session byte limit
     task automatic run_channel(input integer ch, input integer s, input integer nbeats,
                                input integer last_dw, input integer gap);
-        integer b, nbytes, first, ndw; reg [63:0] off, a; reg [63:0] kp; reg [511:0] dat; begin
-            off = 0;
-            for (b = 0; b < nbeats; b = b + 1) begin
+        integer b, nbytes, first, ndw; reg [63:0] off, a; reg [63:0] kp; reg [511:0] dat; reg stop; begin
+            off = 0; stop = 0;
+            for (b = 0; b < nbeats && !stop && !abort_all; b = b + 1) begin
                 kp  = (b == nbeats - 1) ? ({64{1'b1}} >> (64 - 4*last_dw)) : {64{1'b1}};
                 dat = beat_data(ch, s, b);
                 while (urand(0, 99) < gap) @(posedge aclk);
@@ -247,8 +272,21 @@ module tb_bridge_rand;
                 if (ch == 0) begin s0_tdata = dat; s0_tkeep = kp; s0_tlast = (b == nbeats-1); s0_tvalid = 1; end
                 else         begin s1_tdata = dat; s1_tkeep = kp; s1_tlast = (b == nbeats-1); s1_tvalid = 1; end
                 @(posedge aclk);
-                while (!(ch == 0 ? s0_tready : s1_tready)) @(posedge aclk);
+                // F5/F7: the fabric gives up on an overflowed or reset session
+                while (!(ch == 0 ? s0_tready : s1_tready) && !stop && !abort_all) begin
+                    if (session_overflow[ch]) stop = 1;
+                    else @(posedge aclk);
+                end
+                if (stop || abort_all) begin
+                    @(negedge aclk);
+                    if (ch == 0) s0_tvalid = 0; else s1_tvalid = 0;
+                    if (stop) begin
+                        n_ovf = n_ovf + 1;
+                        if (VERBOSE) $display("[%0t] ch%0d sess %0d: overflow after %0d B (limit %0d)", $time, ch, s, off, limit_now);
+                    end
+                end else begin
                 nbytes = (b == nbeats - 1) ? 4*last_dw : 64;
+                if (off + nbytes > limit_now) leaked = leaked + 1;   // F5: accepted past the limit: must never happen
                 a = base[ch] + off;
                 // F2: 4 KB boundary inside this beat -> the splitter emits two MWrs
                 if ((a % 4096) + nbytes > 4096) begin
@@ -262,6 +300,7 @@ module tb_bridge_rand;
                 n_beats = n_beats + 1;
                 @(negedge aclk);
                 if (ch == 0) s0_tvalid = 0; else s1_tvalid = 0;
+                end
             end
             if (VERBOSE) $display("[%0t] ch%0d sess %0d: %0d beats, last %0d DW, gap %0d%%, base %h",
                                   $time, ch, s, nbeats, last_dw, gap, base[ch]);
@@ -269,7 +308,23 @@ module tb_bridge_rand;
     endtask
 
     // ---------------- main ----------------
-    integer s, t0, cyc, nsess, w0, w1, arm, nb0, nb1, ld0, ld1, g0, g1, i;
+    integer s, t0, cyc, nsess, w0, w1, arm, nb0, nb1, ld0, ld1, g0, g1, i, hr, hr_at;
+
+    // host bring-up (power-on, and again after a hot reset): wait for link,
+    // first FC, then what a driver does: Memory Space + Bus Master, MSI-X on,
+    // MSI-X table entries, vectors
+    task host_bringup; begin
+        wait (link_trained === 1'b1);
+        repeat (3) @(negedge clk); updatefc_received = 1; @(negedge clk); updatefc_received = 0;
+        wait (axi_rst_n === 1'b1);
+        cfg_write(12'h004, 32'h0000_0006);
+        cfg_write(12'h050, 32'h8000_0000);
+        repeat (20) @(negedge clk);
+        msix_entry(2, msix_addr_of(0), msix_data_of(0));
+        msix_entry(6, msix_addr_of(1), msix_data_of(1));
+        bar0_write(16'h0010, 32'h0000_0602);       // MSI-X vector ch0=2 ch1=6
+        bar0_write(16'h000C, 32'h00FF_FFFF);
+    end endtask
     initial begin
         if (!$value$plusargs("SEED=%d", SEED)) SEED = 1;
         SEED0 = SEED;
@@ -279,28 +334,24 @@ module tb_bridge_rand;
         if (!$value$plusargs("VERBOSE=%d", VERBOSE)) VERBOSE = 0;
         if (!$value$plusargs("NOISE_PPM=%d", NOISE_PPM)) NOISE_PPM = 0;
         if (!$value$plusargs("BURST=%d", BURST)) BURST = 1;
+        if (!$value$plusargs("OVF_PCT=%d", OVF_PCT)) OVF_PCT = 20;
+        if (!$value$plusargs("HOTRESET_PCT=%d", HOTRESET_PCT)) HOTRESET_PCT = 10;
+        if (!$value$plusargs("REVERSE=%d", REVERSE)) REVERSE = -1;
         // decorrelate neighbouring seeds ($random's first draws track the seed)
         SEED = SEED * 1103515245 + 12345;
         for (i = 0; i < 8; i = i + 1) t0 = $random(SEED);
+        lane_rev = (REVERSE < 0) ? (urand(0, 3) == 0) : (REVERSE != 0);   // F6, fixed before training
         exp_wr[0] = 0; exp_wr[1] = 0; exp_rd[0] = 0; exp_rd[1] = 0;
         msix_cnt[0] = 0; msix_cnt[1] = 0; cur_sess[0] = -1; cur_sess[1] = -1;
         for (i = 1; i <= 16; i = i + 1) n_last_sz[i] = 0;
         for (i = 1; i <= 7; i = i + 1) w_used[i] = 0;
-        $display("tb_bridge_rand: SEED=%0d SESS_MAX=%0d BEATS_MAX=%0d GAP_MAX=%0d NOISE_PPM=%0d BURST=%0d",
-                 SEED0, SESS_MAX, BEATS_MAX, GAP_MAX, NOISE_PPM, BURST);
+        $display("tb_bridge_rand: SEED=%0d SESS_MAX=%0d BEATS_MAX=%0d GAP_MAX=%0d NOISE_PPM=%0d BURST=%0d OVF_PCT=%0d HOTRESET_PCT=%0d lanes %s",
+                 SEED0, SESS_MAX, BEATS_MAX, GAP_MAX, NOISE_PPM, BURST, OVF_PCT, HOTRESET_PCT, lane_rev ? "REVERSED" : "straight");
 
         repeat (5) @(negedge clk); perst_n = 1;
-        wait (link_trained === 1'b1);
-        repeat (3) @(negedge clk); updatefc_received = 1; @(negedge clk); updatefc_received = 0;
-        wait (axi_rst_n === 1'b1);
-        cfg_write(12'h004, 32'h0000_0006);
-        cfg_write(12'h050, 32'h8000_0000);
-        repeat (20) @(negedge clk);
-
-        msix_entry(2, msix_addr_of(0), msix_data_of(0));
-        msix_entry(6, msix_addr_of(1), msix_data_of(1));
-        bar0_write(16'h0010, 32'h0000_0602);       // MSI-X vector ch0=2 ch1=6
-        bar0_write(16'h000C, 32'h00FF_FFFF);       // limit: never reached here (overflow is F5)
+        host_bringup;
+        if (lane_rev && dut.u_lpb.lane_reversed_locked !== 1'b1)
+            $display("[%0t] FAIL: lanes are reversed but lane_reversed_locked=%b", $time, dut.u_lpb.lane_reversed_locked);
 
         noise_on = (NOISE_PPM > 0);          // F4: noise from here on (link is up, config done)
         nsess = urand(1, SESS_MAX);
@@ -318,6 +369,12 @@ module tb_bridge_rand;
             if (arm[1]) n_last_sz[ld1] = n_last_sz[ld1] + 1;
             n_sessions = n_sessions + 1;
 
+            // F5: sometimes set the limit below one channel's session size
+            if (urand(0, 99) < OVF_PCT) begin
+                limit_now = 64 * urand(1, (nb0 > nb1 ? nb0 : nb1)) - urand(0, 63);
+                if (limit_now < 1) limit_now = 1;
+            end else limit_now = 24'hFF_FFFF;
+            bar0_write(16'h000C, limit_now);
             bar0_write(16'h0008, {16'h0, w1[7:0], w0[7:0]});
             if (arm[0]) begin
                 base[0] = rand_base(0); cur_sess[0] = cur_sess[0] + 1;
@@ -332,10 +389,28 @@ module tb_bridge_rand;
             t0 = 0; while ((session_active & arm[1:0]) !== arm[1:0] && t0 < 2000) begin @(posedge aclk); t0 = t0 + 1; end
             if ((session_active & arm[1:0]) !== arm[1:0])
                 $display("[%0t] FAIL: session %0d never became active (arm=%b active=%b)", $time, s, arm[1:0], session_active);
+            hr = (urand(0, 99) < HOTRESET_PCT);
+            hr_at = urand(20, 3000);
             fork
                 if (arm[0]) run_channel(0, cur_sess[0], nb0, ld0, g0);
                 if (arm[1]) run_channel(1, cur_sess[1], nb1, ld1, g1);
+                if (hr) begin   // F7: hot reset at a random point of the session
+                    repeat (hr_at) @(posedge clk);
+                    rx_ignore = 1; abort_all = 1; n_hotreset = n_hotreset + 1;
+                    if (VERBOSE) $display("[%0t] F7: hot reset in session %0d", $time, s);
+                    @(negedge clk); hot_reset_request = 1; @(negedge clk); hot_reset_request = 0;
+                end
             join
+            if (abort_all) begin
+                // F7 recovery: everything in flight is gone; the host re-trains and re-configures
+                wait (link_trained === 1'b0);                     // link really went down
+                host_bringup;
+                exp_rd[0] = exp_wr[0]; exp_rd[1] = exp_wr[1];     // in-flight data was lost by design
+                msix_cnt[0] = cur_sess[0] + 1; msix_cnt[1] = cur_sess[1] + 1;
+                msix_expected = msix_seen;
+                repeat (200) @(posedge clk);
+                rx_ignore = 0; abort_all = 0;
+            end
             t0 = 0; while (session_active !== 2'b00 && t0 < 4000) begin @(posedge aclk); t0 = t0 + 1; end
             // host polls BAR0 STATUS until both channels report idle before re-arming
             // No short cap here: under heavy channel noise a session can take
@@ -359,9 +434,11 @@ module tb_bridge_rand;
                  msix_seen, msix_expected, msix_bad, msix_early);
         $display(" channel: %0d symbol errors injected -> FEC corrected %0d, uncorrectable %0d, CRC fails %0d, replays %0d",
                  n_noise, n_fec_fix, n_fec_bad, n_crc, n_replay);
+        $display(" F5 overflow aborts: %0d (beats accepted past the limit: %0d)   F6 lanes %s   F7 hot resets: %0d (%0d TLPs dropped in reset windows)",
+                 n_ovf, leaked, lane_rev ? "reversed" : "straight", n_hotreset, n_ignored);
         $display(" errors now: framing=%b lane=%b overflow=%b", phy_framing_err, phy_lane_err, session_overflow);
         if (bad == 0 && extra == 0 && exp_rd[0] == exp_wr[0] && exp_rd[1] == exp_wr[1]
-            && msix_seen == msix_expected && msix_bad == 0 && msix_early == 0)
+            && msix_seen == msix_expected && msix_bad == 0 && msix_early == 0 && leaked == 0)
             $display(" RESULT: PASS (seed %0d)", SEED0);
         else
             $display(" RESULT: FAIL (seed %0d -- replay with +SEED=%0d)", SEED0, SEED0);
