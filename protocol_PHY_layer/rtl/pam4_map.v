@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 // -----------------------------------------------------------------------------
 // PAM4 mapper / de-mapper
 // Locked mapping: g=00,01,11,10 -> level=-3,-1,+1,+3 (monotonic, Gray-adjacent)

@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 // -----------------------------------------------------------------------------
 // ts_os_gen - byte k of a TS1 or TS2 ordered set for each of the 4 TX lanes.
 // (Replaces ts1_os_gen; adds TS2 for the Configuration state of pcie_ltssm.)

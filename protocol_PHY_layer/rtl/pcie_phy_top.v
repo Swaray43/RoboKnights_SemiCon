@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 // =============================================================================
 // pcie_phy_top - Protocol-to-PHY layer top (Kshitij's layer), synthesizable.
 // Replaces pcie_link_top (fixes P1, P2, P3, P4, I3 and the PHY side of Seam D).

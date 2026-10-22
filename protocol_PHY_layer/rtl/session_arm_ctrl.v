@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 // ------------------------------------------------------------------
 // Session-arm handshake: host writes base_addr + (optional TC), then
 // pulses session_arm (W1S). FSM latches into shadow regs one cycle

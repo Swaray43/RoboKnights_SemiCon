@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 //=============================================================================
 // axi4s_ingest_port.v
 // One AXI4-Stream ingest port for the interconnect layer (instantiated once

@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 // =============================================================================
 // pcie_ltssm - simplified PCIe Link Training and Status State Machine
 //

@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 // =============================================================================
 // rx_lane_deskew - RX lane-to-lane deskew using the TS1 COM symbol (#1)
 //

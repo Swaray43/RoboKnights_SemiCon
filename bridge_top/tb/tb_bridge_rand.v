@@ -671,12 +671,12 @@ module tb_bridge_rand;
             bar0_read(rg * 4, rv);
             // In loopback every DMA write and MSI-X comes back inbound and misses
             // the RX translation window, so each must be counted (saturating at
-            // 255). A looped-back BAR0 write is claimed by BAR0 and should not be
-            // a miss; today it is counted too (ticket S13), so both are accepted.
+            // 255). A looped-back BAR0 write is claimed by BAR0 and is not a
+            // miss (S13).
             if (rg == 7) begin
                 if (rv == ((xl_n > 255) ? 255 : xl_n)) ;
-                else if (rv == ((xl_n + xl_b0 > 255) ? 255 : xl_n + xl_b0)) n_s13 = n_s13 + 1;
                 else begin
+                    if (rv == ((xl_n + xl_b0 > 255) ? 255 : xl_n + xl_b0)) n_s13 = n_s13 + 1;
                     reg_err = reg_err + 1;
                     $display("[%0t] FAIL: XLAT_MISS=%0d, expected %0d inbound misses (+%0d BAR0 writes)", $time, rv, xl_n, xl_b0);
                 end
@@ -709,7 +709,7 @@ module tb_bridge_rand;
         $display(" F7b link drops: %0d cable pulls, %0d glitches (%0d dropped the link); L0 exits: loss %0d framing %0d TS1 %0d; unexplained drops %0d",
                  n_cut, n_glitch, n_glitch_drop, n_exit[1], n_exit[2], n_exit[3], drop_err);
         $display(" errors now: framing=%b lane=%b overflow=%b   register check errors: %0d", phy_framing_err, phy_lane_err, session_overflow, reg_err);
-        if (n_s13) $display(" NOTE S13: XLAT_MISS also counted %0d inbound BAR0 write(s) as translation misses", xl_b0);
+        if (n_s13) $display(" S13 REGRESSION: XLAT_MISS also counted %0d inbound BAR0 write(s) as translation misses", xl_b0);
         // Step 3 C: one machine-readable line, merged over seeds by ci/coverage_report.py
         $write("COV: seed=%0d noise=%0d", SEED0, NOISE_PPM > 0);
         for (rg = 0; rg < 12; rg = rg + 1) begin rb8 = rg * 4; $write(" wr_%h=%0d rd_%h=%0d", rb8, cv_wr[rg], rb8, cv_rd[rg]); end
