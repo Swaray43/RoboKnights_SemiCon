@@ -29,7 +29,16 @@
 //       sessions): in-flight data is lost by design, but the link must
 //       retrain, the host re-configures, nothing stale arrives afterwards and
 //       every later session must be clean.
-//   (F8 MSI-X masking, F9 host-driven BAR0 -- later commits)
+//   F8  MSI-X masking (+MASK_PCT, default 20% of sessions): one channel's
+//       vector is masked (vector-control bit) or the whole function is masked
+//       (Message Control bit 30) before the session. When it ends, no MSI-X
+//       may come out and the PBA bit must be set; after unmasking, exactly one
+//       MSI-X must come out and the PBA bit must clear.
+//   F9  host-driven BAR0 (+HOSTWR_PCT, default 30% of sessions): one register
+//       the session depends on (ch1 base low, arbiter weights or TC) is written
+//       by an inbound MWr through the link -- a 1-DW DMA on ch0 aimed at BAR0
+//       (BAR0 = 0x8000_0000) -- instead of the test port, then read back. For
+//       ch1's base the data TLPs only land at the right address if it worked.
 //   Not modelled in the RTL, so not tested: link down without hot reset
 //   (pcie_ltssm has no Recovery state; L0 is left only via reset).
 //
@@ -39,7 +48,8 @@
 //
 // plusargs: +SEED=n (default 1)  +SESS_MAX=n (6)  +BEATS_MAX=n (40)
 //           +GAP_MAX=pct (60)  +NOISE_PPM=n (0)  +BURST=k (1)  +OVF_PCT=p (20)
-//           +REVERSE=0/1 (random)  +HOTRESET_PCT=p (10)  +VERBOSE=1
+//           +REVERSE=0/1 (random)  +HOTRESET_PCT=p (10)  +MASK_PCT=p (20)
+//           +HOSTWR_PCT=p (30)  +VERBOSE=1
 // Ends with RESULT: PASS / RESULT: FAIL and prints the seed to replay it.
 // ============================================================
 module tb_bridge_rand;
@@ -49,7 +59,9 @@ module tb_bridge_rand;
     always #2   clk  = ~clk;     // 250 MHz
     always #2.7 aclk = ~aclk;    // ~185 MHz, unrelated
 
-    integer SEED, SEED0, SESS_MAX, BEATS_MAX, GAP_MAX, VERBOSE, NOISE_PPM, BURST, OVF_PCT, REVERSE, HOTRESET_PCT;
+    integer SEED, SEED0, SESS_MAX, BEATS_MAX, GAP_MAX, VERBOSE, NOISE_PPM, BURST, OVF_PCT, REVERSE, HOTRESET_PCT, MASK_PCT, HOSTWR_PCT;
+    localparam [31:0] BAR0 = 32'h8000_0000;
+    reg bar0_rd_en = 0; wire [31:0] bar0_rdata; wire bar0_rd_valid; reg tbl_wr_mask = 0;
     reg hot_reset_request = 0;
 
     reg  [DATA_W-1:0] s0_tdata = 0, s1_tdata = 0;
@@ -83,10 +95,10 @@ module tb_bridge_rand;
         .datapath_rst_n(datapath_rst_n), .axi_rst_n(axi_rst_n),
         .cfg_wr_en(cfg_wr_en), .cfg_rd_en(1'b0), .cfg_addr(cfg_addr), .cfg_wdata(cfg_wdata),
         .cfg_rdata(), .cfg_cpl_valid(),
-        .bar0_wr_en(bar0_wr_en), .bar0_rd_en(1'b0), .bar0_addr(bar0_addr), .bar0_wdata(bar0_wdata),
-        .bar0_rdata(), .bar0_rd_valid(),
+        .bar0_wr_en(bar0_wr_en), .bar0_rd_en(bar0_rd_en), .bar0_addr(bar0_addr), .bar0_wdata(bar0_wdata),
+        .bar0_rdata(bar0_rdata), .bar0_rd_valid(bar0_rd_valid),
         .tbl_wr_en(tbl_wr_en), .tbl_wr_vec(tbl_wr_vec), .tbl_wr_addr(tbl_wr_addr),
-        .tbl_wr_data(tbl_wr_data), .tbl_wr_mask(1'b0),
+        .tbl_wr_data(tbl_wr_data), .tbl_wr_mask(tbl_wr_mask),
         .tx_level(lvl), .tx_level_valid(lvl_v), .rx_level(rx_lvl), .rx_level_valid(lvl_v),   // SerDes loopback + F4 noise
         .err_xlat_miss(err_xlat_miss), .err_addr_ovf(err_addr_ovf), .crc_err(crc_err), .fec_err(fec_err),
         .phy_framing_err(phy_framing_err), .phy_lane_err(phy_lane_err)
@@ -197,6 +209,7 @@ module tb_bridge_rand;
     // ---------------- RX checker (same matching as tb_bridge_top) ----------------
     reg  [31:0] got [0:63];
     integer got_n = 0, ok = 0, bad = 0, extra = 0, k;
+    integer n_bar0_tlp = 0;          // F9
     reg rx_ignore = 0;               // F7: between a hot reset and the end of re-configuration
     integer n_ignored = 0;
     always @(posedge clk) if (rx_tvalid && rx_ignore) begin
@@ -216,6 +229,8 @@ module tb_bridge_rand;
                 for (i = exp_rd[ch]; i < exp_wr[ch]; i = i + 1)
                     if (exp_sess[ch][i] <= msix_cnt[ch]) msix_early = msix_early + 1;
                 msix_cnt[ch] = msix_cnt[ch] + 1;
+            end else if (a[63:16] == {32'h0, BAR0[31:16]}) begin
+                n_bar0_tlp = n_bar0_tlp + 1;            // F9: our own BAR0 write, looped back
             end else begin
                 ch = (a[39:32] == 8'hAB) ? 0 : (a[39:32] == 8'hCD) ? 1 : -1;
                 if (ch < 0 || exp_rd[ch] >= exp_wr[ch]) begin
@@ -247,7 +262,16 @@ module tb_bridge_rand;
         @(negedge clk); bar0_addr = a; bar0_wdata = d; bar0_wr_en = 1; @(negedge clk); bar0_wr_en = 0;
     end endtask
     task msix_entry(input [2:0] v, input [63:0] a, input [31:0] d); begin
-        @(negedge clk); tbl_wr_vec = v; tbl_wr_addr = a; tbl_wr_data = d; tbl_wr_en = 1; @(negedge clk); tbl_wr_en = 0;
+        msix_entry_m(v, a, d, 1'b0);
+    end endtask
+    task msix_entry_m(input [2:0] v, input [63:0] a, input [31:0] d, input m); begin
+        @(negedge clk); tbl_wr_vec = v; tbl_wr_addr = a; tbl_wr_data = d; tbl_wr_mask = m; tbl_wr_en = 1;
+        @(negedge clk); tbl_wr_en = 0; tbl_wr_mask = 0;
+    end endtask
+    task bar0_read(input [15:0] a, output [31:0] d); integer n; begin
+        @(negedge clk); bar0_addr = a; bar0_rd_en = 1; @(negedge clk); bar0_rd_en = 0;
+        n = 0; while (!bar0_rd_valid && n < 50) begin @(posedge clk); n = n + 1; end
+        d = bar0_rdata;
     end endtask
 
     function automatic [511:0] beat_data(input integer ch, input integer s, input integer b);
@@ -258,6 +282,7 @@ module tb_bridge_rand;
 
     // one channel's session on aclk: random beat count, last-beat size, gaps (F1)
     integer leaked = 0, n_ovf = 0, n_hotreset = 0;
+    integer n_mask = 0, n_fmask = 0, mask_err = 0, n_hostwr = 0, hostwr_err = 0;
     reg     abort_all = 0;            // F7: hot reset -> fabric stops driving
     integer limit_now = 24'hFF_FFFF;  // F5: current session byte limit
     task automatic run_channel(input integer ch, input integer s, input integer nbeats,
@@ -309,6 +334,35 @@ module tb_bridge_rand;
 
     // ---------------- main ----------------
     integer s, t0, cyc, nsess, w0, w1, arm, nb0, nb1, ld0, ld1, g0, g1, i, hr, hr_at;
+    integer mk, mk_ch, mk_fn, hw, msix_before, hr_hit; reg [31:0] pba;
+
+    // F9: write one BAR0 register through the link: a 1-beat, 1-DW session on
+    // ch0 whose DMA address is BAR0 + off. Its own MSI-X is accounted for.
+    task host_mwr(input [15:0] off, input [31:0] val);
+        reg [31:0] rb; integer t; begin
+            n_hostwr = n_hostwr + 1;
+            cur_sess[0] = cur_sess[0] + 1;
+            bar0_write(16'h000C, 24'hFF_FFFF);
+            bar0_write(16'h0020, BAR0 + off); bar0_write(16'h0024, 32'h0);
+            bar0_write(16'h0000, 32'h1);
+            t = 0; while (session_active[0] !== 1'b1 && t < 2000) begin @(posedge aclk); t = t + 1; end
+            @(negedge aclk);
+            s0_tdata = {480'h0, val}; s0_tkeep = 64'hF; s0_tlast = 1; s0_tvalid = 1;
+            @(posedge aclk); while (!s0_tready) @(posedge aclk);
+            @(negedge aclk); s0_tvalid = 0; s0_tlast = 0;
+            msix_expected = msix_expected + 1;
+            while (dut.u_lpb.u_pcie_phy_top.session_valid[0] !== 1'b0) @(posedge clk);
+            // the write lands when its TLP comes back through the link (slow under noise):
+            // wait until the checker has seen it, then let the RX decode finish
+            t = 0; while (n_bar0_tlp < n_hostwr && t < 2000000) begin @(posedge clk); t = t + 1; end
+            repeat (100) @(posedge clk);
+            bar0_read(off, rb);
+            if (rb !== val) begin
+                hostwr_err = hostwr_err + 1;
+                $display("[%0t] F9 FAIL: BAR0+%h written %h by inbound MWr, reads back %h", $time, off, val, rb);
+            end else if (VERBOSE) $display("[%0t] F9: BAR0+%h <= %h via inbound MWr, read back OK", $time, off, val);
+        end
+    endtask
 
     // host bring-up (power-on, and again after a hot reset): wait for link,
     // first FC, then what a driver does: Memory Space + Bus Master, MSI-X on,
@@ -318,6 +372,7 @@ module tb_bridge_rand;
         repeat (3) @(negedge clk); updatefc_received = 1; @(negedge clk); updatefc_received = 0;
         wait (axi_rst_n === 1'b1);
         cfg_write(12'h004, 32'h0000_0006);
+        cfg_write(12'h010, BAR0);                  // F9: BAR0 at 0x8000_0000 (64 KB)
         cfg_write(12'h050, 32'h8000_0000);
         repeat (20) @(negedge clk);
         msix_entry(2, msix_addr_of(0), msix_data_of(0));
@@ -337,6 +392,8 @@ module tb_bridge_rand;
         if (!$value$plusargs("OVF_PCT=%d", OVF_PCT)) OVF_PCT = 20;
         if (!$value$plusargs("HOTRESET_PCT=%d", HOTRESET_PCT)) HOTRESET_PCT = 10;
         if (!$value$plusargs("REVERSE=%d", REVERSE)) REVERSE = -1;
+        if (!$value$plusargs("MASK_PCT=%d", MASK_PCT)) MASK_PCT = 20;
+        if (!$value$plusargs("HOSTWR_PCT=%d", HOSTWR_PCT)) HOSTWR_PCT = 30;
         // decorrelate neighbouring seeds ($random's first draws track the seed)
         SEED = SEED * 1103515245 + 12345;
         for (i = 0; i < 8; i = i + 1) t0 = $random(SEED);
@@ -374,16 +431,40 @@ module tb_bridge_rand;
                 limit_now = 64 * urand(1, (nb0 > nb1 ? nb0 : nb1)) - urand(0, 63);
                 if (limit_now < 1) limit_now = 1;
             end else limit_now = 24'hFF_FFFF;
+            // F9: sometimes one register goes through the link instead of the test port
+            hw = (urand(0, 99) < HOSTWR_PCT && !abort_all) ? urand(1, 3) : 0;
+            if (hw == 1) host_mwr(16'h0008, {16'h0, w1[7:0], w0[7:0]});
+            else         bar0_write(16'h0008, {16'h0, w1[7:0], w0[7:0]});
+            if (hw == 2) host_mwr(16'h0018, {21'h0, urand(0,7) & 3'h7, 5'h0, urand(0,7) & 3'h7});
             bar0_write(16'h000C, limit_now);
-            bar0_write(16'h0008, {16'h0, w1[7:0], w0[7:0]});
             if (arm[0]) begin
                 base[0] = rand_base(0); cur_sess[0] = cur_sess[0] + 1;
                 bar0_write(16'h0020, base[0][31:0]); bar0_write(16'h0024, base[0][63:32]);
             end
             if (arm[1]) begin
                 base[1] = rand_base(1); cur_sess[1] = cur_sess[1] + 1;
-                bar0_write(16'h0028, base[1][31:0]); bar0_write(16'h002C, base[1][63:32]);
+                if (hw == 3) host_mwr(16'h0028, base[1][31:0]);   // F9: data only lands right if this worked
+                else         bar0_write(16'h0028, base[1][31:0]);
+                bar0_write(16'h002C, base[1][63:32]);
             end
+            // ch0's base registers may have been used by host_mwr: (re)write them last
+            if (arm[0]) begin bar0_write(16'h0020, base[0][31:0]); bar0_write(16'h0024, base[0][63:32]); end
+            bar0_write(16'h000C, limit_now);
+            // F8: mask one channel's vector, or the whole function, for this session
+            mk = (urand(0, 99) < MASK_PCT);
+            if (mk) begin   // F8 needs a quiet start: every earlier MSI-X must have arrived
+                t0 = 0; while (msix_seen < msix_expected && t0 < 400000) begin @(posedge clk); t0 = t0 + 1; end
+            end
+            mk_ch = arm[0] ? (arm[1] ? urand(0, 1) : 0) : 1;
+            mk_fn = mk && (urand(0, 2) == 0);
+            if (mk) begin
+                if (mk_fn) begin cfg_write(12'h050, 32'hC000_0000); n_fmask = n_fmask + 1; end
+                else begin
+                    msix_entry_m(mk_ch == 0 ? 2 : 6, msix_addr_of(mk_ch), msix_data_of(mk_ch), 1'b1);
+                    n_mask = n_mask + 1;
+                end
+            end
+            msix_before = msix_seen;
             bar0_write(16'h0000, arm);
             msix_expected = msix_expected + arm[0] + arm[1];
             t0 = 0; while ((session_active & arm[1:0]) !== arm[1:0] && t0 < 2000) begin @(posedge aclk); t0 = t0 + 1; end
@@ -401,6 +482,7 @@ module tb_bridge_rand;
                     @(negedge clk); hot_reset_request = 1; @(negedge clk); hot_reset_request = 0;
                 end
             join
+            hr_hit = abort_all;              // F7 happened in this session: F8 checks don't apply
             if (abort_all) begin
                 // F7 recovery: everything in flight is gone; the host re-trains and re-configures
                 wait (link_trained === 1'b0);                     // link really went down
@@ -416,6 +498,39 @@ module tb_bridge_rand;
             // No short cap here: under heavy channel noise a session can take
             // milliseconds to drain (replays). The global watchdog catches a real hang.
             while (dut.u_lpb.u_pcie_phy_top.session_valid !== 2'b00) @(posedge clk);
+            if (mk && !hr_hit) begin : f8
+                integer want;
+                // masked: the other channel's MSI-X (if armed and not masked) may come; ours must not
+                want = mk_fn ? 0 : (arm[0] + arm[1] - 1);
+                // wait for the unmasked channel's MSI-X (it trails its data by ~10k clk),
+                // then a further window in which the masked one must stay silent
+                t0 = 0; while (msix_seen - msix_before < want && t0 < 400000) begin @(posedge clk); t0 = t0 + 1; end
+                repeat (20000) @(posedge clk);
+                if (msix_seen - msix_before != want) begin
+                    mask_err = mask_err + 1;
+                    $display("[%0t] F8 FAIL: %0d MSI-X while %s masked (expected %0d)", $time,
+                             msix_seen - msix_before, (mk_fn ? "function" : "vector"), want);
+                end
+                bar0_read(16'h1800, pba);
+                if (!mk_fn && pba[mk_ch == 0 ? 2 : 6] !== 1'b1) begin
+                    mask_err = mask_err + 1;
+                    $display("[%0t] F8 FAIL: PBA=%h, vector %0d pending bit not set", $time, pba, mk_ch == 0 ? 2 : 6);
+                end
+                if (mk_fn) cfg_write(12'h050, 32'h8000_0000);
+                else       msix_entry_m(mk_ch == 0 ? 2 : 6, msix_addr_of(mk_ch), msix_data_of(mk_ch), 1'b0);
+                // released MSI-X may wait behind data and replays under noise: allow time
+                t0 = 0; while (msix_seen < msix_expected && t0 < 400000) begin @(posedge clk); t0 = t0 + 1; end
+                if (msix_seen != msix_expected) begin
+                    mask_err = mask_err + 1;
+                    $display("[%0t] F8 FAIL: after unmask %0d of %0d MSI-X", $time, msix_seen, msix_expected);
+                end
+                bar0_read(16'h1800, pba);
+                if (pba[7:0] !== 8'h00) begin
+                    mask_err = mask_err + 1;
+                    $display("[%0t] F8 FAIL: PBA=%h after unmask (expected 0)", $time, pba);
+                end
+                if (VERBOSE) $display("[%0t] F8: %s mask on ch%0d checked", $time, mk_fn ? "function" : "vector", mk_ch);
+            end
             repeat (urand(1, 200)) @(posedge clk);
         end
         cyc = 0;
@@ -436,9 +551,12 @@ module tb_bridge_rand;
                  n_noise, n_fec_fix, n_fec_bad, n_crc, n_replay);
         $display(" F5 overflow aborts: %0d (beats accepted past the limit: %0d)   F6 lanes %s   F7 hot resets: %0d (%0d TLPs dropped in reset windows)",
                  n_ovf, leaked, lane_rev ? "reversed" : "straight", n_hotreset, n_ignored);
+        $display(" F8 masked sessions: %0d vector + %0d function (errors %0d)   F9 inbound BAR0 writes: %0d (%0d TLPs, errors %0d)",
+                 n_mask, n_fmask, mask_err, n_hostwr, n_bar0_tlp, hostwr_err);
         $display(" errors now: framing=%b lane=%b overflow=%b", phy_framing_err, phy_lane_err, session_overflow);
         if (bad == 0 && extra == 0 && exp_rd[0] == exp_wr[0] && exp_rd[1] == exp_wr[1]
-            && msix_seen == msix_expected && msix_bad == 0 && msix_early == 0 && leaked == 0)
+            && msix_seen == msix_expected && msix_bad == 0 && msix_early == 0 && leaked == 0
+            && mask_err == 0 && hostwr_err == 0 && n_bar0_tlp == n_hostwr)
             $display(" RESULT: PASS (seed %0d)", SEED0);
         else
             $display(" RESULT: FAIL (seed %0d -- replay with +SEED=%0d)", SEED0, SEED0);
