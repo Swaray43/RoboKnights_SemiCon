@@ -161,3 +161,64 @@ async def test_msix_table_through_bar0(dut):
     await bfm.fire_dma_complete(3)
     await FallingEdge(dut.clk)
     assert int(dut.mwr_valid.value) == 0 and int(dut.pba.value) == 0, "MSI-X disabled must drop the event"
+
+
+@cocotb.test()
+async def test_link_loss_retrain(dut):
+    """K6: cable pull in L0. The LTSSM leaves L0 on signal loss, the reset
+    controller resets the datapath (axi_rst_n low, sessions and config gone),
+    and once the cable is back the link retrains over the lanes and data
+    passes bit-exact again after a fresh UpdateFC."""
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    cocotb.start_soon(Clock(dut.aclk, 7, unit="ns").start())
+    bfm = RootComplexBFM(dut)
+    await bfm.reset()
+    bfm.lane_cut = 0
+    cocotb.start_soon(bfm.serdes_loopback())
+    await bfm.wait_link_up_over_lanes()
+    await bfm.release_axi_reset()
+    await bfm.enable_function()
+    await bfm.program_session(0, 0x1_2345_0000)
+    for _ in range(300):                       # idle L0: RX checks arm on logical idle
+        await FallingEdge(dut.clk)
+    assert int(dut.session_valid.value) & 1, "session armed before the pull"
+    assert int(dut.tx_level_valid.value) == 0xF, "L0 lanes carry logical idle"
+
+    bfm.lane_cut = 0xF                         # cable pull
+    for n in range(200):
+        await FallingEdge(dut.clk)
+        if not int(dut.link_trained.value):
+            break
+    assert not int(dut.link_trained.value), "link must drop on signal loss"
+    assert n <= 72, f"link dropped {n} clk after the pull (LOSS_CLKS=64)"
+    for _ in range(10):
+        await FallingEdge(dut.clk)
+    assert int(dut.axi_rst_n.value) == 0, "AXI held in reset on link down"
+    assert int(dut.session_valid.value) == 0, "sessions cleared by the link-down reset"
+    for _ in range(1000):                      # stays down while the cable is out
+        await FallingEdge(dut.clk)
+    assert not int(dut.link_trained.value)
+
+    bfm.lane_cut = 0                           # cable back
+    await bfm.wait_link_up_over_lanes(max_cycles=20000)
+    await bfm.release_axi_reset()
+    await bfm.enable_function()
+
+    rng = random.Random(66)
+    sent = [[rng.getrandbits(256) for _ in range(8)] for _ in range(2)]
+    got = []
+
+    async def collect():
+        while True:
+            await RisingEdge(dut.clk)
+            if int(dut.phy_rx_valid.value):
+                got.append(int(dut.phy_rx_data.value))
+
+    cocotb.start_soon(collect())
+    for flit in sent:
+        await bfm.send_flit(flit)
+    for _ in range(1500):
+        if len(got) >= 16:
+            break
+        await RisingEdge(dut.clk)
+    assert got == [w for f in sent for w in f], "data bit-exact after the retrain"

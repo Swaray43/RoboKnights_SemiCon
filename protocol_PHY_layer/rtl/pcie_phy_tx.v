@@ -34,6 +34,23 @@
 // (flit_ready drops once it is full). The far end's ts_ordered_set_detector
 // reads these bytes off its lane_rx outputs - see pcie_phy_rx / pcie_phy_top.
 //
+// ---- K6: logical idle in L0 --------------------------------------------------
+// With L0_IDLE_FILL=1 (default) the lanes never go quiet in L0: every byte slot
+// that has no Flit byte to send carries IDL_BYTE on all 4 lanes. The receiver
+// (pcie_phy_rx -> pcie_ltssm) can then treat rx_level_valid low in L0 as a lost
+// link, and checks between-Flit bytes for IDL/SOF to spot a slipped symbol
+// alignment. This is the PCIe rule (L0 always transmits: IDLE Flits / logical
+// idle). IDL_BYTE = 0x1B = symbols 0,1,2,3: none of its symbol rotations
+// (0x6C, 0xB1, 0xC6) is itself or SOF, so a slip cannot hide.
+// Idle never goes INSIDE a Flit: fl_left counts the Flit's payload lane-cycles
+// exactly as flit_sof_strip counts them at the far end (1 SOF + 8 per word).
+// If the producer underruns mid-Flit the lanes stay quiet for up to
+// UNDERRUN_SLOTS byte slots (data usually arrives), then IDL filler is sent and
+// counted as payload so TX and RX framing stay in step (that Flit is corrupt;
+// link-layer CRC/replay recovers it) and the far end does not see a dead link.
+// Costs: a Flit byte may wait up to 3 clk for the next byte slot; tx_level_valid
+// is high throughout L0 (wire-level byte counters now include idle).
+//
 // ---- Lane byte order -----------------------------------------------------------
 // Unchanged from flit_lane_striper: word byte k goes to lane (k mod 4), lowest
 // byte first. tx_level lane i is tx_level[3*i +: 3] (signed -3/-1/+1/+3).
@@ -41,7 +58,9 @@
 module pcie_phy_tx #(
     parameter FIFO_DEPTH     = 16,   // Flit FIFO depth in 256-bit words (power of 2)
     parameter WORDS_PER_FLIT = 8,
-    parameter DESKEW_DEPTH   = 16    // per-lane byte FIFO depth (power of 2, >= 16)
+    parameter DESKEW_DEPTH   = 16,   // per-lane byte FIFO depth (power of 2, >= 16)
+    parameter L0_IDLE_FILL   = 1,    // K6: send IDL bytes in L0 when there is nothing else
+    parameter UNDERRUN_SLOTS = 8     // K6: quiet byte slots allowed mid-Flit before IDL filler (1..15)
 )(
     input  wire         clk,
     input  wire         rst_n,
@@ -66,12 +85,15 @@ module pcie_phy_tx #(
 
     // ---- status ----
     output wire         tx_idle,         // nothing buffered anywhere in the TX path
+                                         // (logical idle does not count as busy)
     output reg          framing_err      // sticky: sof/eof not on an 8-word boundary
 );
 
 localparam FAW = (FIFO_DEPTH <= 2) ? 1 : (FIFO_DEPTH <= 4) ? 2 : (FIFO_DEPTH <= 8) ? 3 :
                  (FIFO_DEPTH <= 16) ? 4 : (FIFO_DEPTH <= 32) ? 5 : 6;
 localparam [7:0] SOF_TOKEN = 8'hFB;
+localparam [7:0] IDL_BYTE  = 8'h1B;              // K6 logical idle (see header)
+localparam [7:0] FLIT_LC   = 8 * WORDS_PER_FLIT;  // payload lane-cycles per Flit
 
 // -----------------------------------------------------------------------------
 // 1. Flit FIFO (first-word-fall-through, 256b data + sof flag)
@@ -165,6 +187,10 @@ wire       dsk_valid;
 reg  [1:0] phase;
 reg        byte_valid;
 reg        byte_is_ts;
+reg        byte_is_idl;     // K6: this byte is logical idle / underrun filler
+reg  [7:0] fl_left;         // K6: payload lane-cycles of the current Flit still to send
+reg  [3:0] starve;          // K6: byte slots spent waiting for data mid-Flit
+reg  [2:0] data_tail;       // K6: clocks until the last Flit byte has left the lanes
 
 // ---- TS1/TS2 ordered-set sequencing ----
 reg  [3:0] ts_idx;          // next byte of the ordered set (0..15)
@@ -174,6 +200,10 @@ wire       slot     = (phase == 2'd0);
 wire       ts_send  = slot && ((ts_idx != 4'd0) || ts_want);   // never cut an OS short
 wire       dsk_rd   = slot && !ts_send && dsk_valid && data_en;
 assign     ts_sending = ts_want || (ts_idx != 4'd0);
+// K6: logical idle between Flits, IDL filler after a long mid-Flit underrun
+wire       in_flit  = (fl_left != 8'd0);
+wire       idl_send = (L0_IDLE_FILL != 0) && slot && !ts_send && !dsk_rd && data_en &&
+                      (!in_flit || (starve >= UNDERRUN_SLOTS));
 
 wire [7:0] ts_b0, ts_b1, ts_b2, ts_b3;
 reg  [31:0] ts_bytes_q;
@@ -198,14 +228,19 @@ always @(posedge clk or negedge rst_n) begin
     phase      <= 2'd0;
     byte_valid <= 1'b0;
     byte_is_ts <= 1'b0;
+    byte_is_idl <= 1'b0;
+    fl_left    <= 8'd0;
+    starve     <= 4'd0;
+    data_tail  <= 3'd0;
     ts_idx     <= 4'd0;
     ts_is2     <= 1'b0;
     os_done    <= 1'b0;
     ts_bytes_q <= 32'd0;
   end else begin
-    byte_valid <= ts_send || dsk_rd;
-    byte_is_ts <= ts_send;
-    if (ts_send || dsk_rd)   phase <= 2'd1;
+    byte_valid  <= ts_send || dsk_rd || idl_send;
+    byte_is_ts  <= ts_send;
+    byte_is_idl <= idl_send;
+    if (ts_send || dsk_rd || idl_send) phase <= 2'd1;
     else if (phase != 2'd0)  phase <= phase + 2'd1;   // 1 -> 2 -> 3 -> 0
 
     os_done <= 1'b0;
@@ -215,14 +250,27 @@ always @(posedge clk or negedge rst_n) begin
       ts_idx     <= ts_idx + 4'd1;                     // 15 -> 0 wraps
       if (ts_idx == 4'd15) os_done <= 1'b1;
     end
+
+    // K6: Flit framing on the lanes, mirrors flit_sof_strip at the far end.
+    // A data byte with no Flit open is the SOF; then FLIT_LC payload cycles.
+    if (dsk_rd)
+      fl_left <= in_flit ? fl_left - 8'd1 : FLIT_LC;
+    else if (idl_send && in_flit)
+      fl_left <= fl_left - 8'd1;                    // underrun filler counts as payload
+    if (!in_flit || dsk_rd)
+      starve <= 4'd0;
+    else if (slot && !ts_send && data_en && starve != 4'hF)
+      starve <= starve + 4'd1;
+    if (dsk_rd)                 data_tail <= 3'd6;  // read -> lane_tx -> 4 symbols -> level reg
+    else if (data_tail != 3'd0) data_tail <= data_tail - 3'd1;
   end
 end
 
 // byte to each lane: the registered TS byte, or the deskew FIFO's registered output
-wire [7:0] ln_b0 = byte_is_ts ? ts_bytes_q[7:0]   : dsk_out0;
-wire [7:0] ln_b1 = byte_is_ts ? ts_bytes_q[15:8]  : dsk_out1;
-wire [7:0] ln_b2 = byte_is_ts ? ts_bytes_q[23:16] : dsk_out2;
-wire [7:0] ln_b3 = byte_is_ts ? ts_bytes_q[31:24] : dsk_out3;
+wire [7:0] ln_b0 = byte_is_ts ? ts_bytes_q[7:0]   : byte_is_idl ? IDL_BYTE : dsk_out0;
+wire [7:0] ln_b1 = byte_is_ts ? ts_bytes_q[15:8]  : byte_is_idl ? IDL_BYTE : dsk_out1;
+wire [7:0] ln_b2 = byte_is_ts ? ts_bytes_q[23:16] : byte_is_idl ? IDL_BYTE : dsk_out2;
+wire [7:0] ln_b3 = byte_is_ts ? ts_bytes_q[31:24] : byte_is_idl ? IDL_BYTE : dsk_out3;
 
 // -----------------------------------------------------------------------------
 // 4. Four TX lanes
@@ -241,8 +289,13 @@ lane_tx u_lane3 (.clk(clk), .rst_n(rst_n), .byte_in_valid(byte_valid), .byte_in(
 
 assign tx_level = {lvl3, lvl2, lvl1, lvl0};
 
-assign tx_idle = !ts_sending && ff_empty && (strp_left == 4'd0) && !dsk_valid && (phase == 2'd0) &&
-                 !byte_valid && (lane_busy == 4'b0000) && (tx_level_valid == 4'b0000);
+// K6: with logical idle the lanes are never quiet in L0, so "idle" means no
+// Flit data anywhere: FIFO, striper, deskew, an open Flit, or bytes still
+// leaving the lanes. Without idle fill the original lane-quiet terms apply.
+assign tx_idle = !ts_sending && ff_empty && (strp_left == 4'd0) && !dsk_valid &&
+                 !in_flit && (data_tail == 3'd0) &&
+                 ((L0_IDLE_FILL != 0) ||
+                  ((phase == 2'd0) && !byte_valid && (lane_busy == 4'b0000) && (tx_level_valid == 4'b0000)));
 
 `ifndef SYNTHESIS
 // The scheduler relies on byte_to_symbol being free exactly when a byte arrives.

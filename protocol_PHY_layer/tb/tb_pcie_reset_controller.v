@@ -1,7 +1,8 @@
 // =============================================================================
 // tb_pcie_reset_controller
 // Covers: PERST# assert/deassert, hot-reset pulsing datapath_rst_n without
-// going through link_state, link-down detection holding axi_rst_n, and FLR
+// going through link_state, link-down detection holding axi_rst_n (and, K6,
+// pulsing datapath_rst_n like a hot reset), and FLR
 // pulsing independently without disturbing link_state.
 // =============================================================================
 module tb_pcie_reset_controller();
@@ -30,6 +31,10 @@ pcie_reset_controller_checker u_checker (
 
 initial clk = 0;
 always #5 clk = ~clk;
+
+// K6: clocks datapath_rst_n spends low (while PERST# is high)
+integer dp_low_cnt = 0;
+always @(posedge clk) if (perst_n && !datapath_rst_n) dp_low_cnt = dp_low_cnt + 1;
 
 initial begin
   errors = 0;
@@ -112,12 +117,25 @@ initial begin
 
   // ---- Test 5: unexpected link-down (link_trained drops without hot-reset) ----
   // should hold axi_rst_n low until re-trained
+  dp_low_cnt = 0;
   link_trained = 0;
   @(negedge clk); @(negedge clk);
   if (axi_rst_n !== 1'b0) begin
     $display("FAIL: axi_rst_n did not re-assert on unexpected link-down");
     errors = errors + 1;
   end else $display("PASS: axi_rst_n correctly re-asserted on unexpected link-down");
+  // K6: link down outside a hot reset now resets the datapath like a hot reset
+  // (DL_Down on an Upstream Port), so deskew/lane order/link layer start clean
+  if (datapath_rst_n !== 1'b0) begin
+    $display("FAIL: K6 datapath_rst_n not pulsed on unexpected link-down (got %b)", datapath_rst_n);
+    errors = errors + 1;
+  end else $display("PASS: K6 unexpected link-down pulses datapath_rst_n (like hot reset)");
+  repeat (6) @(negedge clk);
+  if (datapath_rst_n !== 1'b1 || dp_low_cnt < 2 || dp_low_cnt > 4) begin
+    $display("FAIL: K6 link-down datapath reset pulse wrong: low %0d clk, now %b (want 2..4, then 1)",
+             dp_low_cnt, datapath_rst_n);
+    errors = errors + 1;
+  end else $display("PASS: K6 link-down datapath reset is a %0d-clk pulse that releases on its own (no deadlock)", dp_low_cnt);
 
   link_trained = 1; // re-train
   @(negedge clk); @(negedge clk);
@@ -130,6 +148,7 @@ initial begin
     errors = errors + 1;
   end else $display("PASS: axi_rst_n correctly released after link-down recovery");
 
+  dp_low_cnt = 0;
   // ---- Test 6: FLR pulses independently, does not disturb link_state/axi_rst_n ----
   flr_request = 1;
   @(negedge clk);
@@ -145,7 +164,7 @@ initial begin
     errors = errors + 1;
   end else $display("PASS: flr_active correctly returned to 0 (single-cycle pulse)");
 
-  if (axi_rst_n !== 1'b1 || datapath_rst_n !== 1'b1) begin
+  if (axi_rst_n !== 1'b1 || datapath_rst_n !== 1'b1 || dp_low_cnt != 0) begin
     $display("FAIL: FLR disturbed axi_rst_n/datapath_rst_n - link should stay up (got axi=%b datapath=%b)",
               axi_rst_n, datapath_rst_n);
     errors = errors + 1;
