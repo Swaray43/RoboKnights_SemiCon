@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 // ------------------------------------------------------------------
 // perf_counters: the performance-counter set from work_distribution.md,
 // minus tag utilization (sourced directly from pcie_tag_manager's

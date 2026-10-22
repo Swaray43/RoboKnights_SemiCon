@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 // =============================================================================
 // pcie_phy_top - Protocol-to-PHY layer top (Kshitij's layer), synthesizable.
 // Replaces pcie_link_top (fixes P1, P2, P3, P4, I3 and the PHY side of Seam D).
@@ -22,6 +23,10 @@
 //    TX ordered-set generator; received lanes -> rx_lane_deskew -> TS1/TS2
 //    detectors x4 -> LTSSM, and -> lane_reversal_detector -> latch -> lane_reversed.
 //    link_trained = LTSSM in L0.
+//    K6: in L0 the TX sends logical idle between Flits, and the LTSSM leaves L0
+//    on signal loss (rx_level_valid / lane_err), lost framing between Flits or
+//    TS1s from the partner; pcie_reset_controller then pulses datapath_rst_n
+//    as for a hot reset and the link retrains (see pcie_ltssm header).
 //    pcie_reset_controller  (perst_n -> datapath_rst_n, axi_rst_n)
 //    pcie_config_space      (Type-0 header, BAR sizing, MSI-X cap)
 //    bar0_dma_regs          (base_addr_ch0/1, arm, weights, limit, MSI-X vectors)
@@ -43,7 +48,12 @@ module pcie_phy_top #(
     parameter LTSSM_DETECT_CLKS  = 32,
     parameter LTSSM_RX_TS_MIN    = 8,     // TS received to leave Polling / Configuration
     parameter LTSSM_TX_TS2_MIN   = 16,    // TS2 sent after the first one received
-    parameter LTSSM_TIMEOUT_CLKS = 16384  // Polling / Configuration timeout -> Detect
+    parameter LTSSM_TIMEOUT_CLKS = 16384, // Polling / Configuration timeout -> Detect
+    parameter LTSSM_LOSS_CLKS    = 64,    // K6: lost-signal clocks in L0 -> link down
+    parameter LTSSM_GAP_ERR_MAX  = 512,   // K6: unframed between-Flit lane cycles -> link down
+    parameter LTSSM_L0_TS1_EXIT  = 2,     // K6: TS1s received in L0 -> link down
+    parameter L0_IDLE_FILL       = 1      // K6: TX logical idle in L0; 0 = lanes quiet when idle
+                                          //     (old behaviour; also turns L0 exits 1/2 off)
 )(
     input  wire         clk,
     input  wire         perst_n,
@@ -216,12 +226,26 @@ lane_reversal_latch u_latch (
 // link_trained (used everywhere downstream) now means "LTSSM is in L0".
 wire [1:0] tx_os_mode;
 wire       tx_os_done;
+// K6: receive-side health for leaving L0 on link loss (from pcie_phy_rx)
+wire       rx_gap_ok, rx_gap_bad;
+wire       ltssm_l0_exit;            // debug: 1-clk pulse when L0 is left (not by reset)
+wire [1:0] ltssm_exit_reason;        // debug: 1 signal loss, 2 lost framing, 3 TS1 received
+wire       ltssm_rx_armed;           // debug: L0 receive checks active
+// Exits 1/2 need a partner whose lanes never go quiet in L0 (logical idle).
+// With L0_IDLE_FILL=0 (old behaviour, both ends are this PHY) they are off.
+wire [3:0] ltssm_rx_valid = (L0_IDLE_FILL != 0) ? rx_level_valid : 4'b1111;
+wire       ltssm_gap_bad  = (L0_IDLE_FILL != 0) && rx_gap_bad;
 pcie_ltssm #(.DETECT_CLKS(LTSSM_DETECT_CLKS), .RX_TS_MIN(LTSSM_RX_TS_MIN),
-             .TX_TS2_MIN(LTSSM_TX_TS2_MIN), .TIMEOUT_CLKS(LTSSM_TIMEOUT_CLKS)) u_ltssm (
+             .TX_TS2_MIN(LTSSM_TX_TS2_MIN), .TIMEOUT_CLKS(LTSSM_TIMEOUT_CLKS),
+             .LOSS_CLKS(LTSSM_LOSS_CLKS), .GAP_ERR_MAX(LTSSM_GAP_ERR_MAX),
+             .L0_TS1_EXIT(LTSSM_L0_TS1_EXIT)) u_ltssm (
   .clk(clk), .rst_n(train_rst_n),
   .os_valid(osv), .os_ts2(ost2), .lanes_identified(lanes_identified),
+  .rx_valid(ltssm_rx_valid), .rx_err(phy_lane_err),
+  .rx_gap_ok(rx_gap_ok), .rx_gap_bad(ltssm_gap_bad),
   .tx_os_done(tx_os_done), .tx_os_mode(tx_os_mode),
-  .state(ltssm_state), .link_up(link_trained)
+  .state(ltssm_state), .link_up(link_trained),
+  .l0_exit(ltssm_l0_exit), .exit_reason(ltssm_exit_reason), .rx_armed(ltssm_rx_armed)
 );
 
 pcie_reset_controller u_rst (
@@ -234,7 +258,8 @@ pcie_reset_controller u_rst (
 // -----------------------------------------------------------------------------
 // Datapath
 // -----------------------------------------------------------------------------
-pcie_phy_tx #(.FIFO_DEPTH(TX_FIFO_DEPTH), .WORDS_PER_FLIT(WORDS_PER_FLIT)) u_tx (
+pcie_phy_tx #(.FIFO_DEPTH(TX_FIFO_DEPTH), .WORDS_PER_FLIT(WORDS_PER_FLIT),
+              .L0_IDLE_FILL(L0_IDLE_FILL)) u_tx (
   .clk(clk), .rst_n(datapath_rst_n),
   .os_mode(tx_os_mode), .data_en(link_trained), .ts_sending(phy_ts_sending), .os_done(tx_os_done),
   .flit_data(phy_tx_data), .flit_valid(phy_tx_valid), .flit_sof(phy_tx_sof), .flit_eof(phy_tx_eof),
@@ -252,7 +277,8 @@ pcie_phy_rx #(.WORDS_PER_FLIT(WORDS_PER_FLIT)) u_rx (
   .flit_out_sof(phy_rx_sof), .flit_out_eof(phy_rx_eof),
   .lane_err(phy_lane_err),
   .lane_bytes(rx_lane_bytes), .lane_bytes_valid(rx_lane_bytes_valid),
-  .deskew_locked(phy_deskew_locked)
+  .deskew_locked(phy_deskew_locked),
+  .gap_ok(rx_gap_ok), .gap_bad(rx_gap_bad)
 );
 
 // -----------------------------------------------------------------------------

@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 // ------------------------------------------------------------------
 // pcie_tag_manager: allocates/frees PCIe tags for outstanding MRd
 // requests. Free-list based, supports MAX_OUTSTANDING concurrent

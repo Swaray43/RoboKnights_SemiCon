@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 // -----------------------------------------------------------------------------
 // gray_dec - 2-bit Gray -> binary decoder, exact inverse of gray_enc.
 // Port names (g, a) are canonical - the old gray_enc_dec.v used (g, b).

@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 //=============================================================================
 // cdc_fifo_async.v
 // Generic gray-code asynchronous FIFO for crossing between two unrelated

@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 // -----------------------------------------------------------------------------
 // RX deserializer: four sequential 2-bit symbols -> one reassembled byte, MSB-first
 // Must match byte_to_symbol's bit ordering exactly (interface contract).

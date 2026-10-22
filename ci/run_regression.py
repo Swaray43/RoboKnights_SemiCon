@@ -19,6 +19,10 @@ Suites
   errors        tb_stream_path with bit-error injection + random backpressure
   asic          bridge + stream benches with the ASIC buffer sizes (asic/sim)
   long          tb_bridge_top +SESS=6 +BEATS=50 (600 TLPs)
+  rand          tb_bridge_rand over several seeds, clean and with PAM4 noise
+                (RAND_SEEDS=n, default 4; RAND_BASE=s, default 1), then the
+                Step 3 C coverage table (ci/coverage_report.py). COV: lines go
+                to ci_out/cov_<base>.txt; COV_STRICT=1 fails on an empty bin.
   formal        every *.sby under protocol_PHY_layer/formal and verification/formal
                 (needs sby + yosys + solvers, e.g. the OSS CAD Suite)
 
@@ -38,7 +42,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 PY = sys.executable
 TIMEOUT = 1800
-DEFAULT = ["guards", "link", "interconnect", "phy", "cocotb", "bridge", "errors", "asic"]
+DEFAULT = ["guards", "link", "interconnect", "phy", "cocotb", "bridge", "errors", "asic", "rand"]
 ALL = DEFAULT + ["long", "formal"]
 
 results = []          # (suite, item, ok, detail, seconds)
@@ -214,6 +218,48 @@ def s_long():
     record("long", "tb_bridge_top 6x50" + (f" ({m.group(1)} TLPs)" if m else ""), ok, tail(out), t0)
 
 
+def s_rand():
+    """tb_bridge_rand: half the seeds clean, half with PAM4 noise (some bursty)."""
+    n = int(os.environ.get("RAND_SEEDS", "4"))
+    base = int(os.environ.get("RAND_BASE", "1"))
+    tmp = Path(tempfile.mkdtemp(prefix="rand_"))
+    vvp = tmp / "rand.vvp"
+    t0 = time.time()
+    rc, out = run(["iverilog", "-g2012", "-DSIMULATION", "-s", "tb_bridge_rand", "-o", str(vvp)]
+                  + bridge_srcs(["bridge_top/tb/tb_bridge_rand.v"]))
+    if rc != 0:
+        record("rand", "compile", False, tail(out, 3), t0)
+        shutil.rmtree(tmp, ignore_errors=True)
+        return
+    cov = []
+    for i in range(n):
+        seed = base + i
+        args = [f"+SEED={seed}"]
+        if i % 2 == 1:
+            # 1000 ppm single-symbol errors, or 300 ppm hits of 4-symbol bursts
+            args += ["+NOISE_PPM=300", "+BURST=4"] if i % 4 == 3 else ["+NOISE_PPM=1000"]
+        t0 = time.time()
+        rc, out = run(["vvp", "-n", str(vvp)] + args, cwd=tmp)
+        cov += [l for l in out.splitlines() if l.startswith("COV:")]
+        m = re.search(r"data TLPs received ok\s*:\s*(\d+)", out)
+        r = re.search(r"replays (\d+)", out)
+        label = " ".join(args) + (f" ({m.group(1)} TLPs" + (f", {r.group(1)} replays)" if r else ")") if m else "")
+        record("rand", label, rc == 0 and has_pass(out), tail(out), t0)
+    shutil.rmtree(tmp, ignore_errors=True)
+    # Step 3 C: merge this run's coverage lines
+    t0 = time.time()
+    outd = ROOT / "ci_out"
+    outd.mkdir(exist_ok=True)
+    covf = outd / f"cov_{base}.txt"
+    covf.write_text("\n".join(cov) + "\n")
+    strict = os.environ.get("COV_STRICT", "0") == "1"
+    rc, out = run([PY, str(ROOT / "ci/coverage_report.py")] + (["--strict"] if strict else []) + [str(covf)])
+    print(out)
+    m = re.search(r"Required bins covered: (\d+)/(\d+)", out)
+    record("rand", "coverage" + (f" {m.group(1)}/{m.group(2)} required bins" if m else "")
+           + (" (strict)" if strict else ""), rc == 0, tail(out, 1), t0)
+
+
 def s_formal():
     if shutil.which("sby") is None:
         t0 = time.time()
@@ -231,7 +277,7 @@ def s_formal():
 
 SUITES = {"guards": s_guards, "link": s_link, "interconnect": s_interconnect, "phy": s_phy,
           "cocotb": s_cocotb, "bridge": s_bridge, "errors": s_errors, "asic": s_asic,
-          "long": s_long, "formal": s_formal}
+          "long": s_long, "rand": s_rand, "formal": s_formal}
 
 
 def summary():

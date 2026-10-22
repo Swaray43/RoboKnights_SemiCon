@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 // ------------------------------------------------------------------
 // mrd_completion_handler: consumes Cpl TLPs (from RX/
 // deframer path), looks up the outstanding-request entry by tag,

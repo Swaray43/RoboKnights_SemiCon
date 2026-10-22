@@ -49,6 +49,10 @@ module pcie_rx_engine #(
     input  wire [PCIE_ADDR_W-1:0]  cfg_window_base,
     input  wire [PCIE_ADDR_W-1:0]  cfg_window_mask,
     input  wire [AXI_ADDR_W-1:0]   cfg_axi_base,
+    // S13: BAR0 window -- inbound MWrs here are not translation misses
+    input  wire                    cfg_excl_en,
+    input  wire [PCIE_ADDR_W-1:0]  cfg_excl_base,
+    input  wire [PCIE_ADDR_W-1:0]  cfg_excl_mask,
 
     // Gap fix X1: CfgRd/CfgWr routing (extension point -- no
     // config-space block exists in the project yet to connect this
@@ -173,6 +177,7 @@ module pcie_rx_engine #(
         .trans_window_base(cfg_window_base),
         .trans_window_mask(cfg_window_mask),
         .trans_axi_base(cfg_axi_base),
+        .excl_en(cfg_excl_en), .excl_base(cfg_excl_base), .excl_mask(cfg_excl_mask),   // S13
         .req_valid(mwr_req),
         .req_pcie_addr(tlp_addr),
         .axi_addr_ready(m_axi_awready), // Connected AXI4 ready

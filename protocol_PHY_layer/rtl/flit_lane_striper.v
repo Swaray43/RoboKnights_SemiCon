@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 // -----------------------------------------------------------------------------
 // TX lane striper: 256-bit FLIT -> 4 lanes, byte-interleaved round-robin.
 // Byte-index-is-lane-index falls out of the indexed part-select directly:

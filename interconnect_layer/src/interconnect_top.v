@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 //=============================================================================
 // interconnect_top.v
 // Top-level interconnect layer: two AXI4-Stream ingest ports (SmartNIC,

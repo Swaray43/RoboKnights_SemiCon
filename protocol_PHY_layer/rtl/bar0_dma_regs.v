@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 // =============================================================================
 // bar0_dma_regs - BAR0 DMA/session register block (fixes P4 / Seam B)
 //

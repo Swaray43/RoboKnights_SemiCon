@@ -220,7 +220,10 @@ class RootComplexBFM:
     # ---- Datapath helpers ----
     async def serdes_loopback(self, cross_lanes=False):
         """Model the channel in Python: copy tx_level -> rx_level every clock
-        (one register stage). Start with cocotb.start_soon()."""
+        (one register stage). Start with cocotb.start_soon().
+        K6: set self.lane_cut to a 4-bit mask to pull those receive lanes
+        (cable pull = 0xF); clear it to plug the cable back in."""
+        self.lane_cut = getattr(self, "lane_cut", 0)
         while True:
             await RisingEdge(self.dut.clk)
             lv = int(self.dut.tx_level.value)
@@ -229,7 +232,7 @@ class RootComplexBFM:
                 lv = sum(((lv >> (3 * i)) & 7) << (3 * (3 - i)) for i in range(4))
                 vv = sum(((vv >> i) & 1) << (3 - i) for i in range(4))
             self.dut.rx_level.value = lv
-            self.dut.rx_level_valid.value = vv
+            self.dut.rx_level_valid.value = vv & ~self.lane_cut & 0xF
 
     async def send_flit(self, words):
         """Push one Flit (8 x 256-bit ints) honouring phy_tx_ready."""
