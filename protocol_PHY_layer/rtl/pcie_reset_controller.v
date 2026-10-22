@@ -6,8 +6,22 @@
 // (would come from TS1/TS2 Training Control byte decode - not yet decoded),
 // flr_request (would come from config space CfgWr decode - not built),
 // updatefc_received (would come from DLLP flow-control logic - not built).
+//
+// K6 - link down without hot reset: when link_trained falls while LINK_UP and
+// no hot reset is pending (pcie_ltssm left L0 on signal loss / lost framing /
+// partner retraining), datapath_rst_n is pulsed low for LINKDOWN_PULSE clocks,
+// exactly like a hot reset. An Upstream Port going DL_Down is reset, and here
+// it is also what makes retraining possible: rx_lane_deskew's lock, the lane
+// reversal latch and the link layer's sequence/replay/credit state only clear
+// on reset. axi_rst_n is held as before until re-training + a fresh UpdateFC.
+// No deadlock: the pulse is started by a falling edge of link_trained, times
+// out on its own, and never waits for link_trained (same rule as hot reset).
+// LINKDOWN_RESET=0 restores the old behaviour (axi_rst_n only).
 // -----------------------------------------------------------------------------
-module pcie_reset_controller (
+module pcie_reset_controller #(
+parameter LINKDOWN_RESET = 1,
+parameter LINKDOWN_PULSE = 3     // clocks of datapath_rst_n low (>= 2)
+)(
 input  wire clk,
 input  wire perst_n,
 input  wire hot_reset_request,
@@ -27,6 +41,7 @@ localparam LINK_UP   = 2'd2;
 reg [1:0] link_state;
 reg link_trained_d;
 reg hot_reset_pending;
+reg [2:0] linkdown_cnt;     // K6: clocks of link-down datapath reset left
 
 // ---- Hot-reset pending latch (external protocol event, decoupled from
 // this reset domain's own output - this is what avoids the deadlock below) ----
@@ -54,6 +69,8 @@ always @(posedge clk or negedge perst_n) begin
     datapath_rst_n <= 1'b0;
   end else if (hot_reset_pending) begin
     datapath_rst_n <= 1'b0;   // synchronous reset pulse on confirmed hot-reset
+  end else if (linkdown_cnt != 3'd0) begin
+    datapath_rst_n <= 1'b0;   // K6: same pulse on an unexpected link down
   end else begin
     datapath_rst_n <= 1'b1;
   end
@@ -64,8 +81,10 @@ always @(posedge clk or negedge perst_n) begin
   if (!perst_n) begin
     link_state     <= LINK_DOWN;
     link_trained_d <= 1'b0;
+    linkdown_cnt   <= 3'd0;
   end else begin
     link_trained_d <= link_trained;
+    if (linkdown_cnt != 3'd0) linkdown_cnt <= linkdown_cnt - 3'd1;
 
     case (link_state)
       LINK_DOWN: begin
@@ -82,6 +101,7 @@ always @(posedge clk or negedge perst_n) begin
           // Link-down detection: link_trained fell unexpectedly (not via
           // hot-reset) - spec requires holding AXI reset until re-trained.
           link_state <= LINK_DOWN;
+          if (LINKDOWN_RESET != 0) linkdown_cnt <= LINKDOWN_PULSE;   // K6
         end
       end
     endcase

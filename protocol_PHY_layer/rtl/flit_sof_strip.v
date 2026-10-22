@@ -20,6 +20,10 @@
 //
 // sof_out (new port): high together with the FIRST payload cycle after each
 // SOF, so downstream logic (pcie_phy_rx) can rebuild sof/eof per Flit.
+//
+// hunting (K6, new port): high while waiting for SOF, i.e. the current input
+// cycle is between Flits (logical idle or SOF). pcie_phy_rx uses it to check
+// that between-Flit bytes decode as IDL/SOF (symbol alignment still good).
 // -----------------------------------------------------------------------------
 module flit_sof_strip #(
 parameter PAYLOAD_CYCLES = 8,
@@ -37,7 +41,8 @@ output reg  [7:0] lane_out_1,
 output reg  [7:0] lane_out_2,
 output reg  [7:0] lane_out_3,
 output reg  [3:0] lane_valid_out,
-output reg        sof_out
+output reg        sof_out,
+output wire       hunting
 );
 
 localparam SOF_TOKEN = 8'hFB;
@@ -54,6 +59,7 @@ localparam CW = (PAYLOAD_CYCLES <= 2)   ? 1 :
 reg          state;
 reg [CW-1:0] payload_cnt;
 reg          first_cycle;   // next payload cycle is the first of a Flit
+assign hunting = (state == WAIT_SOF);
 
 wire is_sof_cycle = lane_in_valid &&
                      (lane_in_0 == SOF_TOKEN) && (lane_in_1 == SOF_TOKEN) &&
