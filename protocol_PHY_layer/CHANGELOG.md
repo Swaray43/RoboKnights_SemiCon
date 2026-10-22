@@ -160,6 +160,47 @@ Tested with the patch applied (Icarus 12):
 
 Without the patch, `bridge_top` doesn't build: `pcie_ltssm`, `rx_lane_deskew` and `ts_os_gen` aren't on its file list.
 
+## Update 9: ticket K6, leaving L0 on link loss ("Recovery-lite")
+
+**Problem:** once in L0, only `rst_n` (PERST# or hot reset) left it. If the receiver lost the signal, `link_trained`, `axi_rst_n` and the sessions all stayed high and data silently stopped.
+
+**Why "count `rx_level_valid` low" alone was not enough.** Two things in the PHY had to change first:
+1. **The TX lanes went quiet whenever there was no Flit data in L0.** `tx_level_valid` dropped to 0 when idle, so in loopback `rx_level_valid` low was the *normal* idle state; a counter would have dropped every idle link after 64 clocks.
+2. **Retraining needs a reset.** `rx_lane_deskew.locked` and `lane_reversal_latch` only clear on reset, and the link layer, which runs on `datapath_rst_n`, keeps its sequence, replay and credit state otherwise. A plain L0 → DETECT transition could not retrain, and stale DLL state would survive the outage.
+
+| Change | Where |
+|---|---|
+| **Logical idle in L0.** Every byte slot without a Flit byte carries `IDL_BYTE = 0x1B` on all 4 lanes, so the lanes are never quiet in L0 (the PCIe rule: IDLE Flits / logical idle). `0x1B` = symbols 0,1,2,3, so none of its symbol rotations (`0x6C`, `0xB1`, `0xC6`) is itself or SOF, and a slipped alignment can't hide. Idle never goes *inside* a Flit: `fl_left` counts payload lane-cycles exactly as `flit_sof_strip` does at the far end. A mid-Flit producer underrun stays quiet for up to `UNDERRUN_SLOTS = 8` slots, then sends IDL filler that counts as payload, so TX/RX framing stays in step and the far end doesn't see a dead link. That Flit is corrupt and link-layer CRC/replay recovers it; it never happens with `link_layer_tx`, which sends Flits back to back. `tx_idle` now means "no Flit data anywhere" rather than "lanes quiet". Parameter `L0_IDLE_FILL = 1`. | `rtl/pcie_phy_tx.v` |
+| **Between-Flit check on RX.** `flit_sof_strip` has a new `hunting` output. `pcie_phy_rx` outputs `gap_ok` (between Flits, all lanes IDL or all SOF) and `gap_bad` (anything else). | `rtl/flit_sof_strip.v`, `rtl/pcie_phy_rx.v` |
+| **LTSSM L0 exits.** After the RX is *armed* (first `gap_ok` in this L0), L0 → DETECT on: **(1) signal loss**, any lane's `rx_level_valid` low or `lane_err` for `LOSS_CLKS = 64` consecutive clocks; **(2) lost framing**, `GAP_ERR_MAX = 512` unframed between-Flit lane cycles with no clean one in between, which catches a short glitch that slipped the frozen byte boundary; **(3) partner retraining**, `L0_TS1_EXIT = 2` TS1s received on all lanes. TS2s are not counted, because the partner's last Configuration TS2s legitimately arrive after L0 entry. Before arming, exits 1 and 2 are off, so training through the `ts_byte_*` injection port with no lane traffic, as the 4 original cocotb tests do, never drops. Debug outputs: `l0_exit` pulse, `exit_reason` (1/2/3), `rx_armed` (wires `ltssm_l0_exit` / `ltssm_exit_reason` / `ltssm_rx_armed` in `pcie_phy_top`; no top-level port changes). `ltssm_state` is still 2 bits. | `rtl/pcie_ltssm.v`, `rtl/pcie_phy_top.v` |
+| **Link down resets the datapath.** When `link_trained` falls while LINK_UP and no hot reset is pending, `datapath_rst_n` pulses low for 3 clocks, exactly like a hot reset (an Upstream Port going DL_Down is reset). Deskew, lane order, link layer and function state start clean, the LTSSM retrains from DETECT, and `axi_rst_n` is held until re-training plus a fresh UpdateFC, as before. No deadlock: the pulse starts on a falling edge, ends on its own and never waits for `link_trained`. Parameters `LINKDOWN_RESET = 1`, `LINKDOWN_PULSE = 3`. | `rtl/pcie_reset_controller.v` |
+| **New top parameters** (defaults shown): `LTSSM_LOSS_CLKS = 64`, `LTSSM_GAP_ERR_MAX = 512`, `LTSSM_L0_TS1_EXIT = 2`, `L0_IDLE_FILL = 1`. `L0_IDLE_FILL = 0` gives the old quiet lanes and also turns exits 1 and 2 off. Exit 3 and the link-down reset stay; with this setting Parts A–I pass unchanged. | `rtl/pcie_phy_top.v` |
+
+**Why these thresholds survive channel noise.** Noise flips levels, not `rx_level_valid`, so exit 1 is immune. For exit 2, a noise hit that loses one SOF costs one Flit (at most 65 unframed cycles), and the count restarts at the next clean cycle. It would take about 8 SOFs lost in a row to reach 512. The rand suite's `+NOISE_PPM=1000` and `+NOISE_PPM=300 +BURST=4` seeds pass with no link drop (see below).
+
+**New tests**
+- `tb_pcie_phy_top` **Part K** (33 checks; bench now 118 checks):
+  - **K0**: lanes carry idle in L0 and the RX arms.
+  - **K1**: a 32-clk dropout (< `LOSS_CLKS`, whole bytes) is tolerated, with no reset, the session kept and data bit-exact.
+  - **K2**: a 7-clk dropout slips the symbol alignment. It's detected as lost framing about 2,060 clk later, then the link resets, retrains and data is bit-exact.
+  - **K3**: cable pull mid-session with Flits in flight. L0 is left 65 clk later on signal loss. There's one datapath reset pulse; `axi_rst_n` goes low; sessions and the Command register are cleared. While pulled, Polling keeps sending TS1 with no reset storm. With the cable back, the link retrains (about 1,700 clk), AXI waits for a fresh UpdateFC, the host re-configures, there's one new session start and data is bit-exact with nothing stale.
+  - **K4**: one lane lost drops the link, which retrains when the lane returns.
+  - **K5**: 3 TS2s in L0 keep the link up; 2 TS1s drop it, and it retrains.
+  - **A6** now also checks the lanes are never quiet in L0 (including producer stalls) and that there's no spurious L0 exit.
+- `tb_pcie_reset_controller` Test 5: an unexpected link-down pulses `datapath_rst_n` for 2–4 clk, which then releases on its own.
+- cocotb **`test_link_loss_retrain`**: cable pull via the Python channel (`bfm.lane_cut`). Link down within 72 clk, AXI reset, sessions cleared, stays down while pulled; cable back → retrain → bit-exact data. cocotb is now **10 / 10**.
+
+**Cost**
+- About +400 cells (+1.8%) in `yosys synth -top pcie_phy_top`, 0 latches, 0 `check` problems.
+- A Flit byte may wait up to 3 clk for the next byte slot: A6 measures 10,418 clk for 40 Flits versus 10,416, so the drain rate is still 260 clk per Flit.
+- Wire-level counters such as `bridge_top/tb/perf_monitor.v`'s PAM4-symbol stage (`hit(4)`, `tx_level_valid`) now include idle bytes and read as line rate throughout L0.
+
+**For others (not applied, outside `protocol_PHY_layer/`)**
+- **`ci/protected_lines.txt`:** add the K6 rules in `integration/K6_protected_lines.patch` (`git apply` from the repo root).
+- **Aditya, F7b in `tb_bridge_rand`:** pull the cable by masking the loopback valid (`.rx_level_valid(lvl_v & ~cut)`). Expect `link_trained` to fall within about 70 clk and `datapath_rst_n` to pulse (the same as F7, so the F7 recovery path applies). Keep `cut` until you want the link back. Training resumes on its own, so re-configure after `link_trained` returns. The header line "Not modelled ... link down without hot reset" can go.
+- **Aditya / Swaray, `tb_bridge_rand` far above CI noise (FYI, pre-existing, not K6):** at `+NOISE_PPM=3000` or `+NOISE_PPM=2000 +BURST=3`, F8 ("after unmask n of m MSI-X") and F9 (inbound BAR0 write not read back) can fail. **The original step3 RTL fails the same way:** baseline `+SEED=16 +NOISE_PPM=2000 +BURST=3 +SESS_MAX=3 +BEATS_MAX=15` gives F8 "after unmask 0 of 2 MSI-X". With K6 there were no link drops (`pcie_ltssm` logs every one) and no framing errors. In K6 seed 12 at 3000 ppm the late MSI-X did arrive (10/10). In K6 seed 14 (2000 ppm, burst 3) a probe showed the inbound MWr to BAR0+0x28 never reached the RX link layer within F9's 2M-clk wait, while other TLPs kept flowing. The ch1 session then ran on the old base, so 13 TLPs show as "mismatched" by address with correct data. That points at link-layer replay or flow control under heavy burst errors, not the PHY (every Flit is CRC-64 checked). All CI noise settings pass.
+- **`perf_monitor.v` stage 4 (PAM4 symbols)** now counts logical idle, so it reads line rate throughout L0. If you want Flit-only wire bytes, count only cycles outside idle (the TX `byte_is_idl` flag) or use stage 3.
+
 ## Design decisions to confirm
 
 1. **SOF once per 256-byte Flit (the PCIe meaning).** TX inserts SOF before each word that arrives with `flit_sof=1`, and RX expects `WORDS_PER_FLIT=8` words after each SOF. `flit_sof_strip` gained `PAYLOAD_CYCLES` (8 = old per-word behaviour, which is still the default for its unit test; 64 in the top). It also gained `RESYNC_MIDFLIT=0` in the top, so payload containing 0xFB on all 4 lanes no longer resyncs. That was the old "known limitation", and the benches now push all-0xFB words through to prove it.
@@ -183,7 +224,7 @@ Without the patch, `bridge_top` doesn't build: `pcie_ltssm`, `rx_lane_deskew` an
 
 ## Not done / known gaps
 
-- **The LTSSM is simplified.** Not modelled: Recovery, L0s/L1/L2 power states, speed change / equalization, and link/lane-number negotiation (lane numbers are fixed per physical lane).
+- **The LTSSM is simplified.** Not modelled: a real Recovery state (K6 leaves L0 through DETECT with a datapath reset, i.e. DL_Down, instead of a TS1/TS2 exchange that keeps the link up), L0s/L1/L2 power states, speed change / equalization, and link/lane-number negotiation (lane numbers are fixed per physical lane).
 - **Lane skew must stay under 32 clk (8 bytes) between the earliest and latest lane.** COM repeats every 16 bytes, so larger skew aliases onto the wrong ordered set and can't be detected from TS1 alone. Real PCIe skew limits are far smaller.
 
 ## Files deleted (now in `rtl/`, `tb/` or `formal/`)
@@ -198,7 +239,7 @@ Without the patch, `bridge_top` doesn't build: `pcie_ltssm`, `rx_lane_deskew` an
 python run_all.py                  # all 24 Verilog benches (Icarus); Windows/macOS/Linux
 python run_all.py tb_pcie_phy_top  # one bench
 ./run_all.sh                       # same thing, wrapper for bash users
-cd cocotb && python3 run_tests.py  # 9 cocotb tests (or: make)
+cd cocotb && python3 run_tests.py  # 10 cocotb tests (or: make)
 cd formal && sby -f gray.sby       # also pam4.sby, verify_sof_strip.sby
 ```
 

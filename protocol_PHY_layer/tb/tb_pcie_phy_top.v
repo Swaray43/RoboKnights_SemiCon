@@ -26,6 +26,18 @@
 //   Part I  no partner: Polling times out to Detect, retries, then trains
 //   Part G  per-lane channel skew (up to 30 clk, odd amounts, also with
 //           crossed lanes): deskew on COM, train, data bit-exact
+//   Part K  (K6) link loss in L0 - "Recovery-lite":
+//     K0  lanes carry logical idle in L0 (never quiet), RX checks arm
+//     K1  a 32-clk dropout (< LOSS_CLKS, whole bytes) is tolerated
+//     K2  a 7-clk dropout slips the symbol alignment: lost framing between
+//         Flits is detected, link drops and retrains
+//     K3  cable pull mid-session (all lanes, data in flight): L0 exit on
+//         signal loss, datapath reset (sessions, config, AXI), LTSSM keeps
+//         retrying while pulled; cable back -> retrain, fresh UpdateFC,
+//         host re-configures, clean session and data bit-exact
+//     K4  one lane lost: link drops, retrains after it returns
+//     K5  partner retraining: TS1s received in L0 -> link drops; trailing
+//         TS2s in L0 do NOT drop it
 // =============================================================================
 `timescale 1ns/1ps
 `default_nettype none
@@ -101,6 +113,7 @@ pcie_phy_top dut (
 // ---------------------------------------------------------------------------
 reg cross_lanes;
 reg chan_on;             // 0 = channel not connected yet (receiver sees nothing)
+reg [3:0] lane_kill = 4'b0000;   // K6: per-lane signal loss (receiver lane i sees nothing)
 reg [5:0] skew_l0, skew_l1, skew_l2, skew_l3;
 integer h;
 // lane i of the wire after crossing, before skew
@@ -123,7 +136,7 @@ always @(*) begin
     rx_level_valid = 4'b0000;
   end else begin
     rx_level       = {r3[2:0], r2[2:0], r1[2:0], r0[2:0]};
-    rx_level_valid = {r3[3] === 1'b1, r2[3] === 1'b1, r1[3] === 1'b1, r0[3] === 1'b1};
+    rx_level_valid = {r3[3] === 1'b1, r2[3] === 1'b1, r1[3] === 1'b1, r0[3] === 1'b1} & ~lane_kill;
   end
 end
 
@@ -143,7 +156,26 @@ always @(posedge clk) begin
   if (&dut.osv &&  (&dut.ost2)) seen_ts2 = seen_ts2 + 1;
 end
 
+// ---------------------------------------------------------------------------
+// K6 monitors: L0 exits (with reason), datapath reset pulses, quiet TX lanes in L0
+// ---------------------------------------------------------------------------
+integer   l0_exits = 0, dp_resets = 0, l0_quiet_clks = 0;
+reg [1:0] last_exit_reason = 0;
+reg       dp_rst_d = 1;
+always @(posedge clk) begin
+  if (dut.ltssm_l0_exit) begin
+    l0_exits = l0_exits + 1;
+    last_exit_reason = dut.ltssm_exit_reason;
+  end
+  dp_rst_d <= datapath_rst_n;
+  if (dp_rst_d && !datapath_rst_n && perst_n) dp_resets = dp_resets + 1;
+  // TX side of L0: every clock must carry a symbol on all 4 lanes
+  if (perst_n && datapath_rst_n && ltssm_state == 2'd3 && tx_level_valid != 4'b1111)
+    l0_quiet_clks = l0_quiet_clks + 1;
+end
+
 integer errors = 0;
+localparam LOSS_WAIT = 2000;
 task check(input cond, input [8*96-1:0] msg);
   begin
     if (cond) $display("PASS: %0s", msg);
@@ -304,9 +336,56 @@ task skew_test(input [5:0] s0, input [5:0] s1, input [5:0] s2, input [5:0] s3,
   end
 endtask
 
+// K6: play a link partner that is retraining: inject one TS1 or TS2 ordered
+// set on all 4 lanes through the ts_byte_* port (1 byte per clk per lane).
+reg  [3:0] inj_idx = 0;
+reg        inj_ts2 = 0;
+wire [7:0] inj_b0, inj_b1, inj_b2, inj_b3;
+ts_os_gen u_inj (.idx(inj_idx), .ts2(inj_ts2),
+                 .byte_l0(inj_b0), .byte_l1(inj_b1), .byte_l2(inj_b2), .byte_l3(inj_b3));
+task inject_os(input is_ts2);
+  integer k;
+  begin
+    inj_ts2 = is_ts2;
+    for (k = 0; k < 16; k = k + 1) begin
+      inj_idx = k;
+      #1;
+      ts_byte_l0 = inj_b0; ts_byte_l1 = inj_b1; ts_byte_l2 = inj_b2; ts_byte_l3 = inj_b3;
+      ts_byte_valid = 1;
+      @(negedge clk);
+    end
+    ts_byte_valid = 0;
+  end
+endtask
+
+task wait_trained(input integer max_clk);
+  begin
+    train_clk = 0;
+    while (!link_trained && train_clk < max_clk) begin @(negedge clk); train_clk = train_clk + 1; end
+  end
+endtask
+
+task wait_l0_exit(input integer max_clk, output integer took);
+  integer e0;
+  begin
+    e0 = l0_exits; took = 0;
+    while (l0_exits == e0 && took < max_clk) begin @(negedge clk); took = took + 1; end
+  end
+endtask
+
+// UpdateFC + the host's minimum re-configuration after a (re)train
+task host_config;
+  begin
+    repeat (3) @(negedge clk);
+    updatefc_received = 1; @(negedge clk); updatefc_received = 0; @(negedge clk);
+    cfg_write(12'h004, 32'h0000_0006);          // Memory Space + Bus Master
+    cfg_write(12'h050, 32'h8000_0000);          // MSI-X enable
+  end
+endtask
+
 // ---------------------------------------------------------------------------
 reg [31:0] rd;
-integer t_start, t_end, i, base_wr_seen;
+integer t_start, t_end, i, base_wr_seen, took, quiet0, starts0;
 initial begin
   cross_lanes = 0; stall_cycles = 0; chan_on = 1;
   skew_l0 = 0; skew_l1 = 0; skew_l2 = 0; skew_l3 = 0;
@@ -320,6 +399,9 @@ initial begin
   check(phy_ts_sending === 1'b0,        "A1 TX stopped sending ordered sets in L0");
   check(axi_rst_n === 1'b1,             "A1 axi_rst_n released after UpdateFC");
   check(phy_tx_ready === 1'b1,          "A1 phy_tx_ready high once datapath is out of reset");
+
+  // K6: from here to the end of A6 the TX lanes must never be quiet in L0
+  quiet0 = l0_quiet_clks;
 
   // ---- A2: BAR0 ----
   // A real host enables Memory Space and MSI-X before using either.
@@ -416,6 +498,9 @@ initial begin
   check(((t_end - t_start) / 10 / 40) <= 266, "A6 drain rate within 4% of the 260-clk floor");
   repeat (20) @(negedge clk);
   check(phy_tx_idle === 1'b1,           "A6 TX path idle after drain");
+  check(l0_quiet_clks == quiet0 && tx_level_valid === 4'b1111,
+        "A6 (K6) TX lanes never quiet in L0: logical idle between Flits, incl. stalls");
+  check(dut.ltssm_rx_armed === 1'b1 && l0_exits == 0, "A6 (K6) RX link-loss checks armed, no spurious L0 exit");
 
   // =================== Part F: config-space gating (#3) ===================
   // F1: MSI-X table/PBA location advertised in config space
@@ -566,6 +651,128 @@ initial begin
   train_clk = 0;
   while (!link_trained && train_clk < 6000) begin @(negedge clk); train_clk = train_clk + 1; end
   check(link_trained === 1'b1 && !ltssm_bad_jump, "I3 partner appears -> link trains, only legal LTSSM transitions");
+
+  // =================== Part K (K6): link loss in L0 ===================
+  // K0: fresh link with channel skew, host configures, a session is armed.
+  skew_test(6'd3, 6'd9, 6'd0, 6'd14, 1'b0, "K0 link up with skew");
+  host_config;
+  bar0_write(12'h020, 32'h5555_0000); bar0_write(12'h024, 32'h0000_0001);
+  bar0_write(12'h000, 32'h1);
+  repeat (8) @(negedge clk);
+  check(axi_rst_n === 1'b1 && session_valid[0] === 1'b1, "K0 AXI out of reset, session armed on ch0");
+  quiet0 = l0_quiet_clks;
+  repeat (400) @(negedge clk);
+  check(l0_quiet_clks == quiet0 && dut.ltssm_rx_armed === 1'b1,
+        "K0 idle L0: lanes carry logical idle (never quiet), RX checks armed");
+
+  // K1: a 32-clk dropout on all lanes (8 whole bytes lost, < LOSS_CLKS)
+  l0_exits = 0; dp_resets = 0;
+  chan_on = 0; repeat (32) @(negedge clk); chan_on = 1;
+  repeat (300) @(negedge clk);
+  check(link_trained === 1'b1 && l0_exits == 0 && dp_resets == 0 && session_valid[0] === 1'b1,
+        "K1 32-clk dropout (< LOSS_CLKS) tolerated: still L0, no reset, session kept");
+  exp_wr = 0; exp_rd = 0; rx_bad = 0;
+  push_flits(2, 1);
+  wait_rx_drain(3000);
+  check(exp_rd == 16 && rx_bad == 0, "K1 2 Flits bit-exact after the short dropout");
+
+  // K2: a 7-clk dropout - too short for signal loss, but 7 symbols is not a
+  // whole byte, so the frozen byte boundary has slipped. Nothing between
+  // Flits decodes as IDL/SOF any more -> lost-framing exit, then retrain.
+  l0_exits = 0; dp_resets = 0;
+  chan_on = 0; repeat (7) @(negedge clk); chan_on = 1;
+  repeat (100) @(negedge clk);
+  check(link_trained === 1'b1 && l0_exits == 0, "K2 7-clk dropout: no signal-loss exit (shorter than LOSS_CLKS)");
+  wait_l0_exit(4000, took);
+  $display("INFO: K2 lost framing detected %0d clk after the slip", took + 107);
+  check(l0_exits == 1 && last_exit_reason == 2'd2, "K2 slipped alignment -> L0 left for lost framing (reason 2)");
+  repeat (5) @(negedge clk);
+  check(dp_resets == 1 && axi_rst_n === 1'b0 && session_valid === 2'b00,
+        "K2 link down -> datapath reset pulse, AXI reset, session cleared");
+  wait_trained(5000);
+  check(link_trained === 1'b1 && phy_deskew_locked === 1'b1, "K2 link retrains on its own (alignment recovered)");
+  host_config;
+  exp_wr = 0; exp_rd = 0; rx_bad = 0;
+  push_flits(2, 1);
+  wait_rx_drain(3000);
+  check(exp_rd == 16 && rx_bad == 0, "K2 2 Flits bit-exact after the retrain");
+
+  // K3: cable pull in the middle of a session with Flits in flight.
+  bar0_write(12'h020, 32'h7777_0000); bar0_write(12'h024, 32'h0000_0002);
+  bar0_write(12'h000, 32'h1);
+  repeat (8) @(negedge clk);
+  check(session_valid[0] === 1'b1 && axi_rst_n === 1'b1, "K3 session active before the cable pull");
+  l0_exits = 0; dp_resets = 0;
+  exp_wr = 0; exp_rd = 0; rx_bad = 0;
+  fork
+    push_flits(4, 0);                           // producer keeps going; data is lost by design
+    begin
+      repeat (300) @(negedge clk);              // mid-Flit
+      chan_on = 0;
+      wait_l0_exit(LOSS_WAIT, took);
+    end
+  join
+  $display("INFO: K3 L0 left %0d clk after the cable pull", took);
+  check(l0_exits == 1 && last_exit_reason == 2'd1 && took <= 64 + 8,
+        "K3 cable pull -> L0 left on signal loss within LOSS_CLKS (reason 1)");
+  repeat (5) @(negedge clk);
+  check(link_trained === 1'b0 && dp_resets == 1, "K3 link_trained drops, datapath_rst_n pulsed (like hot reset)");
+  check(axi_rst_n === 1'b0 && session_valid === 2'b00, "K3 AXI held in reset, sessions cleared");
+  cfg_read(12'h004, rd);
+  check(rd[2:1] == 2'b00, "K3 function state reset: Command register cleared, host must re-configure");
+  repeat (3000) @(negedge clk);                 // cable stays out
+  check(link_trained === 1'b0 && ltssm_state === 2'd1 && phy_ts_sending === 1'b1 && dp_resets == 1,
+        "K3 while pulled: LTSSM stays out of L0, Polling sends TS1, no reset storm");
+  check(axi_rst_n === 1'b0, "K3 AXI still in reset while the cable is out");
+  exp_wr = 0; exp_rd = 0; rx_bad = 0;           // everything sent before the pull is gone
+  chan_on = 1;
+  wait_trained(17000);                          // may have to wait out one Polling timeout
+  $display("INFO: K3 retrained %0d clk after the cable came back", train_clk);
+  check(link_trained === 1'b1 && phy_deskew_locked === 1'b1 && !ltssm_bad_jump,
+        "K3 cable back -> link retrains to L0 over the lanes");
+  repeat (3) @(negedge clk);
+  check(axi_rst_n === 1'b0, "K3 AXI stays in reset until a fresh UpdateFC");
+  starts0 = start_cnt0;
+  host_config;
+  check(axi_rst_n === 1'b1, "K3 fresh UpdateFC releases AXI");
+  bar0_write(12'h020, 32'h9999_0000); bar0_write(12'h024, 32'h0000_0003);
+  bar0_write(12'h000, 32'h1);
+  repeat (8) @(negedge clk);
+  check(session_valid[0] === 1'b1 && cfg_base_addr_ch0 == 64'h0000_0003_9999_0000 && start_cnt0 == starts0 + 1,
+        "K3 host re-configures: clean new session (new base, one start pulse)");
+  push_flits(3, 1);
+  wait_rx_drain(4000);
+  check(exp_rd == 24 && rx_bad == 0 && phy_lane_err === 1'b0, "K3 3 Flits bit-exact after the re-train, nothing stale");
+
+  // K4: one lane lost (lane 2), others fine
+  l0_exits = 0; dp_resets = 0;
+  lane_kill = 4'b0100;
+  wait_l0_exit(LOSS_WAIT, took);
+  check(l0_exits == 1 && last_exit_reason == 2'd1, "K4 single lane lost -> L0 left on signal loss");
+  repeat (500) @(negedge clk);
+  check(link_trained === 1'b0, "K4 no retrain while a lane is missing");
+  lane_kill = 4'b0000;
+  wait_trained(17000);
+  check(link_trained === 1'b1 && !ltssm_bad_jump, "K4 lane back -> link retrains");
+  host_config;
+  exp_wr = 0; exp_rd = 0; rx_bad = 0;
+  push_flits(2, 0);
+  wait_rx_drain(3000);
+  check(exp_rd == 16 && rx_bad == 0, "K4 data bit-exact after the retrain");
+
+  // K5: the partner went back to Polling (sends TS1). TS2s alone (as at the
+  // end of Configuration) must NOT drop the link; TS1s must.
+  repeat (100) @(negedge clk);
+  l0_exits = 0; dp_resets = 0;
+  inject_os(1); inject_os(1); inject_os(1);
+  repeat (50) @(negedge clk);
+  check(link_trained === 1'b1 && l0_exits == 0, "K5 three TS2s received in L0: link stays up");
+  inject_os(0); inject_os(0);
+  repeat (5) @(negedge clk);
+  check(l0_exits == 1 && last_exit_reason == 2'd3 && link_trained === 1'b0,
+        "K5 two TS1s received in L0 (partner retraining) -> L0 left (reason 3)");
+  wait_trained(17000);
+  check(link_trained === 1'b1 && !ltssm_bad_jump, "K5 link retrains with the partner");
 
   if (errors == 0) $display("ALL PASS: pcie_phy_top");
   else             $display("TOTAL FAILURES: %0d", errors);
