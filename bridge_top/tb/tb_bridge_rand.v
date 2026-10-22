@@ -39,8 +39,25 @@
 //       by an inbound MWr through the link -- a 1-DW DMA on ch0 aimed at BAR0
 //       (BAR0 = 0x8000_0000) -- instead of the test port, then read back. For
 //       ch1's base the data TLPs only land at the right address if it worked.
-//   Not modelled in the RTL, so not tested: link down without hot reset
-//   (pcie_ltssm has no Recovery state; L0 is left only via reset).
+//   F7b link drop without hot reset (K6; +LINKDROP_PCT, default 10% of
+//       sessions), at a random point of a session, one of:
+//         cable pull  rx_level_valid low on all lanes for 200..5000 clk. The
+//                     LTSSM must leave L0 (signal loss) while the cable is
+//                     out; after it is back the link retrains, the host
+//                     re-configures, nothing stale arrives, later sessions
+//                     are clean. A pull that does not drop the link FAILS.
+//         glitch      rx_level_valid low for 2..40 clk (< LOSS_CLKS). Either
+//                     outcome is legal (survive with replays, or lost framing
+//                     -> link down -> retrain), but data must never be wrong.
+//       Any link drop with no pull/glitch/hot reset in progress FAILS (e.g.
+//       channel noise must not take the link down).
+//
+// Step 3 C coverage: every run prints one "COV:" line of bin counters
+// (BAR0 register writes/reads, 4 KB split / no split, last-beat sizes,
+// contested arbiter wins per weight, credit stalls, FEC/CRC/replay, MSI-X
+// masks, hot resets, link drops by reason, overflow, lane order, inbound BAR0
+// writes). ci/coverage_report.py merges them over all seeds and fails if a
+// required bin stayed empty.
 //
 // Reference model, per accepted beat at address A with N bytes:
 //   one MWr of N bytes, or -- if [A, A+N) crosses a 4 KB boundary -- two MWrs:
@@ -49,7 +66,7 @@
 // plusargs: +SEED=n (default 1)  +SESS_MAX=n (6)  +BEATS_MAX=n (40)
 //           +GAP_MAX=pct (60)  +NOISE_PPM=n (0)  +BURST=k (1)  +OVF_PCT=p (20)
 //           +REVERSE=0/1 (random)  +HOTRESET_PCT=p (10)  +MASK_PCT=p (20)
-//           +HOSTWR_PCT=p (30)  +VERBOSE=1
+//           +HOSTWR_PCT=p (30)  +LINKDROP_PCT=p (10)  +VERBOSE=1
 // Ends with RESULT: PASS / RESULT: FAIL and prints the seed to replay it.
 // ============================================================
 module tb_bridge_rand;
@@ -59,7 +76,7 @@ module tb_bridge_rand;
     always #2   clk  = ~clk;     // 250 MHz
     always #2.7 aclk = ~aclk;    // ~185 MHz, unrelated
 
-    integer SEED, SEED0, SESS_MAX, BEATS_MAX, GAP_MAX, VERBOSE, NOISE_PPM, BURST, OVF_PCT, REVERSE, HOTRESET_PCT, MASK_PCT, HOSTWR_PCT;
+    integer SEED, SEED0, SESS_MAX, BEATS_MAX, GAP_MAX, VERBOSE, NOISE_PPM, BURST, OVF_PCT, REVERSE, HOTRESET_PCT, MASK_PCT, HOSTWR_PCT, LINKDROP_PCT;
     localparam [31:0] BAR0 = 32'h8000_0000;
     reg bar0_rd_en = 0; wire [31:0] bar0_rdata; wire bar0_rd_valid; reg tbl_wr_mask = 0;
     reg hot_reset_request = 0;
@@ -80,6 +97,8 @@ module tb_bridge_rand;
     reg tbl_wr_en = 0; reg [2:0] tbl_wr_vec = 0; reg [63:0] tbl_wr_addr = 0; reg [31:0] tbl_wr_data = 0;
 
     wire [11:0] lvl; wire [3:0] lvl_v;
+    reg  cable_cut = 0;                        // F7b: receiver sees no signal on any lane
+    wire [3:0] rx_v = cable_cut ? 4'b0000 : lvl_v;
     wire err_xlat_miss, err_addr_ovf, crc_err, fec_err, phy_framing_err, phy_lane_err;
 
     bridge_top dut (
@@ -99,7 +118,7 @@ module tb_bridge_rand;
         .bar0_rdata(bar0_rdata), .bar0_rd_valid(bar0_rd_valid),
         .tbl_wr_en(tbl_wr_en), .tbl_wr_vec(tbl_wr_vec), .tbl_wr_addr(tbl_wr_addr),
         .tbl_wr_data(tbl_wr_data), .tbl_wr_mask(tbl_wr_mask),
-        .tx_level(lvl), .tx_level_valid(lvl_v), .rx_level(rx_lvl), .rx_level_valid(lvl_v),   // SerDes loopback + F4 noise
+        .tx_level(lvl), .tx_level_valid(lvl_v), .rx_level(rx_lvl), .rx_level_valid(rx_v),   // SerDes loopback + F4 noise + F7b pull
         .err_xlat_miss(err_xlat_miss), .err_addr_ovf(err_addr_ovf), .crc_err(crc_err), .fec_err(fec_err),
         .phy_framing_err(phy_framing_err), .phy_lane_err(phy_lane_err)
     );
@@ -149,6 +168,48 @@ module tb_bridge_rand;
         if (fec_err) n_fec_bad = n_fec_bad + 1;
         if (crc_err) n_crc = n_crc + 1;
         if (dut.u_lpb.replay_event) n_replay = n_replay + 1;
+    end
+
+    // ---------------- Step 3 C: coverage monitors ----------------
+    integer cv_wr [0:15], cv_rd [0:15];       // BAR0 0x000-0x02C by DW index (test port + inbound MWr)
+    integer cv_win0 [1:7], cv_win1 [1:7];     // contested arbiter grants won, by the winner's weight
+    integer cv_credit_stall = 0, cv_stall_ep = 0, cv_framing = 0, cv_lane = 0, cv_pba_rd = 0, cv_xlat = 0;
+    integer cv_hw [1:3];                      // F9 inbound BAR0 writes by kind (weights, TC, ch1 base)
+    reg     stall_q = 0, fr_q = 0, ln_q = 0;
+    initial begin
+        for (nl = 0; nl < 16; nl = nl + 1) begin cv_wr[nl] = 0; cv_rd[nl] = 0; end
+        for (nl = 1; nl <= 7; nl = nl + 1) begin cv_win0[nl] = 0; cv_win1[nl] = 0; end
+        for (nl = 1; nl <= 3; nl = nl + 1) cv_hw[nl] = 0;
+    end
+    always @(posedge clk) begin : cov_clk
+        reg st;
+        if (dut.u_lpb.u_pcie_phy_top.u_bar0.bar0_wr_en === 1'b1 && dut.u_lpb.u_pcie_phy_top.u_bar0.bar0_addr[11:6] == 0)
+            cv_wr[dut.u_lpb.u_pcie_phy_top.u_bar0.bar0_addr[5:2]] = cv_wr[dut.u_lpb.u_pcie_phy_top.u_bar0.bar0_addr[5:2]] + 1;
+        if (dut.u_lpb.u_pcie_phy_top.u_bar0.bar0_rd_en === 1'b1 && dut.u_lpb.u_pcie_phy_top.u_bar0.bar0_addr[11:6] == 0)
+            cv_rd[dut.u_lpb.u_pcie_phy_top.u_bar0.bar0_addr[5:2]] = cv_rd[dut.u_lpb.u_pcie_phy_top.u_bar0.bar0_addr[5:2]] + 1;
+        st = (dut.u_lpb.u_link_layer_top.u_stream_tx_path_top.credit_alloc_valid === 1'b1)
+          && (dut.u_lpb.u_link_layer_top.u_stream_tx_path_top.credit_grant !== 1'b1);
+        if (st) cv_credit_stall = cv_credit_stall + 1;
+        if (st && !stall_q) cv_stall_ep = cv_stall_ep + 1;
+        stall_q = st;
+        if (phy_framing_err === 1'b1 && !fr_q) cv_framing = cv_framing + 1;
+        if (phy_lane_err === 1'b1 && !ln_q) cv_lane = cv_lane + 1;
+        fr_q = (phy_framing_err === 1'b1); ln_q = (phy_lane_err === 1'b1);
+        if (err_xlat_miss === 1'b1) begin
+            cv_xlat = cv_xlat + 1;
+            if (VERBOSE && cv_xlat < 4) $display("[%0t] translation miss (err_xlat_miss) #%0d", $time, cv_xlat);
+        end
+    end
+    always @(posedge aclk) begin : cov_arb
+        integer w;
+        if (dut.u_ic.u_arb.req0 === 1'b1 && dut.u_ic.u_arb.req1 === 1'b1) begin
+            if (dut.u_ic.u_arb.grant0 === 1'b1) begin
+                w = dut.u_ic.u_arb.weight0; if (w >= 1 && w <= 7) cv_win0[w] = cv_win0[w] + 1;
+            end
+            if (dut.u_ic.u_arb.grant1 === 1'b1) begin
+                w = dut.u_ic.u_arb.weight1; if (w >= 1 && w <= 7) cv_win1[w] = cv_win1[w] + 1;
+            end
+        end
     end
 
     // ---------------- random helpers ----------------
@@ -210,6 +271,7 @@ module tb_bridge_rand;
     reg  [31:0] got [0:63];
     integer got_n = 0, ok = 0, bad = 0, extra = 0, k;
     integer n_bar0_tlp = 0;          // F9
+    integer xl_n = 0, xl_b0 = 0;     // Step 3 C: inbound TLPs since XLAT_MISS was last cleared (other / BAR0)
     reg rx_ignore = 0;               // F7: between a hot reset and the end of re-configuration
     integer n_ignored = 0;
     always @(posedge clk) if (rx_tvalid && rx_ignore) begin
@@ -222,6 +284,7 @@ module tb_bridge_rand;
             reg [63:0] a; integer ch, ndw, m, i; reg b;
             a   = {got[2], got[3]};
             ndw = got[0][9:0];
+            if (a[63:16] == {32'h0, BAR0[31:16]}) xl_b0 = xl_b0 + 1; else xl_n = xl_n + 1;
             if (ndw == 1 && (a == msix_addr_of(0) || a == msix_addr_of(1))) begin
                 ch = (a == msix_addr_of(0)) ? 0 : 1;
                 msix_seen = msix_seen + 1;
@@ -258,7 +321,10 @@ module tb_bridge_rand;
     task cfg_write(input [11:0] a, input [31:0] d); begin
         @(negedge clk); cfg_addr = a; cfg_wdata = d; cfg_wr_en = 1; @(negedge clk); cfg_wr_en = 0;
     end endtask
+    reg [31:0] mir0 = 0, mir1 = 0; reg mir0_ok = 0, mir1_ok = 0;   // Step 3 C: last base written
     task bar0_write(input [15:0] a, input [31:0] d); begin
+        if (a == 16'h0020) begin mir0 = d; mir0_ok = 1; end
+        if (a == 16'h0028) begin mir1 = d; mir1_ok = 1; end
         @(negedge clk); bar0_addr = a; bar0_wdata = d; bar0_wr_en = 1; @(negedge clk); bar0_wr_en = 0;
     end endtask
     task msix_entry(input [2:0] v, input [63:0] a, input [31:0] d); begin
@@ -282,7 +348,7 @@ module tb_bridge_rand;
 
     // one channel's session on aclk: random beat count, last-beat size, gaps (F1)
     integer leaked = 0, n_ovf = 0, n_hotreset = 0;
-    integer n_mask = 0, n_fmask = 0, mask_err = 0, n_hostwr = 0, hostwr_err = 0;
+    integer n_mask = 0, n_fmask = 0, mask_err = 0, n_hostwr = 0, hostwr_err = 0, reg_err = 0;
     reg     abort_all = 0;            // F7: hot reset -> fabric stops driving
     integer limit_now = 24'hFF_FFFF;  // F5: current session byte limit
     task automatic run_channel(input integer ch, input integer s, input integer nbeats,
@@ -332,9 +398,33 @@ module tb_bridge_rand;
         end
     endtask
 
+    // ---------------- F7b: link-drop watcher ----------------
+    // A falling link_trained outside a hot reset is only legal while a cable
+    // pull or glitch is in progress (drop_ok). Then the fabric stops and the
+    // session recovers like F7; otherwise it is a FAIL.
+    reg     drop_ok = 0, watch_on = 0, lt_q = 0;
+    integer n_cut = 0, n_glitch = 0, n_glitch_drop = 0, n_drop = 0, drop_err = 0;
+    integer n_exit [0:3];
+    initial for (nl = 0; nl < 4; nl = nl + 1) n_exit[nl] = 0;
+    always @(posedge clk) begin
+        if (watch_on && lt_q === 1'b1 && link_trained === 1'b0 && !abort_all) begin
+            if (!drop_ok) begin
+                drop_err = drop_err + 1;
+                $display("[%0t] F7b FAIL: link went down with no cable pull, glitch or hot reset", $time);
+            end
+            n_drop = n_drop + 1;
+            rx_ignore = 1; abort_all = 1;
+            if (VERBOSE) $display("[%0t] F7b: link down, fabric stops", $time);
+        end
+        lt_q = link_trained;
+        if (dut.u_lpb.u_pcie_phy_top.u_ltssm.l0_exit === 1'b1)
+            n_exit[dut.u_lpb.u_pcie_phy_top.u_ltssm.exit_reason] = n_exit[dut.u_lpb.u_pcie_phy_top.u_ltssm.exit_reason] + 1;
+    end
+
     // ---------------- main ----------------
     integer s, t0, cyc, nsess, w0, w1, arm, nb0, nb1, ld0, ld1, g0, g1, i, hr, hr_at;
     integer mk, mk_ch, mk_fn, hw, msix_before, hr_hit; reg [31:0] pba;
+    integer ld, ld_at, ld_kind, ld_len, ld_t, rg, n_s13 = 0; reg [31:0] rv; reg [7:0] rb8;
 
     // F9: write one BAR0 register through the link: a 1-beat, 1-DW session on
     // ch0 whose DMA address is BAR0 + off. Its own MSI-X is accounted for.
@@ -351,6 +441,7 @@ module tb_bridge_rand;
             @(posedge aclk); while (!s0_tready) @(posedge aclk);
             @(negedge aclk); s0_tvalid = 0; s0_tlast = 0;
             msix_expected = msix_expected + 1;
+            if (off == 16'h0028) begin mir1 = val; mir1_ok = 1; end
             while (dut.u_lpb.u_pcie_phy_top.session_valid[0] !== 1'b0) @(posedge clk);
             // the write lands when its TLP comes back through the link (slow under noise):
             // wait until the checker has seen it, then let the RX decode finish
@@ -379,6 +470,8 @@ module tb_bridge_rand;
         msix_entry(6, msix_addr_of(1), msix_data_of(1));
         bar0_write(16'h0010, 32'h0000_0602);       // MSI-X vector ch0=2 ch1=6
         bar0_write(16'h000C, 32'h00FF_FFFF);
+        bar0_write(16'h001C, 32'h0);               // XLAT_MISS: start counting from 0
+        xl_n = 0; xl_b0 = 0;
     end endtask
     initial begin
         if (!$value$plusargs("SEED=%d", SEED)) SEED = 1;
@@ -394,6 +487,7 @@ module tb_bridge_rand;
         if (!$value$plusargs("REVERSE=%d", REVERSE)) REVERSE = -1;
         if (!$value$plusargs("MASK_PCT=%d", MASK_PCT)) MASK_PCT = 20;
         if (!$value$plusargs("HOSTWR_PCT=%d", HOSTWR_PCT)) HOSTWR_PCT = 30;
+        if (!$value$plusargs("LINKDROP_PCT=%d", LINKDROP_PCT)) LINKDROP_PCT = 10;
         // decorrelate neighbouring seeds ($random's first draws track the seed)
         SEED = SEED * 1103515245 + 12345;
         for (i = 0; i < 8; i = i + 1) t0 = $random(SEED);
@@ -402,13 +496,14 @@ module tb_bridge_rand;
         msix_cnt[0] = 0; msix_cnt[1] = 0; cur_sess[0] = -1; cur_sess[1] = -1;
         for (i = 1; i <= 16; i = i + 1) n_last_sz[i] = 0;
         for (i = 1; i <= 7; i = i + 1) w_used[i] = 0;
-        $display("tb_bridge_rand: SEED=%0d SESS_MAX=%0d BEATS_MAX=%0d GAP_MAX=%0d NOISE_PPM=%0d BURST=%0d OVF_PCT=%0d HOTRESET_PCT=%0d lanes %s",
-                 SEED0, SESS_MAX, BEATS_MAX, GAP_MAX, NOISE_PPM, BURST, OVF_PCT, HOTRESET_PCT, lane_rev ? "REVERSED" : "straight");
+        $display("tb_bridge_rand: SEED=%0d SESS_MAX=%0d BEATS_MAX=%0d GAP_MAX=%0d NOISE_PPM=%0d BURST=%0d OVF_PCT=%0d HOTRESET_PCT=%0d LINKDROP_PCT=%0d lanes %s",
+                 SEED0, SESS_MAX, BEATS_MAX, GAP_MAX, NOISE_PPM, BURST, OVF_PCT, HOTRESET_PCT, LINKDROP_PCT, lane_rev ? "REVERSED" : "straight");
 
         repeat (5) @(negedge clk); perst_n = 1;
         host_bringup;
         if (lane_rev && dut.u_lpb.lane_reversed_locked !== 1'b1)
             $display("[%0t] FAIL: lanes are reversed but lane_reversed_locked=%b", $time, dut.u_lpb.lane_reversed_locked);
+        watch_on = 1;                        // F7b: from here every link drop must be explained
 
         noise_on = (NOISE_PPM > 0);          // F4: noise from here on (link is up, config done)
         nsess = urand(1, SESS_MAX);
@@ -433,6 +528,7 @@ module tb_bridge_rand;
             end else limit_now = 24'hFF_FFFF;
             // F9: sometimes one register goes through the link instead of the test port
             hw = (urand(0, 99) < HOSTWR_PCT && !abort_all) ? urand(1, 3) : 0;
+            if (hw != 0) cv_hw[hw] = cv_hw[hw] + 1;
             if (hw == 1) host_mwr(16'h0008, {16'h0, w1[7:0], w0[7:0]});
             else         bar0_write(16'h0008, {16'h0, w1[7:0], w0[7:0]});
             if (hw == 2) host_mwr(16'h0018, {21'h0, urand(0,7) & 3'h7, 5'h0, urand(0,7) & 3'h7});
@@ -472,6 +568,11 @@ module tb_bridge_rand;
                 $display("[%0t] FAIL: session %0d never became active (arm=%b active=%b)", $time, s, arm[1:0], session_active);
             hr = (urand(0, 99) < HOTRESET_PCT);
             hr_at = urand(20, 3000);
+            // F7b: or a cable pull / glitch instead (never both in one session)
+            ld      = !hr && (urand(0, 99) < LINKDROP_PCT);
+            ld_at   = urand(20, 3000);
+            ld_kind = urand(0, 1);                       // 0 cable pull, 1 glitch
+            ld_len  = ld_kind == 0 ? urand(200, 5000) : urand(2, 40);
             fork
                 if (arm[0]) run_channel(0, cur_sess[0], nb0, ld0, g0);
                 if (arm[1]) run_channel(1, cur_sess[1], nb1, ld1, g1);
@@ -481,15 +582,39 @@ module tb_bridge_rand;
                     if (VERBOSE) $display("[%0t] F7: hot reset in session %0d", $time, s);
                     @(negedge clk); hot_reset_request = 1; @(negedge clk); hot_reset_request = 0;
                 end
+                if (ld) begin   // F7b: link drop without hot reset
+                    repeat (ld_at) @(posedge clk);
+                    drop_ok = 1;
+                    if (VERBOSE) $display("[%0t] F7b: %s of %0d clk in session %0d", $time,
+                                          ld_kind == 0 ? "cable pull" : "glitch", ld_len, s);
+                    @(negedge clk); cable_cut = 1;
+                    repeat (ld_len) @(posedge clk);
+                    if (ld_kind == 0) begin
+                        n_cut = n_cut + 1;
+                        if (!abort_all) begin
+                            drop_err = drop_err + 1; rx_ignore = 1; abort_all = 1;
+                            $display("[%0t] F7b FAIL: cable pulled for %0d clk but link_trained stayed %b", $time, ld_len, link_trained);
+                        end
+                        @(negedge clk); cable_cut = 0;
+                    end else begin
+                        n_glitch = n_glitch + 1;
+                        @(negedge clk); cable_cut = 0;
+                        // lost framing is detected after GAP_ERR_MAX unframed gap cycles
+                        ld_t = 0; while (!abort_all && ld_t < 60000) begin @(posedge clk); ld_t = ld_t + 1; end
+                        if (abort_all) n_glitch_drop = n_glitch_drop + 1;
+                    end
+                    drop_ok = 0;
+                end
             join
-            hr_hit = abort_all;              // F7 happened in this session: F8 checks don't apply
+            hr_hit = abort_all;              // F7/F7b happened in this session: F8 checks don't apply
             if (abort_all) begin
-                // F7 recovery: everything in flight is gone; the host re-trains and re-configures
+                // F7/F7b recovery: everything in flight is gone; the host re-trains and re-configures
                 wait (link_trained === 1'b0);                     // link really went down
                 host_bringup;
                 exp_rd[0] = exp_wr[0]; exp_rd[1] = exp_wr[1];     // in-flight data was lost by design
                 msix_cnt[0] = cur_sess[0] + 1; msix_cnt[1] = cur_sess[1] + 1;
                 msix_expected = msix_seen;
+                mir0_ok = 0; mir1_ok = 0;                         // registers were reset; re-learn
                 repeat (200) @(posedge clk);
                 rx_ignore = 0; abort_all = 0;
             end
@@ -539,6 +664,34 @@ module tb_bridge_rand;
         end
         repeat (2000) @(posedge clk);
 
+        // Step 3 C: read every DMA register once; XLAT_MISS must be 0 (all
+        // addresses are inside the windows), the bases must hold what was last
+        // written, and a write to 0x1C clears the counter
+        for (rg = 0; rg < 12; rg = rg + 1) begin
+            bar0_read(rg * 4, rv);
+            // In loopback every DMA write and MSI-X comes back inbound and misses
+            // the RX translation window, so each must be counted (saturating at
+            // 255). A looped-back BAR0 write is claimed by BAR0 and should not be
+            // a miss; today it is counted too (ticket S13), so both are accepted.
+            if (rg == 7) begin
+                if (rv == ((xl_n > 255) ? 255 : xl_n)) ;
+                else if (rv == ((xl_n + xl_b0 > 255) ? 255 : xl_n + xl_b0)) n_s13 = n_s13 + 1;
+                else begin
+                    reg_err = reg_err + 1;
+                    $display("[%0t] FAIL: XLAT_MISS=%0d, expected %0d inbound misses (+%0d BAR0 writes)", $time, rv, xl_n, xl_b0);
+                end
+            end
+            if (rg == 8 && mir0_ok && rv !== mir0) begin
+                reg_err = reg_err + 1; $display("[%0t] FAIL: BASE_CH0_LO=%h, last written %h", $time, rv, mir0);
+            end
+            if (rg == 10 && mir1_ok && rv !== mir1) begin
+                reg_err = reg_err + 1; $display("[%0t] FAIL: BASE_CH1_LO=%h, last written %h", $time, rv, mir1);
+            end
+        end
+        bar0_write(16'h001C, 32'h0);
+        bar0_read(16'h1800, rv); cv_pba_rd = cv_pba_rd + 1;
+        if (rv[7:0] !== 8'h00) begin reg_err = reg_err + 1; $display("[%0t] FAIL: PBA=%h at end", $time, rv); end
+
         $display("------------------------------------------------------------");
         $display(" seed %0d: %0d sessions (%0d single-channel), %0d beats, %0d beats split at 4 KB",
                  SEED0, n_sessions, n_single_ch, n_beats, n_split);
@@ -553,10 +706,25 @@ module tb_bridge_rand;
                  n_ovf, leaked, lane_rev ? "reversed" : "straight", n_hotreset, n_ignored);
         $display(" F8 masked sessions: %0d vector + %0d function (errors %0d)   F9 inbound BAR0 writes: %0d (%0d TLPs, errors %0d)",
                  n_mask, n_fmask, mask_err, n_hostwr, n_bar0_tlp, hostwr_err);
-        $display(" errors now: framing=%b lane=%b overflow=%b", phy_framing_err, phy_lane_err, session_overflow);
+        $display(" F7b link drops: %0d cable pulls, %0d glitches (%0d dropped the link); L0 exits: loss %0d framing %0d TS1 %0d; unexplained drops %0d",
+                 n_cut, n_glitch, n_glitch_drop, n_exit[1], n_exit[2], n_exit[3], drop_err);
+        $display(" errors now: framing=%b lane=%b overflow=%b   register check errors: %0d", phy_framing_err, phy_lane_err, session_overflow, reg_err);
+        if (n_s13) $display(" NOTE S13: XLAT_MISS also counted %0d inbound BAR0 write(s) as translation misses", xl_b0);
+        // Step 3 C: one machine-readable line, merged over seeds by ci/coverage_report.py
+        $write("COV: seed=%0d noise=%0d", SEED0, NOISE_PPM > 0);
+        for (rg = 0; rg < 12; rg = rg + 1) begin rb8 = rg * 4; $write(" wr_%h=%0d rd_%h=%0d", rb8, cv_wr[rg], rb8, cv_rd[rg]); end
+        $write(" rd_1800=%0d split=%0d nosplit=%0d single_ch=%0d", cv_pba_rd, n_split, n_beats - n_split, n_single_ch);
+        for (rg = 1; rg <= 16; rg = rg + 1) $write(" last_%0d=%0d", rg, n_last_sz[rg]);
+        for (rg = 1; rg <= 7; rg = rg + 1) $write(" arb0_w%0d=%0d arb1_w%0d=%0d", rg, cv_win0[rg], rg, cv_win1[rg]);
+        $write(" credit_stall_clk=%0d credit_stall_ep=%0d fec_fix=%0d fec_bad=%0d crc=%0d replay=%0d framing=%0d lane_err=%0d xlat_err=%0d xlat_cnt=%0d",
+               cv_credit_stall, cv_stall_ep, n_fec_fix, n_fec_bad, n_crc, n_replay, cv_framing, cv_lane, cv_xlat, xl_n);
+        $write(" ovf=%0d mask_vec=%0d mask_fn=%0d hotreset=%0d cable=%0d glitch=%0d glitch_drop=%0d exit_loss=%0d exit_framing=%0d exit_ts1=%0d",
+               n_ovf, n_mask, n_fmask, n_hotreset, n_cut, n_glitch, n_glitch_drop, n_exit[1], n_exit[2], n_exit[3]);
+        $write(" lanes_rev=%0d lanes_straight=%0d hw_weights=%0d hw_tc=%0d hw_base1=%0d msix=%0d\n",
+               lane_rev, !lane_rev, cv_hw[1], cv_hw[2], cv_hw[3], msix_seen);
         if (bad == 0 && extra == 0 && exp_rd[0] == exp_wr[0] && exp_rd[1] == exp_wr[1]
             && msix_seen == msix_expected && msix_bad == 0 && msix_early == 0 && leaked == 0
-            && mask_err == 0 && hostwr_err == 0 && n_bar0_tlp == n_hostwr)
+            && mask_err == 0 && hostwr_err == 0 && n_bar0_tlp == n_hostwr && drop_err == 0 && reg_err == 0)
             $display(" RESULT: PASS (seed %0d)", SEED0);
         else
             $display(" RESULT: FAIL (seed %0d -- replay with +SEED=%0d)", SEED0, SEED0);

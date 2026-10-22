@@ -12,8 +12,9 @@ Every push and pull request runs `.github/workflows/regression.yml` on GitHub:
 | sim / bridge | `tb_bridge_top`, `tb_bridge_ovf`, `tb_ingest_overflow_leak` | <1 min |
 | sim / errors | `tb_stream_path` with bit-error injection and random backpressure | ~2 min |
 | sim / asic | same benches with the smaller ASIC buffer sizes | ~2 min |
-| sim / rand | `tb_bridge_rand` (F1-F9: random traffic, 4 KB splits, weights, PAM4 noise, overflow, lane reversal, hot reset, MSI-X masking, BAR0 via inbound MWr), 4 seeds: 2 clean, 2 noisy | ~4 min |
-| sim / rand sweep | nightly: 40 more seeds | ~15 min |
+| sim / rand | `tb_bridge_rand` (F1-F9 + F7b: random traffic, 4 KB splits, weights, PAM4 noise, overflow, lane reversal, hot reset, cable pull / glitch, MSI-X masking, BAR0 via inbound MWr), 4 seeds: 2 clean, 2 noisy, then the coverage table | ~6 min |
+| sim / rand sweep | nightly: 40 more seeds | ~25 min |
+| coverage | nightly: the 40 seeds' coverage merged by `ci/coverage_report.py --strict`; fails if a required bin was never hit | seconds |
 | long | `tb_bridge_top` 6 sessions x 50 beats (pull requests + nightly) | ~2 min |
 | formal | every `.sby` proof (OSS CAD Suite) | varies |
 
@@ -61,3 +62,17 @@ usually because the file was edited from an old copy. Restore it (`git log -p --
 <file>` shows the commit that removed it). If the code was deliberately
 redesigned, update the rule in `ci/protected_lines.txt` in the same PR and say
 why. Add a rule for every new fix that must never regress.
+
+## Coverage (Step 3 C)
+
+Each `tb_bridge_rand` run prints one `COV:` line. `ci/coverage_report.py` merges
+them into a table (BAR0 registers, 4 KB split / no split, last-beat sizes,
+contested arbiter wins per weight, credit stalls, FEC/CRC/replay, XLAT_MISS,
+overflow, MSI-X masks, hot reset, cable pull, glitch, L0 exit reasons, lane
+order, inbound BAR0 writes). The table is on the job summary page. Locally:
+
+    python3 ci/run_regression.py rand                      # writes ci_out/cov_1.txt + prints the table
+    RAND_SEEDS=40 COV_STRICT=1 python3 ci/run_regression.py rand   # gate like the nightly job
+
+Bins tb_bridge_rand cannot reach (PHY framing/lane errors, TX translation miss,
+L0 exit on TS1) are marked optional and name the directed suite that covers them.

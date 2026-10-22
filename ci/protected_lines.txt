@@ -66,3 +66,14 @@ F1     | interconnect_layer/src/axi4s_ingest_port.v | require | (({1'b0, session
 
 # ---- Step 4 rank 5: memory arrays outside async-reset blocks (RAM inference) ----
 OPT-5  | protocol_PHY_layer/rtl/pcie_phy_top.v      | require | reg  [1:0]  ic_end_seen;
+
+# ---- K6: LTSSM leaves L0 on link loss; link down resets the datapath ----
+K6     | protocol_PHY_layer/rtl/pcie_ltssm.v        | require | wire sig_lost  = (rx_armed && (rx_valid != 4'b1111)) || rx_err;
+K6     | protocol_PHY_layer/rtl/pcie_ltssm.v        | require | if (loss_exit || gap_exit || ts1_exit) begin
+K6     | protocol_PHY_layer/rtl/pcie_phy_top.v      | require | wire [3:0] ltssm_rx_valid = (L0_IDLE_FILL != 0) ? rx_level_valid : 4'b1111;
+K6     | protocol_PHY_layer/rtl/pcie_phy_top.v      | require | .rx_valid(ltssm_rx_valid), .rx_err(phy_lane_err),
+K6     | protocol_PHY_layer/rtl/pcie_phy_tx.v       | require | (!in_flit || (starve >= UNDERRUN_SLOTS));
+K6     | protocol_PHY_layer/rtl/pcie_reset_controller.v | require | if (LINKDOWN_RESET != 0) linkdown_cnt <= LINKDOWN_PULSE;
+
+# ---- S7: a DLLP Flit wins the TX slot; the payload must not be consumed in the same cycle ----
+S7     | src-link_layer/hdl/link_layer_tx.v         | require | assign s_ready = (state == ST_IDLE) && !dllp_req;
