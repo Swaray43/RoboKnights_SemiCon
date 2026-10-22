@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 // -----------------------------------------------------------------------------
 // lane_tx - TX half of one PHY lane (fixes P1: TX and RX used to be fused in
 // lane_symbol_pipe through an ideal in-RTL channel).

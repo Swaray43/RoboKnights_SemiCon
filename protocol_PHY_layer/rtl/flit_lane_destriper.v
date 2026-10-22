@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 // -----------------------------------------------------------------------------
 // RX lane de-striper: inverse of flit_lane_striper. Reassembles 4 lanes'
 // worth of bytes per cycle back into the 256-bit FLIT over 8 cycles.

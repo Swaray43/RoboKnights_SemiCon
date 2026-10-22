@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 // -----------------------------------------------------------------------------
 // pulse_sync - toggle-based single-pulse clock-domain crossing (fixes I3)
 //

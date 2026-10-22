@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 // ------------------------------------------------------------------
 // fifo_scoreboard: counters + edge-detection for Module 5's
 // FIFO status/error signals. Single clock domain, shared with

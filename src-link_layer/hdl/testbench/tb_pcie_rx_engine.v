@@ -11,6 +11,14 @@
 //   4. A malformed TLP (unrecognised Type field)
 //   5. G4 (P2-5): a genuine MRd (Type 0_0000, Fmt has-data=0) must NOT
 //      be misrouted through the address translator as a write
+//   6. F5/F6: a Message (Type 1_0000) is not decoded as an MWr
+//   7a S12/F6: CplDLk (Type 0_1011, with data) for an allocated tag drains
+//      exactly like a CplD. Reverting F6 (is_cpld matching only 0_1010)
+//      makes 7a fail: the TLP is flagged malformed and no data drains.
+//   7b S12/F6: CplLk (Type 0_1011, no data) is recognised (not malformed)
+//      and produces no AXI write and no completion data.
+//   8. S13: an MWr into the exclusion window (BAR0) is not a translation
+//      miss (no error, no XLAT_MISS count); a real miss still counts.
 // and a RESULT: PASS/FAIL line.
 // ============================================================
 module tb_pcie_rx_engine;
@@ -55,6 +63,11 @@ module tb_pcie_rx_engine;
     reg [PCIE_ADDR_W-1:0]   cfg_window_base;
     reg [PCIE_ADDR_W-1:0]   cfg_window_mask;
     reg [AXI_ADDR_W-1:0]    cfg_axi_base;
+    reg                     cfg_excl_en;      // S13
+    reg [PCIE_ADDR_W-1:0]   cfg_excl_base, cfg_excl_mask;
+    wire [7:0]              xlat_miss_cnt;
+    reg                     xlat_miss_clr;
+    integer                 cap_before;
 
     wire                    malformed_tlp_err;
 
@@ -96,6 +109,8 @@ module tb_pcie_rx_engine;
         .cfg_window_base(cfg_window_base),
         .cfg_window_mask(cfg_window_mask),
         .cfg_axi_base(cfg_axi_base),
+        .cfg_excl_en(cfg_excl_en), .cfg_excl_base(cfg_excl_base), .cfg_excl_mask(cfg_excl_mask),
+        .err_xlat_miss_cnt(xlat_miss_cnt), .err_xlat_miss_clr(xlat_miss_clr),
         .cfg_req_valid(),
         .cfg_req_type1(),
         .cfg_req_tag(),
@@ -141,6 +156,10 @@ module tb_pcie_rx_engine;
         cfg_window_base = 64'h0000_0000_2000_0000;
         cfg_window_mask = 64'hFFFF_FFFF_F000_0000; // 256MB window
         cfg_axi_base    = 32'h1000_0000;
+        cfg_excl_en     = 1'b1;                    // S13: BAR0 at 0x8000_0000, 64 KB
+        cfg_excl_base   = 64'h0000_0000_8000_0000;
+        cfg_excl_mask   = 64'hFFFF_FFFF_FFFF_0000;
+        xlat_miss_clr   = 1'b0;
 
         @(negedge clk); @(negedge clk);
         rst_n = 1;
@@ -259,6 +278,82 @@ module tb_pcie_rx_engine;
         tlp_rx_valid = 0; tlp_rx_sof = 0; tlp_rx_eof = 0;
         check_eq(m_axi_awvalid, 0, "T6: Msg does not issue an AXI write");
         @(posedge clk);
+
+        // ============================================================
+        // Test 7a (S12/F6): CplDLk (Type 0_1011, with data) for an
+        // allocated tag -- must drain exactly like a CplD.
+        // ============================================================
+        @(negedge clk);
+        cap_before = cap_cnt;
+        req_alloc_valid = 1; req_alloc_tag = 10'h021; req_alloc_len = 10'd2;
+        @(posedge clk);
+        while (!req_alloc_ready) @(posedge clk);
+        @(negedge clk);
+        req_alloc_valid = 0;
+        tlp_type       = 5'b01011; // CplDLk
+        tlp_has_data   = 1;
+        tlp_tag        = 10'h021;
+        tlp_lower_addr = 7'd0;
+        tlp_cpl_status = 3'b000;
+        tlp_rx_valid   = 1; tlp_rx_sof = 1; tlp_rx_eof = 0;
+        tlp_rx_data    = 32'h3333_3333;
+        @(posedge clk);
+        check_eq(malformed_tlp_err, 0, "T7a: CplDLk is not malformed");
+        @(negedge clk);
+        tlp_rx_sof = 0; tlp_rx_eof = 1;
+        tlp_rx_data = 32'h4444_4444;
+        @(negedge clk);
+        tlp_rx_valid = 0; tlp_rx_eof = 0;
+        repeat (4) @(negedge clk);
+        check_eq(cap_cnt - cap_before, 2, "T7a: CplDLk 2 DW drained");
+        check_eq(cap_data[cap_before],     32'h3333_3333, "T7a: CplDLk DW0");
+        check_eq(cap_last[cap_before],     0,             "T7a: CplDLk DW0 not tlast");
+        check_eq(cap_data[cap_before + 1], 32'h4444_4444, "T7a: CplDLk DW1");
+        check_eq(cap_last[cap_before + 1], 1,             "T7a: CplDLk DW1 tlast");
+
+        // ============================================================
+        // Test 7b (S12/F6): CplLk (Type 0_1011, no data) -- recognised,
+        // no AXI write, no completion data.
+        // ============================================================
+        @(negedge clk);
+        cap_before = cap_cnt;
+        tlp_type     = 5'b01011; tlp_has_data = 0;
+        tlp_tag      = 10'h022;   // not allocated: nothing may drain
+        tlp_rx_valid = 1; tlp_rx_sof = 1; tlp_rx_eof = 1;
+        tlp_rx_data  = 32'h0000_0000;
+        @(posedge clk);
+        check_eq(malformed_tlp_err, 0, "T7b: CplLk is not malformed");
+        @(negedge clk);
+        tlp_rx_valid = 0; tlp_rx_sof = 0; tlp_rx_eof = 0;
+        check_eq(m_axi_awvalid, 0, "T7b: CplLk no AXI write");
+        repeat (4) @(negedge clk);
+        check_eq(cap_cnt - cap_before, 0, "T7b: CplLk drains no data");
+
+        // ============================================================
+        // Test 8 (S13): MWr into BAR0 (exclusion window) is not a miss;
+        // an MWr outside every window still is.
+        // ============================================================
+        @(negedge clk); xlat_miss_clr = 1; @(negedge clk); xlat_miss_clr = 0;
+        check_eq(xlat_miss_cnt, 0, "T8: XLAT_MISS cleared");
+        tlp_type     = 5'b00000; tlp_has_data = 1;
+        tlp_addr     = 64'h0000_0000_8000_0008;   // BAR0 + 0x08
+        tlp_rx_valid = 1; tlp_rx_sof = 1; tlp_rx_eof = 1;
+        tlp_rx_data  = 32'h0000_0302;
+        @(posedge clk);
+        @(negedge clk);
+        tlp_rx_valid = 0; tlp_rx_sof = 0; tlp_rx_eof = 0;
+        check_eq(m_axi_awerr, 0,   "T8: BAR0 MWr no xlat error");
+        check_eq(m_axi_awvalid, 0, "T8: BAR0 MWr no DMA write");
+        @(negedge clk);
+        check_eq(xlat_miss_cnt, 0, "T8: BAR0 MWr not counted");
+        tlp_addr     = 64'h0000_0000_3000_0000;   // outside both windows
+        tlp_rx_valid = 1; tlp_rx_sof = 1; tlp_rx_eof = 1;
+        @(posedge clk);
+        @(negedge clk);
+        tlp_rx_valid = 0; tlp_rx_sof = 0; tlp_rx_eof = 0;
+        check_eq(m_axi_awerr, 1, "T8: real miss -> xlat error");
+        @(negedge clk);
+        check_eq(xlat_miss_cnt, 1, "T8: real miss still counted");
 
         if (errors == 0) $display("RESULT: PASS");
         else              $display("RESULT: FAIL (%0d errors)", errors);

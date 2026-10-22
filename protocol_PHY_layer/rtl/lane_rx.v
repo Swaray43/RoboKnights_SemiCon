@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 // -----------------------------------------------------------------------------
 // lane_rx - RX half of one PHY lane (the other half of the P1 split).
 //

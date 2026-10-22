@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 // ------------------------------------------------------------------
 // mrd_outstanding_table: tag-indexed storage for in-flight MRd
 // requests. Written once by axi_mrd_generator on issue, read/updated

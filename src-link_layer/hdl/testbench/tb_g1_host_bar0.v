@@ -282,7 +282,27 @@ module tb_g1_host_bar0;
         $display(" TC after host MWr  : %h (expect 00000503)", rd);
         if (rd !== 32'h0000_0503) errors = errors + 1;
         bar0_read(16'h001C, rd);
-        $display(" XLAT_MISS          : %h (expect 1: 0x8000_0018 is outside the AXI window)", rd);
+        $display(" XLAT_MISS          : %h (expect 0: S13, a BAR0 hit is not a translation miss)", rd);
+        if (rd[7:0] !== 8'd0) errors = errors + 1;
+
+        // G3: a real miss (outside BAR0 and the AXI window) is counted, then cleared
+        repeat (2000) @(posedge clk);
+        bar0_write(16'h0020, 32'h3000_0000);
+        bar0_write(16'h0024, 32'h0000_0000);
+        bar0_write(16'h0000, 32'h0000_0001);
+        repeat (10) @(posedge clk);
+        @(negedge clk);
+        s_tdata = {DATA_W{1'b0}}; s_tdata[31:0] = 32'h1234_5678;
+        s_tkeep = {{(KEEP_W-4){1'b0}}, 4'hF};
+        s_tuser = {1'b1, 24'd0, 1'b0}; s_tlast = 1; s_tvalid = 1;
+        @(negedge clk); while (!s_tready) @(negedge clk);
+        s_tvalid = 0; s_tlast = 0;
+        rd = 0; last_progress = cyc;
+        while (rd[7:0] == 8'd0 && cyc - last_progress < 20000) begin
+            repeat (100) @(posedge clk);
+            bar0_read(16'h001C, rd);
+        end
+        $display(" XLAT_MISS          : %h (expect 1: 0x3000_0000 is outside every window)", rd);
         if (rd[7:0] !== 8'd1) errors = errors + 1;
         bar0_write(16'h001C, 32'h0);
         repeat (3) @(posedge clk);

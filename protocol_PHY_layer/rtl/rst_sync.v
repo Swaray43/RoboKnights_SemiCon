@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 // ------------------------------------------------------------------
 // rst_sync: converts a potentially-async internal reset assertion to
 // a synchronous, glitch-free active-low reset for a downstream

@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 // -----------------------------------------------------------------------------
 // TX elastic deskew buffer (fixed-depth model). Per-lane FIFO + shared release
 // gate. NOTE ON NAMING: this is "four-lane buffering with a common release

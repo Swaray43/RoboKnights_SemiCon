@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 // -----------------------------------------------------------------------------
 // Lane reversal support (TS1/TS2, scoped to lane-reversal detection only -
 // full rate/equalization negotiation explicitly out of scope). Symbol-level

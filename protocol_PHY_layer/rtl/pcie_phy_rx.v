@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 // =============================================================================
 // pcie_phy_rx - synthesizable RX datapath of the Protocol-to-PHY layer
 // (fixes P1 RX half and P2 RX half)
@@ -36,6 +37,12 @@ module pcie_phy_rx #(
 
     output reg          lane_err,        // sticky: deskew FIFO overflowed after lock (skew grew)
     output wire         deskew_locked,   // lanes aligned on COM
+
+    // ---- K6: between-Flit check for pcie_ltssm (L0 link-loss detection) ----
+    // While no Flit is being received, every lane cycle should be logical idle
+    // (pcie_phy_tx IDL_BYTE on all lanes) or a SOF (0xFB on all lanes).
+    output wire         gap_ok,          // between Flits: all lanes IDL, or all lanes SOF
+    output wire         gap_bad,         // between Flits: anything else (noise, slip, junk)
 
     // ---- deskewed per-lane bytes BEFORE the lane swap, for the TS1/TS2
     // detectors. Training must see physical lane numbers to detect reversal,
@@ -77,6 +84,14 @@ lane_swap_mux u_swap (
   .lane_out_0(s0), .lane_out_1(s1), .lane_out_2(s2), .lane_out_3(s3)
 );
 
+// K6: classify each between-Flit lane cycle (after deskew and lane swap)
+localparam [7:0] IDL_BYTE = 8'h1B;     // must match pcie_phy_tx
+wire strip_hunting;
+wire all_idl = (s0 == IDL_BYTE) && (s1 == IDL_BYTE) && (s2 == IDL_BYTE) && (s3 == IDL_BYTE);
+wire all_sof = (s0 == 8'hFB) && (s1 == 8'hFB) && (s2 == 8'hFB) && (s3 == 8'hFB);
+assign gap_ok  = d_valid && strip_hunting &&  (all_idl || all_sof);
+assign gap_bad = d_valid && strip_hunting && !(all_idl || all_sof);
+
 wire [7:0] p0, p1, p2, p3;
 wire [3:0] pv;
 wire       p_sof;
@@ -85,7 +100,7 @@ flit_sof_strip #(.PAYLOAD_CYCLES(8 * WORDS_PER_FLIT), .RESYNC_MIDFLIT(0)) u_sofs
   .lane_in_0(s0), .lane_in_1(s1), .lane_in_2(s2), .lane_in_3(s3),
   .lane_in_valid(d_valid),
   .lane_out_0(p0), .lane_out_1(p1), .lane_out_2(p2), .lane_out_3(p3),
-  .lane_valid_out(pv), .sof_out(p_sof)
+  .lane_valid_out(pv), .sof_out(p_sof), .hunting(strip_hunting)
 );
 
 wire         w_valid;

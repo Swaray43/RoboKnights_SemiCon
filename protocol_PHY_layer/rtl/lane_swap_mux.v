@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 module lane_swap_mux (
 input  wire        lane_reversed,
 input  wire [7:0]  lane_in_0,
