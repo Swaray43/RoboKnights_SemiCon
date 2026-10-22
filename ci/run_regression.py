@@ -20,7 +20,9 @@ Suites
   asic          bridge + stream benches with the ASIC buffer sizes (asic/sim)
   long          tb_bridge_top +SESS=6 +BEATS=50 (600 TLPs)
   rand          tb_bridge_rand over several seeds, clean and with PAM4 noise
-                (RAND_SEEDS=n, default 4; RAND_BASE=s, default 1)
+                (RAND_SEEDS=n, default 4; RAND_BASE=s, default 1), then the
+                Step 3 C coverage table (ci/coverage_report.py). COV: lines go
+                to ci_out/cov_<base>.txt; COV_STRICT=1 fails on an empty bin.
   formal        every *.sby under protocol_PHY_layer/formal and verification/formal
                 (needs sby + yosys + solvers, e.g. the OSS CAD Suite)
 
@@ -229,6 +231,7 @@ def s_rand():
         record("rand", "compile", False, tail(out, 3), t0)
         shutil.rmtree(tmp, ignore_errors=True)
         return
+    cov = []
     for i in range(n):
         seed = base + i
         args = [f"+SEED={seed}"]
@@ -237,11 +240,24 @@ def s_rand():
             args += ["+NOISE_PPM=300", "+BURST=4"] if i % 4 == 3 else ["+NOISE_PPM=1000"]
         t0 = time.time()
         rc, out = run(["vvp", "-n", str(vvp)] + args, cwd=tmp)
+        cov += [l for l in out.splitlines() if l.startswith("COV:")]
         m = re.search(r"data TLPs received ok\s*:\s*(\d+)", out)
         r = re.search(r"replays (\d+)", out)
         label = " ".join(args) + (f" ({m.group(1)} TLPs" + (f", {r.group(1)} replays)" if r else ")") if m else "")
         record("rand", label, rc == 0 and has_pass(out), tail(out), t0)
     shutil.rmtree(tmp, ignore_errors=True)
+    # Step 3 C: merge this run's coverage lines
+    t0 = time.time()
+    outd = ROOT / "ci_out"
+    outd.mkdir(exist_ok=True)
+    covf = outd / f"cov_{base}.txt"
+    covf.write_text("\n".join(cov) + "\n")
+    strict = os.environ.get("COV_STRICT", "0") == "1"
+    rc, out = run([PY, str(ROOT / "ci/coverage_report.py")] + (["--strict"] if strict else []) + [str(covf)])
+    print(out)
+    m = re.search(r"Required bins covered: (\d+)/(\d+)", out)
+    record("rand", "coverage" + (f" {m.group(1)}/{m.group(2)} required bins" if m else "")
+           + (" (strict)" if strict else ""), rc == 0, tail(out, 1), t0)
 
 
 def s_formal():

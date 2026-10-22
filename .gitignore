@@ -18,3 +18,4 @@ vivado_bridge/
 .Xil/
 *.dcp
 quartus_bridge/
+ci_out/
