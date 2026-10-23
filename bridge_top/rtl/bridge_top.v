@@ -21,6 +21,13 @@ module bridge_top #(
     parameter SOFF_W = 24,
     parameter PHY_WIDE = 1,                      // Step 4 item 3: wide PHY (8 B per lane per clock)
     parameter MERGE_EN = 1,                      // Step 4 item 2: merge beats up to Max Payload
+    // X.2: buffer sizes, brought to the top so the ASIC build (LibreLane
+    // SYNTH_PARAMETERS) can shrink them. Defaults = the FPGA / regression build.
+    parameter IC_FIFO_AW    = 4,                 // interconnect CDC FIFO depth = 2^IC_FIFO_AW
+    parameter REPLAY_DEPTH  = 32,                // link replay buffer, Flits (power of 2)
+    parameter WDB_FIFO_D    = 16,                // link write-data buffer, beats
+    parameter WDB_HWM       = 12,                // write-data buffer high-water mark
+    parameter PHY_TX_FIFO_D = 16,                // PHY TX Flit FIFO, 256-bit words
     parameter LVL_W  = PHY_WIDE ? 384 : 12
 )(
     input  wire              clk,       // pcie_clk: link + PHY + interconnect read side
@@ -95,7 +102,7 @@ module bridge_top #(
     wire [7:0]  w0, w1;
     wire [23:0] lim, lim1;            // Step 4 item 7: per-channel session limits
 
-    interconnect_top u_ic (
+    interconnect_top #(.FIFO_ADDR_WIDTH(IC_FIFO_AW)) u_ic (
         .aclk(aclk), .arstn(arstn),
         .s0_tdata(s0_tdata), .s0_tkeep(s0_tkeep), .s0_tlast(s0_tlast), .s0_tvalid(s0_tvalid), .s0_tready(s0_tready),
         .ch0_session_start(session_start_aclk[0]), .ch0_session_limit(lim),
@@ -112,7 +119,10 @@ module bridge_top #(
     // session end = falling edge of session_active (aclk)
     wire [1:0] session_end_aclk = session_end;   // from interconnect_top (Step 4 item 7)
 
-    link_phy_bridge_top u_lpb (
+    link_phy_bridge_top #(
+        .PHY_WIDE(PHY_WIDE), .MERGE_EN(MERGE_EN), .REPLAY_DEPTH(REPLAY_DEPTH),
+        .FIFO_D(WDB_FIFO_D), .HWM(WDB_HWM), .PHY_TX_FIFO_D(PHY_TX_FIFO_D)
+    ) u_lpb (
         .clk(clk), .perst_n(perst_n), .aclk(aclk), .aclk_rst_n(arstn),
         .s_axis_tdata(ic_tdata), .s_axis_tkeep(ic_tkeep), .s_axis_tuser(ic_tuser),
         .s_axis_tlast(ic_tlast), .s_axis_tvalid(ic_tvalid), .s_axis_tready(ic_tready),

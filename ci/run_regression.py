@@ -197,9 +197,10 @@ def s_errors():
 
 
 def s_asic():
-    for tb, prm in [("tb_bridge_top", "asic_params"), ("tb_bridge_ovf", "asic_params_ovf")]:
+    for tb, prm in [("tb_bridge_top", "asic_params"), ("tb_bridge_ovf", "asic_params_ovf"),
+                    ("tb_bridge_top", "asic_params_gds"), ("tb_bridge_ovf", "asic_params_gds_ovf")]:   # X.2: GDS build
         t0 = time.time()
-        ok, out = ivl_build_run(tb + "_asic", bridge_srcs([f"bridge_top/tb/{tb}.v", f"asic/sim/{prm}.v"]), tb,
+        ok, out = ivl_build_run(tb + "_" + prm, bridge_srcs([f"bridge_top/tb/{tb}.v", f"asic/sim/{prm}.v"]), tb,
                                 defines=["SIMULATION"], extra_tops=[prm],
                                 plusargs=["+REARM_FAST=1"] if tb == "tb_bridge_top" else [])
         record("asic", f"{tb} with {prm}", ok, tail(out), t0)
