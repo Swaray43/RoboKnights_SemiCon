@@ -147,9 +147,18 @@ module link_layer_rx #(
         end
     end
 
-    wire [63:0]          crc_calc = flit_crc64(d2_fixed[FL_BODY_W-1:0]);
-    wire                 crc_ok   = (crc_calc == d2_fixed[FL_PROT_W-1:FL_CRC_LO]);
-    wire [FL_DLP_W-1:0]  dlp      = d2_fixed[FL_BODY_W-1:FL_DLP_LO];
+    // Wave C: CRC-64 in two stages (D3 per-chunk parts, D4 combine + compare)
+    reg                  d3_v;
+    reg [FL_PROT_W-1:0]  d3_fixed;
+    reg                  d3_unc, d3_cor;
+    reg [511:0]          d3_parts;
+    wire [63:0]          crc_calc = flit_crc64_combine(d3_parts);
+    wire                 crc_ok   = (crc_calc == d3_fixed[FL_PROT_W-1:FL_CRC_LO]);
+    wire [FL_DLP_W-1:0]  dlp      = d3_fixed[FL_BODY_W-1:FL_DLP_LO];
+`ifndef SYNTHESIS
+    always @(posedge clk) if (rst_n && d3_v && (crc_calc !== flit_crc64(d3_fixed[FL_BODY_W-1:0])))
+        $display("ERROR link_layer_rx @%0t: pipelined CRC-64 differs from flit_crc64", $time);
+`endif
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -157,6 +166,7 @@ module link_layer_rx #(
             d1_s[0] <= 10'd0; d1_s[1] <= 10'd0; d1_s[2] <= 10'd0;
             d1_o[0] <= 1'b0;  d1_o[1] <= 1'b0;  d1_o[2] <= 1'b0;
             d2_v <= 1'b0; d2_fixed <= {FL_PROT_W{1'b0}}; d2_unc <= 1'b0; d2_cor <= 1'b0;
+            d3_v <= 1'b0; d3_fixed <= {FL_PROT_W{1'b0}}; d3_unc <= 1'b0; d3_cor <= 1'b0; d3_parts <= 512'd0;
         end else begin
             d1_v <= raw_v;
             if (raw_v) begin
@@ -174,6 +184,13 @@ module link_layer_rx #(
                 d2_fixed <= fix_c;
                 d2_unc   <= unc_c;
                 d2_cor   <= cor_c;
+            end
+            d3_v <= d2_v;
+            if (d2_v) begin
+                d3_fixed <= d2_fixed;
+                d3_unc   <= d2_unc;
+                d3_cor   <= d2_cor;
+                d3_parts <= flit_crc64_parts(d2_fixed[FL_BODY_W-1:0]);
             end
         end
     end
@@ -193,18 +210,18 @@ module link_layer_rx #(
             fec_err       <= 1'b0;
             fec_corrected <= 1'b0;
         end else begin
-            rx_flit_valid <= d2_v;
-            crc_err       <= d2_v && !d2_unc && !crc_ok;
-            fec_err       <= d2_v && d2_unc;
-            fec_corrected <= d2_v && d2_cor && !d2_unc;
-            if (d2_v) begin
-                rx_flit_ok   <= !d2_unc && crc_ok;
+            rx_flit_valid <= d3_v;
+            crc_err       <= d3_v && !d3_unc && !crc_ok;
+            fec_err       <= d3_v && d3_unc;
+            fec_corrected <= d3_v && d3_cor && !d3_unc;
+            if (d3_v) begin
+                rx_flit_ok   <= !d3_unc && crc_ok;
                 rx_kind      <= dlp[13:12];
                 rx_seq       <= dlp[11:0];
                 rx_ack_valid <= dlp[14];
                 rx_nak_valid <= dlp[15];
                 rx_ackn_seq  <= dlp[27:16];
-                rx_payload   <= d2_fixed[FL_TLP_W-1:0];
+                rx_payload   <= d3_fixed[FL_TLP_W-1:0];
                 rx_fc_dllp   <= dlp[FL_DLP_FC_BIT];
             end
         end

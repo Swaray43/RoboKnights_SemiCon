@@ -85,6 +85,68 @@ function [63:0] flit_crc64;
     end
 endfunction
 
+// ---------------- CRC-64 split for pipelining (Step 4 Wave C) ----------------
+// The CRC is affine in the data: crc = ~(K0 ^ XOR_k part_k), where part_k is
+// the linear contribution of one 256-bit chunk (computed from a zero state and
+// advanced through the rest of the body as zeros) and K0 is the all-ones init
+// advanced through FL_BODY_W zero bits. Each part is an independent XOR tree,
+// so the parts can be registered and combined in the next stage.
+// Loop bounds are constants (Yosys/LibreLane); lo/len must be literals.
+function [63:0] flit_crc64_part;
+    input [255:0] ch;
+    input integer lo;          // first body bit of the chunk
+    input integer len;         // bits in the chunk (<= 256)
+    integer i;
+    reg [63:0] c;
+    begin
+        c = 64'd0;
+        for (i = 0; i < 256; i = i + 1)
+            if (i < len) c = (c[63] ^ ch[i]) ? ((c << 1) ^ 64'h42F0E1EBA9EA3693) : (c << 1);
+        for (i = 0; i < FL_BODY_W; i = i + 1)
+            if (i >= lo + len) c = c[63] ? ((c << 1) ^ 64'h42F0E1EBA9EA3693) : (c << 1);
+        flit_crc64_part = c;
+    end
+endfunction
+
+function [63:0] flit_crc64_k0;
+    input dummy;
+    integer i;
+    reg [63:0] c;
+    begin
+        c = {64{1'b1}};
+        for (i = 0; i < FL_BODY_W; i = i + 1)
+            c = c[63] ? ((c << 1) ^ 64'h42F0E1EBA9EA3693) : (c << 1);
+        flit_crc64_k0 = c;
+    end
+endfunction
+
+// all 8 parts of a body, {part7, ..., part0}
+function [511:0] flit_crc64_parts;
+    input [FL_BODY_W-1:0] d;
+    begin
+        flit_crc64_parts = {
+            flit_crc64_part({112'd0, d[1935:1792]}, 1792, 144),
+            flit_crc64_part(d[1536 +: 256], 1536, 256),
+            flit_crc64_part(d[1280 +: 256], 1280, 256),
+            flit_crc64_part(d[1024 +: 256], 1024, 256),
+            flit_crc64_part(d[ 768 +: 256],  768, 256),
+            flit_crc64_part(d[ 512 +: 256],  512, 256),
+            flit_crc64_part(d[ 256 +: 256],  256, 256),
+            flit_crc64_part(d[   0 +: 256],    0, 256)};
+    end
+endfunction
+
+function [63:0] flit_crc64_combine;
+    input [511:0] parts;
+    integer k;
+    reg [63:0] x;
+    begin
+        x = flit_crc64_k0(1'b0);
+        for (k = 0; k < 8; k = k + 1) x = x ^ parts[64*k +: 64];
+        flit_crc64_combine = ~x;
+    end
+endfunction
+
 // ---------------- helpers ----------------
 function fl_is_pow2;
     input [10:0] p;

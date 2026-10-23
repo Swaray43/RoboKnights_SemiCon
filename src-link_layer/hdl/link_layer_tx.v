@@ -113,7 +113,7 @@ module link_layer_tx #(
     reg [FL_BODY_W-1:0]  l_body;
     reg                  c1_v;
     reg [FL_BODY_W-1:0]  c1_body;
-    reg [63:0]           c1_crc;
+    reg [511:0]          c1_parts;     // Wave C: CRC-64 per-chunk parts (combined in C2)
     reg [32:0]           c1_sp;        // {sp2, sp1, sp0}, 11 bits each, body bytes only
     reg                  c2_v;
     reg [FLIT_W-1:0]     c2_flit;
@@ -181,13 +181,14 @@ module link_layer_tx #(
         end
     endfunction
 
-    wire [32:0] sp_crc = fec_sp3({c1_crc, {FL_BODY_W{1'b0}}});
+    wire [63:0] c2_crc = flit_crc64_combine(c1_parts);
+    wire [32:0] sp_crc = fec_sp3({c2_crc, {FL_BODY_W{1'b0}}});
     wire [32:0] sp_all = c1_sp ^ sp_crc;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             l_v <= 1'b0; l_body <= {FL_BODY_W{1'b0}};
-            c1_v <= 1'b0; c1_body <= {FL_BODY_W{1'b0}}; c1_crc <= 64'd0; c1_sp <= 33'd0;
+            c1_v <= 1'b0; c1_body <= {FL_BODY_W{1'b0}}; c1_parts <= 512'd0; c1_sp <= 33'd0;
             c2_v <= 1'b0; c2_flit <= {FLIT_W{1'b0}};
             snd <= 1'b0; flit_r <= {FLIT_W{1'b0}}; word_idx <= 3'd0;
         end else begin
@@ -211,7 +212,7 @@ module link_layer_tx #(
             if (l_take) begin
                 c1_v    <= 1'b1;
                 c1_body <= l_body;
-                c1_crc  <= flit_crc64(l_body);
+                c1_parts <= flit_crc64_parts(l_body);
                 c1_sp   <= fec_sp3({64'd0, l_body});
             end
             // ---- C2 ----
@@ -219,7 +220,7 @@ module link_layer_tx #(
             if (c1_take) begin
                 c2_v    <= 1'b1;
                 c2_flit <= {15'd0, cw_bits(sp_all[32:22]), cw_bits(sp_all[21:11]), cw_bits(sp_all[10:0]),
-                            c1_crc, c1_body};
+                            c2_crc, c1_body};
             end
             // ---- S ----
             if (snd && m_sys_bus_ready) begin
@@ -233,6 +234,11 @@ module link_layer_tx #(
             end
         end
     end
+
+`ifndef SYNTHESIS
+    always @(posedge clk) if (rst_n && c1_take && (c2_crc !== flit_crc64(c1_body)))
+        $display("ERROR link_layer_tx @%0t: pipelined CRC-64 differs from flit_crc64", $time);
+`endif
 
     assign m_sys_bus_valid = snd;
     assign m_sys_bus_data  = flit_r[word_idx*SYS_BUS_W +: SYS_BUS_W];
