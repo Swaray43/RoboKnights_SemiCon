@@ -65,7 +65,7 @@ def build(root, bench, tmp):
     return vvp
 
 
-def run_set(vvp, ids, tmp):
+def run_set(vvp, ids, tmp, save=None):
     res = {}
     for sid in ids:
         desc, args, _ = SCEN[sid]
@@ -81,6 +81,8 @@ def run_set(vvp, ids, tmp):
         print(f"  {sid:8s} {'PASS' if ok else 'FAIL'}  "
               f"ch0 {d.get('ch0_gbps', 0):.2f} GB/s  ch1 {d.get('ch1_gbps', 0):.2f} GB/s  "
               f"NIC p99 {d.get('pkt_lat99', 0):.0f} ns  replays {d.get('replays', 0):.0f}", flush=True)
+        if save:                                   # keep partial results if the run is cut short
+            Path(save).write_text(json.dumps({"partial": res}, indent=1))
     return res
 
 
