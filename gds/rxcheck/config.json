@@ -1,0 +1,12 @@
+{
+  "DESIGN_NAME": "link_layer_rx",
+  "VERILOG_FILES": [
+    "dir::../../src-link_layer/hdl/flit_fec_syn.v",
+    "dir::../../src-link_layer/hdl/flit_crc64_parts.v",
+    "dir::../../src-link_layer/hdl/link_layer_rx.v"
+  ],
+  "VERILOG_INCLUDE_DIRS": ["dir::../../src-link_layer/hdl"],
+  "CLOCK_PORT": "clk",
+  "CLOCK_PERIOD": 30.0,
+  "RUN_LINTER": false
+}
