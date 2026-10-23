@@ -109,6 +109,8 @@ module tlp_tx_wide #(
     reg [ADDR_W-1:0] b_addr;       // address of DW 0 of the beat
     reg              b_sid, b_tlast, b_msix;
     reg [ADDR_W-1:0] b_paddr;      // b_addr + 4*b_c, kept incrementally (timing)
+    reg [4:0]        b_left;       // b_ndw - b_c
+    reg [10:0]       b_topage;     // DWs from b_paddr to the next 4 KB boundary (1..1024)
     wire             b_done;       // the beat finishes this cycle
 
     assign s_ready = !b_v || b_done;
@@ -124,6 +126,7 @@ module tlp_tx_wide #(
     reg [LW-1:0]     a_len;
     reg [ADDR_W-1:0] a_addr;
     reg [ADDR_W-1:0] a_eaddr;      // a_addr + 4*a_len, kept incrementally (timing)
+    reg [10:0]       a_room;       // MPS - a_len
     reg              a_sid, a_msix;
     reg [3:0]        idle_cnt;
 
@@ -148,13 +151,21 @@ module tlp_tx_wide #(
     wire              into_new = !a_open || flush;
     wire              piece_go = b_v && (into_new || appendable) && !(a_open && a_term && !flush);
     wire [LW-1:0]     dst_len  = into_new ? {LW{1'b0}} : a_len;
-    wire [10:0]       to_page  = 11'd1024 - {1'b0, p_addr[11:2]};  // DWs to the 4 KB boundary
-    wire [10:0]       room_mps = MPS - dst_len;
-    wire [10:0]       room     = (to_page < room_mps) ? to_page : room_mps;
-    wire [4:0]        left     = b_ndw - b_c;
-    wire [10:0]       piece    = ({6'd0, left} < room) ? {6'd0, left} : room;
-    wire              page_cut = (piece == to_page) && (to_page < room_mps);   // closes at a 4 KB boundary
-    wire              mps_cut  = (piece == room_mps);
+    // Timing: every size below comes from registers (b_left, b_topage, a_room);
+    // the piece for a fresh accumulator and for an append are formed in
+    // parallel and only selected by into_new at the end.
+    wire [4:0]        left     = b_left;
+    wire [10:0]       to_page  = b_topage;                          // DWs to the 4 KB boundary
+    function [10:0] min3; input [10:0] x, y, z; reg [10:0] m; begin
+        m = (x < y) ? x : y; min3 = (m < z) ? m : z; end endfunction
+    wire [10:0]       pn       = min3({6'd0, left}, to_page, MPS);
+    wire [10:0]       pa       = min3({6'd0, left}, to_page, a_room);
+    wire [10:0]       piece    = into_new ? pn : pa;
+    wire [10:0]       room_mps = into_new ? MPS : a_room;
+    wire              pcut_n   = (pn == to_page) && (to_page < MPS);
+    wire              pcut_a   = (pa == to_page) && (to_page < a_room);
+    wire              page_cut = into_new ? pcut_n : pcut_a;            // closes at a 4 KB boundary
+    wire              mps_cut  = into_new ? (pn == MPS) : (pa == a_room);
     assign            b_done   = piece_go && (piece[4:0] == left);
     wire              new_term = (MERGE_EN == 0) || page_cut || mps_cut || b_msix ||
                                  (b_done && b_tlast);
@@ -162,6 +173,7 @@ module tlp_tx_wide #(
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             b_v <= 1'b0; b_data <= {DATA_W{1'b0}}; b_ndw <= 5'd0; b_c <= 5'd0;
+            b_left <= 5'd0; b_topage <= 11'd1024;
             b_addr <= {ADDR_W{1'b0}}; b_paddr <= {ADDR_W{1'b0}}; b_sid <= 1'b0; b_tlast <= 1'b0; b_msix <= 1'b0;
             err_xlat_miss <= 1'b0; err_addr_ovf <= 1'b0;
         end else begin
@@ -174,6 +186,8 @@ module tlp_tx_wide #(
                 b_c     <= 5'd0;
                 b_addr  <= s_msix ? s_msix_addr : sum[ADDR_W-1:0];
                 b_paddr <= s_msix ? s_msix_addr : sum[ADDR_W-1:0];
+                b_left  <= s_ndw;
+                b_topage <= 11'd1024 - {1'b0, (s_msix ? s_msix_addr[11:2] : sum[11:2])};
                 b_sid   <= s_sid;
                 b_tlast <= s_tlast;
                 b_msix  <= s_msix;
@@ -182,24 +196,34 @@ module tlp_tx_wide #(
             end else if (b_v && piece_go) begin
                 b_c     <= b_c + piece[4:0];
                 b_paddr <= b_paddr + {piece[4:0], 2'b00};
+                b_left  <= b_left - piece[4:0];
+                b_topage <= (b_topage == piece) ? 11'd1024 : b_topage - piece;
             end
         end
     end
 
-    // beat DWs [b_c .. b_c+piece-1] -> accumulator DWs [dst_len ..]
-    reg [DATA_W-1:0]  sh_beat;
-    reg [ACC_W-1:0]   placed;
+    // beat DWs [b_c .. b_c+piece-1] -> accumulator DWs [dst_len ..].
+    // Per accumulator DW: a 16:1 pick from the beat (select from registers
+    // b_c / a_len only) and a write enable from the piece range.
+    wire [6:0]        d_app    = {2'd0, b_c} - {{(7-LW){1'b0}}, a_len};   // beat DW = acc DW + d
+    reg  [ACC_W-1:0]  a_next;
     integer q;
+    reg [3:0] sel_n, sel_a;
     always @(*) begin
-        sh_beat = b_data >> (b_c * 32);
-        for (q = 0; q < BDW; q = q + 1)
-            if (q >= piece) sh_beat[q*32 +: 32] = 32'd0;
-        placed = {{(ACC_W-DATA_W){1'b0}}, sh_beat} << (dst_len * 32);
+        for (q = 0; q < MPS; q = q + 1) begin
+            sel_n = q + b_c;                              // fresh accumulator: acc DW q <- beat DW q + b_c
+            sel_a = q + d_app;                            // append: acc DW q <- beat DW q - a_len + b_c
+            if (into_new)
+                a_next[q*32 +: 32] = (q < pn) ? b_data[sel_n*32 +: 32] : 32'd0;
+            else
+                a_next[q*32 +: 32] = (q >= a_len && q < a_len + pa) ? b_data[sel_a*32 +: 32] : a_data[q*32 +: 32];
+        end
     end
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             a_open <= 1'b0; a_term <= 1'b0; a_data <= {ACC_W{1'b0}}; a_len <= {LW{1'b0}};
+            a_room <= MPS;
             a_addr <= {ADDR_W{1'b0}}; a_eaddr <= {ADDR_W{1'b0}}; a_sid <= 1'b0; a_msix <= 1'b0; idle_cnt <= 4'd0;
             e_v <= 1'b0; e_data <= {ACC_W{1'b0}}; e_len <= {LW{1'b0}}; e_addr <= {ADDR_W{1'b0}};
             stat_split_occurred <= 1'b0;
@@ -221,7 +245,8 @@ module tlp_tx_wide #(
             if (piece_go) begin
                 a_open <= 1'b1;
                 a_term <= new_term;
-                a_data <= (into_new ? {ACC_W{1'b0}} : a_data) | placed;
+                a_data <= a_next;
+                a_room <= room_mps - piece;
                 a_len  <= dst_len + piece[LW-1:0];
                 a_eaddr <= p_addr + {piece[4:0], 2'b00};
                 if (into_new) begin
