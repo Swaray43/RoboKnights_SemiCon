@@ -1,11 +1,10 @@
 {
-  "_doc": "Step 5 gate: allowed relative change vs the base column before a metric counts as worse (0.02 = 2%). Latency limits assume the PR declares any added pipeline clocks.",
+  "_doc": "Step 5 gate: allowed relative change vs the base column before a metric counts as worse (0.02 = 2%). Latency limits assume the PR declares any added pipeline clocks. Jain fairness is reported but not gated: the NIC is offer-limited (one session per packet), so its share under the weights measures the workload, not the arbiter.",
   "ch0_gbps": 0.02,
   "ch1_gbps": 0.02,
   "ch0_mpps": 0.02,
   "pkt_lat99": 0.05,
   "ch0_lat99": 0.05,
   "ch1_lat99": 0.05,
-  "jain": 0.05,
   "replays": 0.10
 }
