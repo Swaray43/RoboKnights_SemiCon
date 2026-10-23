@@ -60,7 +60,8 @@ module bar0_dma_regs #(
     output reg  [63:0]   base_addr_ch1,
     output reg  [WW-1:0] weight_ch0,
     output reg  [WW-1:0] weight_ch1,
-    output reg  [LW-1:0] session_limit,
+    output reg  [LW-1:0] session_limit,          // ch0 (Step 4 item 7: 0x0C)
+    output reg  [LW-1:0] session_limit_ch1,      // ch1 (0x34; a write to 0x0C sets both)
     output reg  [2:0]    msix_vec_ch0,
     output reg  [2:0]    msix_vec_ch1,
     output reg  [2:0]    tc_ch0,
@@ -82,6 +83,7 @@ module bar0_dma_regs #(
 wire [7:0]  w0_x  = weight_ch0;
 wire [7:0]  w1_x  = weight_ch1;
 wire [31:0] lim_x = session_limit;
+wire [31:0] lim1_x = session_limit_ch1;
 
 always @(posedge clk) begin
     if (!rst_n) begin
@@ -91,6 +93,7 @@ always @(posedge clk) begin
         weight_ch0    <= {{(WW-1){1'b0}}, 1'b1};
         weight_ch1    <= {{(WW-1){1'b0}}, 1'b1};
         session_limit <= {LW{1'b1}};
+        session_limit_ch1 <= {LW{1'b1}};
         msix_vec_ch0  <= 3'd0;
         msix_vec_ch1  <= 3'd1;
         tc_ch0        <= 3'd0;
@@ -106,7 +109,8 @@ always @(posedge clk) begin
             case (bar0_addr[11:2])
                 10'h000: arm_pulse <= bar0_wdata[1:0];
                 10'h002: begin weight_ch0 <= bar0_wdata[WW-1:0]; weight_ch1 <= bar0_wdata[8+WW-1:8]; end
-                10'h003: session_limit <= bar0_wdata[LW-1:0];
+                10'h003: begin session_limit <= bar0_wdata[LW-1:0]; session_limit_ch1 <= bar0_wdata[LW-1:0]; end
+                10'h00D: session_limit_ch1 <= bar0_wdata[LW-1:0];
                 10'h004: begin msix_vec_ch0 <= bar0_wdata[2:0]; msix_vec_ch1 <= bar0_wdata[10:8]; end
                 10'h006: begin tc_ch0 <= bar0_wdata[2:0]; tc_ch1 <= bar0_wdata[10:8]; end
                 10'h007: xlat_miss_clr <= 1'b1;   // G3: any write clears the sticky counter
@@ -125,6 +129,7 @@ always @(posedge clk) begin
                 10'h001: bar0_rdata <= {22'h0, status_in, 2'h0, ic_end_seen, 2'h0, session_valid};
                 10'h002: bar0_rdata <= {16'h0, w1_x, w0_x};
                 10'h003: bar0_rdata <= lim_x;
+                10'h00D: bar0_rdata <= lim1_x;
                 10'h004: bar0_rdata <= {21'h0, msix_vec_ch1, 5'h0, msix_vec_ch0};
                 10'h005: bar0_rdata <= {16'h0, arm_dbg_ch1, arm_dbg_ch0};
                 10'h006: bar0_rdata <= {21'h0, tc_ch1, 5'h0, tc_ch0};

@@ -103,6 +103,7 @@ module data_link_layer_top #(
     output wire                     fec_err,
     output wire                     fec_corrected,
     output wire                     replay_event,
+    output wire                     nak_sent_evt,      // Step 4 item 6: a NAK was scheduled
 
     // G2: far-end FC credits -> credit_manager (InitFC, then UpdateFC)
     output reg                      fc_upd_valid,
@@ -266,6 +267,7 @@ module data_link_layer_top #(
     wire rx_dup      = rx_v && rx_ok && is_payload && is_dup;
     wire rx_need_nak = rx_v && (!rx_ok || (is_payload && !in_order && !is_dup) ||
                                 (is_payload && in_order && rxf_full));
+    assign nak_sent_evt = rx_need_nak && !rx_accept && !rx_dup && !nak_sent;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin

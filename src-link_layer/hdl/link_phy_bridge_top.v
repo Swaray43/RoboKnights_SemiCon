@@ -80,7 +80,10 @@ module link_phy_bridge_top #(
     // Inbound-MWr decode window (see "Known follow-up" above)
     parameter [63:0]        WINDOW_BASE      = 64'h0000_0001_0000_0000,
     parameter [63:0]        WINDOW_MASK      = 64'hFFFF_FFFF_0000_0000,
-    parameter [AXI_ADDR_W-1:0] AXI_BASE_DEFAULT = 32'h2000_0000
+    parameter [AXI_ADDR_W-1:0] AXI_BASE_DEFAULT = 32'h2000_0000,
+    parameter PHY_WIDE   = 1,              // Step 4 item 3: 1 = 8 bytes per lane per clock
+    parameter MERGE_EN   = 1,              // Step 4 item 2: merge beats up to Max Payload
+    parameter LVL_W      = PHY_WIDE ? 384 : 12
 )(
     input  wire              clk,
     input  wire              perst_n,
@@ -146,9 +149,9 @@ module link_phy_bridge_top #(
     output wire         bar0_rd_valid,
  
     // ---- SerDes symbol bus ----
-    output wire [11:0]  tx_level,
+    output wire [LVL_W-1:0] tx_level,
     output wire [3:0]   tx_level_valid,
-    input  wire [11:0]  rx_level,
+    input  wire [LVL_W-1:0] rx_level,
     input  wire [3:0]   rx_level_valid,
  
     // ---- Session handshake with the interconnect (aclk domain) ----
@@ -157,7 +160,8 @@ module link_phy_bridge_top #(
     input  wire [NUM_STREAMS-1:0] session_overflow_aclk,
     output wire [WW-1:0]          arb_weight_ch0,
     output wire [WW-1:0]          arb_weight_ch1,
-    output wire [LW-1:0]          session_limit,
+    output wire [LW-1:0]          session_limit,       // ch0
+    output wire [LW-1:0]          session_limit_ch1,   // Step 4 item 7
  
     // ---- Status ----
     output wire  err_xlat_miss,
@@ -217,6 +221,7 @@ module link_phy_bridge_top #(
     wire [1:0]  ll_session_done;
     wire        ll_fc_credits_valid;   // G2
     wire [7:0]  ll_xlat_miss_cnt;       // G3
+    wire        ll_nak_evt;             // Step 4 item 6
     wire        ll_xlat_miss_clr;       // G3
 
     // G1: BAR0 base from config space, inbound MWr from link_layer_top
@@ -232,7 +237,7 @@ module link_phy_bridge_top #(
     wire [31:0] pt_bar0_wdata;
  
     pcie_phy_top #(
-        .WW(WW), .LW(LW)
+        .WW(WW), .LW(LW), .PHY_WIDE(PHY_WIDE)
     ) u_pcie_phy_top (
         .clk               (clk),
         .perst_n           (perst_n),
@@ -288,7 +293,8 @@ module link_phy_bridge_top #(
         .session_end_aclk  (session_end_aclk),
         .session_overflow_aclk(session_overflow_aclk),
         .arb_weight_ch0    (arb_weight_ch0), .arb_weight_ch1(arb_weight_ch1),
-        .session_limit     (session_limit)
+        .session_limit     (session_limit), .session_limit_ch1(session_limit_ch1),
+        .link_err_evt      ({malformed_tlp_err, ll_nak_evt, replay_event, fec_err, fec_corrected, crc_err})
     );
  
     // ================================================================
@@ -322,6 +328,7 @@ module link_phy_bridge_top #(
     // stream_id} order from interconnect_top -- passed straight through, no remap.
  
     link_layer_top #(
+        .MERGE_EN    (MERGE_EN),
         .DATA_W      (DATA_W),
         .KEEP_W      (KEEP_W),
         .TUSER_W     (TUSER_W),
@@ -390,6 +397,7 @@ module link_phy_bridge_top #(
         .fec_err            (fec_err),
         .fec_corrected      (fec_corrected),
         .replay_event       (replay_event),
+        .nak_sent_evt       (ll_nak_evt),
         .malformed_tlp_err  (malformed_tlp_err),
 
         .fc_credits_valid   (ll_fc_credits_valid),

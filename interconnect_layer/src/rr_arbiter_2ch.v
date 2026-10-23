@@ -23,11 +23,12 @@
 //     it drives the downstream crossbar mux select at cycle N+1 with no
 //     combinational path from req/weight through the 512-bit data mux.
 //
-// Known simplification: credit-based WRR grants a channel's full weight
-// worth of consecutive beats before switching (e.g. weight 3:1 -> ch0,
-// ch0, ch0, ch1), not an interleaved/smoothed pattern. Fine for coarse
-// bandwidth-share tuning; flag if a smoother (deficit/interleaved) WRR
-// is actually needed.
+// Interleaving (Step 4 item 7, checked): while both channels hold credit
+// the grant alternates (last_grant tie-break), so weights 3:1 give ch0,
+// ch1, ch0, ch0 -- not a burst of 3. The low-weight channel is served at
+// the start of every round, which bounds its latency at one round
+// (w0 + w1 beats). Verified by the Step 5 mixed workload (bandwidth split
+// vs weights, NIC p99 latency at 1:1 / 1:3 / 1:7).
 //=============================================================================
 
 module rr_arbiter_2ch #(

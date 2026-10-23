@@ -119,6 +119,7 @@ module tb_g1_host_bar0;
     localparam [31:0] EXP_AWADDR = AXI_BASE; // offset 0 into the window
  
     link_phy_bridge_top #(
+        .PHY_WIDE(0),           // narrow PHY: this bench drives the 12-bit level bus
         .DATA_W(DATA_W), .KEEP_W(KEEP_W), .SOFF_W(SOFF_W), .TUSER_W(TUSER_W),
         .NUM_STREAMS(NUM_STREAMS), .SYS_BUS_W(SYS_BUS_W), .AXI_ADDR_W(AXI_ADDR_W)
     ) dut (
