@@ -83,6 +83,10 @@ module link_phy_bridge_top #(
     parameter [AXI_ADDR_W-1:0] AXI_BASE_DEFAULT = 32'h2000_0000,
     parameter PHY_WIDE   = 1,              // Step 4 item 3: 1 = 8 bytes per lane per clock
     parameter MERGE_EN   = 1,              // Step 4 item 2: merge beats up to Max Payload
+    parameter REPLAY_DEPTH  = 32,          // X.2: buffer sizes from bridge_top
+    parameter FIFO_D        = 16,
+    parameter HWM           = 12,
+    parameter PHY_TX_FIFO_D = 16,
     parameter LVL_W      = PHY_WIDE ? 384 : 12
 )(
     input  wire              clk,
@@ -237,7 +241,7 @@ module link_phy_bridge_top #(
     wire [31:0] pt_bar0_wdata;
  
     pcie_phy_top #(
-        .WW(WW), .LW(LW), .PHY_WIDE(PHY_WIDE)
+        .WW(WW), .LW(LW), .PHY_WIDE(PHY_WIDE), .TX_FIFO_DEPTH(PHY_TX_FIFO_D)
     ) u_pcie_phy_top (
         .clk               (clk),
         .perst_n           (perst_n),
@@ -329,6 +333,9 @@ module link_phy_bridge_top #(
  
     link_layer_top #(
         .MERGE_EN    (MERGE_EN),
+        .REPLAY_DEPTH(REPLAY_DEPTH),
+        .FIFO_D      (FIFO_D),
+        .HWM         (HWM),
         // Wave C: with the wide PHY a Flit takes 9 clocks, ACKs come back within
         // ~100 clocks, so a lost NAK/replay is retried after 2 K clocks (8 us)
         // instead of 16 K (65 us). The narrow PHY needs the long timer.
