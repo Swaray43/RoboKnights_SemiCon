@@ -260,21 +260,38 @@ module link_layer_top #(
     reg  [2:0]  hcnt_n;
     integer     gi;
 
+    // Wave C timing: register the beat's first 5 DWs and their count first;
+    // the gather is then a 5-way pick by (hcnt, r_n), not a 16-step
+    // compaction chained from the delimiter's output register (was the
+    // worst path, 28 levels). Inbound decode is one clock later.
+    reg          r_v, r_last;
+    reg  [159:0] r_d;
+    reg  [2:0]   r_n;               // min(valid DWs in the beat, 5); TKEEP is contiguous from DW 0
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            r_v <= 1'b0; r_last <= 1'b0; r_d <= 160'd0; r_n <= 3'd0;
+        end else begin
+            r_v    <= rx_wide_valid;
+            r_last <= rx_wide_last;
+            r_d    <= rx_wide_data[159:0];
+            r_n    <= rx_wide_keep[16] ? 3'd5 : rx_wide_keep[12] ? 3'd4 : rx_wide_keep[8] ? 3'd3 :
+                      rx_wide_keep[4]  ? 3'd2 : rx_wide_keep[0]  ? 3'd1 : 3'd0;
+        end
+    end
+
+    reg  [3:0] hsum;
     always @(*) begin
-        for (gi = 0; gi < 5; gi = gi + 1) hn[gi] = hb[gi];
-        hcnt_n = hcnt;
-        for (gi = 0; gi < 16; gi = gi + 1)
-            if (rx_wide_keep[gi*4] && hcnt_n < 3'd5) begin
-                hn[hcnt_n] = rx_wide_data[gi*32 +: 32];
-                hcnt_n = hcnt_n + 3'd1;
-            end
+        hsum   = {1'b0, hcnt} + {1'b0, r_n};
+        hcnt_n = (hsum > 4'd5) ? 3'd5 : hsum[2:0];
+        for (gi = 0; gi < 5; gi = gi + 1)
+            hn[gi] = (gi >= hcnt && gi < hsum) ? r_d[(gi - hcnt)*32 +: 32] : hb[gi];
     end
 
     wire        dc_has_data = hn[0][30];
     wire        dc_4dw      = hn[0][29];
     wire [4:0]  dc_type     = hn[0][28:24];
     wire [2:0]  dc_need     = dc_has_data ? (dc_4dw ? 3'd5 : 3'd4) : (dc_4dw ? 3'd4 : 3'd3);
-    wire        dc_fire     = rx_wide_valid && !hdone && ((hcnt_n >= dc_need) || rx_wide_last);
+    wire        dc_fire     = r_v && !hdone && ((hcnt_n >= dc_need) || r_last);
     wire        dc_is_mwr   = (dc_type == 5'b00000) && dc_has_data;
     wire        dc_is_mrd   = ((dc_type == 5'b00000) || (dc_type == 5'b00001)) && !dc_has_data;
     wire        dc_is_msg   = (dc_type[4:3] == 2'b10);
@@ -299,8 +316,8 @@ module link_layer_top #(
             xl_req        <= 1'b0;
             malf_r        <= 1'b0;
             inb_mwr_valid <= 1'b0;
-            if (rx_wide_valid) begin
-                if (rx_wide_last) begin
+            if (r_v) begin
+                if (r_last) begin
                     hcnt  <= 3'd0;
                     hdone <= 1'b0;
                 end else begin
