@@ -181,8 +181,12 @@ module link_layer_tx #(
         end
     endfunction
 
+    wire [511:0] l_parts;
+    flit_crc64_parts u_crc_parts (.d(l_body), .parts(l_parts));   // Wave C: explicit XOR trees
     wire [63:0] c2_crc = flit_crc64_combine(c1_parts);
-    wire [32:0] sp_crc = fec_sp3({c2_crc, {FL_BODY_W{1'b0}}});
+    wire [32:0] sp_crc, l_sp;
+    flit_fec_syn u_syn_crc  (.d({c2_crc, {FL_BODY_W{1'b0}}}), .sp(sp_crc));   // Wave C: explicit XOR trees
+    flit_fec_syn u_syn_body (.d({64'd0, l_body}), .sp(l_sp));
     wire [32:0] sp_all = c1_sp ^ sp_crc;
 
     always @(posedge clk or negedge rst_n) begin
@@ -212,8 +216,8 @@ module link_layer_tx #(
             if (l_take) begin
                 c1_v    <= 1'b1;
                 c1_body <= l_body;
-                c1_parts <= flit_crc64_parts(l_body);
-                c1_sp   <= fec_sp3({64'd0, l_body});
+                c1_parts <= l_parts;
+                c1_sp   <= l_sp;
             end
             // ---- C2 ----
             if (c2_take) c2_v <= 1'b0;
