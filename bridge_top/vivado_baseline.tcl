@@ -20,6 +20,7 @@
 #   route_util.rpt / route_util_hier.rpt / route_timing.rpt / route_timing_paths.rpt
 #   ram_util.rpt, clock_interaction.rpt, cdc.rpt
 #   baseline_summary.txt              the numbers to paste into the Phase 2 doc
+#   baseline_summary_<commit>.txt     same, named after the commit measured (Step 4/5 history)
 
 set here [file normalize [file dirname [info script]]]
 set root [file normalize "$here/.."]
@@ -85,7 +86,13 @@ if {$do_impl} {
 # ---- 5. summary ----
 set fs [open "$out/baseline_summary.txt" w]
 proc both {fs s} { puts $s; puts $fs $s }
+# commit being measured (Step 4/5: results are matched to commits by this hash)
+set commit "unknown"
+catch { set commit [string trim [exec git -C $root rev-parse --short HEAD]] }
+set dirty ""
+catch { if {[string trim [exec git -C $root status --porcelain --untracked-files=no]] ne ""} { set dirty " (uncommitted changes!)" } }
 both $fs "Bridge baseline  part [get_property PART [current_design]]  stage $stage  [clock format [clock seconds] -format {%Y-%m-%d %H:%M}]"
+both $fs "  commit $commit$dirty   Vivado [version -short]"
 set u [report_utilization -return_string]
 # pick a row out of report_utilization's table: Used | ... | Available | Util%
 proc util_row {u label site_re} {
@@ -111,8 +118,34 @@ foreach clk {clk aclk} {
     both $fs "       from [get_property STARTPOINT_PIN $p]"
     both $fs "       to   [get_property ENDPOINT_PIN $p]"
 }
+# Step 4: how widespread the failures are, and where. Bins every failing
+# setup endpoint (up to 20000) by its module path (5 levels deep).
+foreach clk {clk aclk} {
+    set fails [get_timing_paths -quiet -setup -group $clk -max_paths 20000 -nworst 1 -slack_lesser_than 0]
+    set n [llength $fails]
+    set tns 0.0
+    array unset bin
+    array unset worst
+    foreach p $fails {
+        set sl [get_property SLACK $p]
+        set tns [expr {$tns + $sl}]
+        set parts [split [get_property ENDPOINT_PIN $p] /]
+        set mod [join [lrange $parts 0 [expr {min(5, [llength $parts] - 3)}]] /]
+        if {$mod eq ""} { set mod "(top)" }
+        if {![info exists bin($mod)]} { set bin($mod) 0; set worst($mod) 0.0 }
+        incr bin($mod)
+        if {$sl < $worst($mod)} { set worst($mod) $sl }
+    }
+    both $fs [format "  %-4s failing endpoints %d%s   TNS %.1f ns" $clk $n [expr {$n >= 20000 ? "+ (capped)" : ""}] $tns]
+    set rows {}
+    foreach m [array names bin] { lappend rows [list $m $bin($m) $worst($m)] }
+    foreach r [lrange [lsort -real -index 2 $rows] 0 14] {
+        both $fs [format "       %6d  worst %7.3f  %s" [lindex $r 1] [lindex $r 2] [lindex $r 0]]
+    }
+}
 set h [get_timing_paths -quiet -max_paths 1 -hold]
 if {[llength $h]} { both $fs [format "  WHS %7.3f ns" [get_property SLACK $h]] }
 both $fs "Per-module area: $out/[expr {$stage eq {route} ? {route} : {synth}}]_util_hier.rpt   Simulation numbers: PERF lines in sim_tb_bridge_top.log"
 close $fs
+file copy -force "$out/baseline_summary.txt" "$out/baseline_summary_$commit.txt"
 puts "BASELINE done: $out/baseline_summary.txt"
