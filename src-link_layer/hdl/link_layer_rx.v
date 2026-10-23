@@ -111,47 +111,67 @@ module link_layer_rx #(
     reg [FL_PROT_W-1:0]  d2_fixed;
     reg                  d2_unc, d2_cor;
 
-    integer jj, bb, kk;             // combinational correction loop only
-    integer js;                     // X.3: own index for the clocked D1 loop (one integer in two always blocks = two drivers)
-    reg [10:0] sp_c, p_c;
+    integer js;                     // index for the clocked D1 loop
+    reg [10:0] sp_c;
     reg [9:0]  c_rx_c;
     reg        ovr_rx_c;
 
     wire [32:0] raw_sp;
     flit_fec_syn u_syn (.d(raw_r[FL_PROT_W-1:0]), .sp(raw_sp));   // Wave C: explicit XOR trees
 
-    // D2 combinational correction from the D1 registers
-    reg [FL_PROT_W-1:0] fix_c;
-    reg                 unc_c, cor_c, found_c;
-    always @(*) begin
-        fix_c = d1_d; unc_c = 1'b0; cor_c = 1'b0;
-        p_c = 11'd2; found_c = 1'b0;     // X.3: assigned on every path, so no latch / logic loop
-        for (jj = 0; jj < 3; jj = jj + 1) begin
-            p_c = 11'd2; found_c = 1'b0;
-            if (d1_s[jj] == 10'd0 && !d1_o[jj]) begin
-                // clean
-            end else if (d1_o[jj]) begin
-                if (d1_s[jj] == 10'd0 || fl_is_pow2({1'b0, d1_s[jj]})) begin
-                    cor_c = 1'b1;                       // error in a check bit / overall bit
-                end else begin
-                    p_c = 11'd2; found_c = 1'b0;
-                    for (bb = jj; bb < FL_FEC_BYTES; bb = bb + 3) begin
-                        for (kk = 0; kk < 8; kk = kk + 1) begin
-                            p_c = p_c + 11'd1;
-                            if (fl_is_pow2(p_c)) p_c = p_c + 11'd1;
-                            if (p_c[9:0] == d1_s[jj] && p_c[10] == 1'b0) begin
-                                fix_c[bb*8+kk] = ~fix_c[bb*8+kk];
-                                found_c = 1'b1;
-                            end
-                        end
-                    end
-                    if (found_c) cor_c = 1'b1; else unc_c = 1'b1;
-                end
-            end else begin
-                unc_c = 1'b1;                           // s != 0, even parity: double error
-            end
+    // ---------------- D2: single-bit correction (X.4) ----------------
+    // No procedural loop: every protected bit has a fixed Hamming position in
+    // its interleave (an elaboration-time constant), and it is flipped when
+    // that interleave's syndrome equals the position and the overall parity
+    // says "odd number of errors". Same result as flit_fec_decode; written as
+    // plain gates so no synthesis tool can infer latches or loops from it
+    // (LibreLane's Yosys did, from the old for-loop with blocking variables).
+    function [10:0] data_pos;                 // position of data bit n (0-based) in a codeword
+        input integer n;
+        integer e;
+        reg [10:0] q;
+        begin
+            q = n + 3;                           // positions 1, 2, 4, 8, ... hold check bits
+            for (e = 2; e < 11; e = e + 1)
+                if (q >= (11'd1 << e)) q = q + 11'd1;
+            data_pos = q;
         end
-    end
+    endfunction
+
+    wire [FL_PROT_W-1:0] hit;                // bit to flip
+    genvar gb;
+    generate for (gb = 0; gb < FL_PROT_W; gb = gb + 1) begin : g_fix
+        localparam integer BY = gb / 8;
+        localparam integer IL = BY % 3;                       // interleave
+        localparam integer NB = (BY / 3) * 8 + (gb % 8);      // data-bit index inside the interleave
+        localparam [10:0]  PS = data_pos(NB);
+        assign hit[gb] = d1_o[IL] && (d1_s[IL] == PS[9:0]);
+    end endgenerate
+
+    wire [FL_PROT_W-1:0] fix_c = d1_d ^ hit;
+
+    // per interleave: clean / corrected / uncorrectable
+    function [FL_PROT_W-1:0] il_mask;         // bits belonging to interleave j
+        input integer j;
+        integer i;
+        begin
+            for (i = 0; i < FL_PROT_W; i = i + 1)
+                il_mask[i] = (((i / 8) % 3) == j);
+        end
+    endfunction
+
+    wire [2:0] il_found, il_cor, il_unc;
+    genvar gj;
+    generate for (gj = 0; gj < 3; gj = gj + 1) begin : g_il
+        localparam [FL_PROT_W-1:0] MK = il_mask(gj);
+        wire s_zero = (d1_s[gj] == 10'd0);
+        wire s_pow2 = !s_zero && ((d1_s[gj] & (d1_s[gj] - 10'd1)) == 10'd0);
+        assign il_found[gj] = |(hit & MK);
+        assign il_cor[gj]   = d1_o[gj] && (s_zero || s_pow2 || il_found[gj]);
+        assign il_unc[gj]   = (!d1_o[gj] && !s_zero) || (d1_o[gj] && !s_zero && !s_pow2 && !il_found[gj]);
+    end endgenerate
+    wire unc_c = |il_unc;
+    wire cor_c = |il_cor;
 
     // Wave C: CRC-64 in two stages (D3 per-chunk parts, D4 combine + compare)
     reg                  d3_v;
