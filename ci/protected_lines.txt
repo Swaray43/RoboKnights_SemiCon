@@ -13,7 +13,7 @@
 # and say why in the PR description).
 
 # ---- plumbing fixes (round 1) ----
-OVF-1  | interconnect_layer/src/axi4s_ingest_port.v | require | && !would_overflow && !ds_backpressure && !abort_pend;
+OVF-1  | interconnect_layer/src/axi4s_ingest_port.v | require | && fits && !ds_backpressure && !abort_pend;
 K1     | protocol_PHY_layer/rtl/pcie_phy_top.v      | require | .session_end(session_done[0])
 K1     | protocol_PHY_layer/rtl/pcie_phy_top.v      | require | .session_end(session_done[1])
 FEC-if | src-link_layer/hdl/flit_defs.vh            | require | if (fl_is_pow2(p)) p = p + 11'd1;
@@ -63,7 +63,7 @@ F6     | src-link_layer/hdl/tlp_header_parser.v     | require | is_cpl          
 F6     | src-link_layer/hdl/pcie_rx_engine.v        | require | wire is_cpld = (tlp_type[4:1] == 4'b0101);
 
 # ---- F1: ingest offset compare one bit wider (no 16 MB wrap) ----
-F1     | interconnect_layer/src/axi4s_ingest_port.v | require | (({1'b0, session_offset} + beat_bytes) > {1'b0, session_limit});
+F1     | interconnect_layer/src/axi4s_ingest_port.v | require | wire ex_ovf   = ({1'b0, off_cur} + ex_bytes)   > {1'b0, session_limit};
 
 # ---- Step 4 rank 5: memory arrays outside async-reset blocks (RAM inference) ----
 OPT-5  | protocol_PHY_layer/rtl/pcie_phy_top.v      | require | reg  [1:0]  ic_end_seen;

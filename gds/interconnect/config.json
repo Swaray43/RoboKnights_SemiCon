@@ -1,0 +1,17 @@
+{
+  "DESIGN_NAME": "interconnect_top",
+  "VERILOG_FILES": [
+    "dir::../../interconnect_layer/src/axi4s_ingest_port.v",
+    "dir::../../interconnect_layer/src/cdc_fifo_async.v",
+    "dir::../../interconnect_layer/src/rr_arbiter_2ch.v",
+    "dir::../../interconnect_layer/src/interconnect_top.v"
+  ],
+  "VERILOG_INCLUDE_DIRS": ["dir::../../shared"],
+  "CLOCK_PORT": ["aclk", "pcie_clk"],
+  "CLOCK_PERIOD": 15.0,
+  "PNR_SDC_FILE": "dir::interconnect.sdc",
+  "SIGNOFF_SDC_FILE": "dir::interconnect.sdc",
+  "FP_CORE_UTIL": 35,
+  "PL_TARGET_DENSITY_PCT": 45,
+  "RUN_LINTER": false
+}
