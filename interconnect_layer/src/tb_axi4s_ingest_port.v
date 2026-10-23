@@ -93,7 +93,12 @@ module tb_axi4s_ingest_port;
         grant = 1;
         s_tvalid = 1; s_tdata = 64'h1111_1111_1111_1111; s_tkeep = {KEEP_WIDTH{1'b1}}; s_tlast = 0;
         @(posedge clk); #1; // beat 1: offset 0->8, within limit(12)
-        @(posedge clk); #1; // beat 2: would be 8->16, exceeds limit(12) -> overflow expected
+        @(posedge clk); #1; // beat 2: near the limit -> held one cycle (X.1 exact path), TREADY low
+        if (s_tready !== 1'b0) begin
+            $display("FAIL: beat 2 must not handshake while its byte count is checked");
+            errors = errors + 1;
+        end
+        @(posedge clk); #1; // beat 2 checked: 8->16 exceeds limit(12) -> overflow expected
         if (session_overflow !== 1'b1) begin
             $display("FAIL: expected session_overflow=1 when a beat would exceed session_limit");
             errors = errors + 1;
