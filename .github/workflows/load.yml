@@ -1,0 +1,42 @@
+# Step 5 load analyser -- SmartNIC / ML / mixed workloads on bridge_top, for
+# every Step 4 change. Compares against the committed step4-base results
+# (ci/load/base_step4-base.json) so the base is never re-simulated, and
+# against the previous commit's results when a PR is open.
+#   local: python3 ci/load/run_workloads.py --out new.json
+#          python3 ci/load/compare.py ci/load/base_step4-base.json new.json --labels=base,this
+name: load
+
+on:
+  push:
+    branches: [phase2/step4, "phase2/step4-*"]
+  pull_request:
+    branches: [phase2/step4, main]
+  workflow_dispatch:
+  schedule:
+    - cron: "30 20 * * *"          # nightly: full set incl. 4 MB / 16 MB tensors
+
+concurrency:
+  group: load-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  load:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq iverilog
+      - name: Run workloads
+        run: |
+          mkdir -p ci_out
+          FULL=""
+          if [ "${{ github.event_name }}" = "schedule" ]; then FULL="--full"; fi
+          python3 ci/load/run_workloads.py $FULL --out ci_out/load_${GITHUB_SHA::7}.json
+      - name: Before/after table
+        if: always()
+        run: python3 ci/load/compare.py ci/load/base_step4-base.json ci_out/load_${GITHUB_SHA::7}.json --labels=step4-base,${GITHUB_SHA::7}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: "load-${{ github.sha }}", path: ci_out/load_*.json }
