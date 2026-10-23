@@ -47,7 +47,7 @@ BINS = [
     ("Arbiter (contested grant won)", f"arb{c}_w{w}", f"ch{c} wins with weight {w}", True, "")
     for w in range(1, 8) for c in (0, 1)
 ] + [
-    ("Flow control", "credit_stall_ep", "TX stalled for Posted credits", True, ""),
+    ("Flow control", "credit_stall_ep", "TX stalled for Posted credits", False, "tb_credit_gate_proof (link suite); the link partner advertises infinite credits"),
     ("Errors / recovery", "fec_fix", "FEC corrected a symbol error", True, ""),
     ("Errors / recovery", "fec_bad", "FEC uncorrectable", True, ""),
     ("Errors / recovery", "crc", "CRC-64 fail", False, "tb_stream_path (errors suite)"),
