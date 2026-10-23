@@ -116,6 +116,9 @@ module link_layer_rx #(
     reg [9:0]  c_rx_c;
     reg        ovr_rx_c;
 
+    wire [32:0] raw_sp;
+    flit_fec_syn u_syn (.d(raw_r[FL_PROT_W-1:0]), .sp(raw_sp));   // Wave C: explicit XOR trees
+
     // D2 combinational correction from the D1 registers
     reg [FL_PROT_W-1:0] fix_c;
     reg                 unc_c, cor_c, found_c;
@@ -152,6 +155,8 @@ module link_layer_rx #(
     reg [FL_PROT_W-1:0]  d3_fixed;
     reg                  d3_unc, d3_cor;
     reg [511:0]          d3_parts;
+    wire [511:0]         d2_parts;
+    flit_crc64_parts u_crc_parts (.d(d2_fixed[FL_BODY_W-1:0]), .parts(d2_parts));   // explicit XOR trees
     wire [63:0]          crc_calc = flit_crc64_combine(d3_parts);
     wire                 crc_ok   = (crc_calc == d3_fixed[FL_PROT_W-1:FL_CRC_LO]);
     wire [FL_DLP_W-1:0]  dlp      = d3_fixed[FL_BODY_W-1:FL_DLP_LO];
@@ -172,7 +177,7 @@ module link_layer_rx #(
             if (raw_v) begin
                 d1_d <= raw_r[FL_PROT_W-1:0];
                 for (jj = 0; jj < 3; jj = jj + 1) begin
-                    sp_c     = fl_cw_syn(raw_r[FL_PROT_W-1:0], jj);
+                    sp_c     = raw_sp[11*jj +: 11];
                     c_rx_c   = raw_r[FL_FEC_LO + jj*FEC_CW_BITS +: 10];
                     ovr_rx_c = raw_r[FL_FEC_LO + jj*FEC_CW_BITS + 10];
                     d1_s[jj] <= sp_c[9:0] ^ c_rx_c;
@@ -190,7 +195,7 @@ module link_layer_rx #(
                 d3_fixed <= d2_fixed;
                 d3_unc   <= d2_unc;
                 d3_cor   <= d2_cor;
-                d3_parts <= flit_crc64_parts(d2_fixed[FL_BODY_W-1:0]);
+                d3_parts <= d2_parts;
             end
         end
     end

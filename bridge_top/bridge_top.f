@@ -62,5 +62,7 @@ src-link_layer/hdl/tlp32_to_axis_packetizer.v
 src-link_layer/hdl/tlp_header_parser.v
 src-link_layer/hdl/tlp_packetizer.v
 src-link_layer/hdl/tlp_tx_wide.v
+src-link_layer/hdl/flit_crc64_parts.v
+src-link_layer/hdl/flit_fec_syn.v
 src-link_layer/hdl/write_data_buffer.v
 bridge_top/rtl/bridge_top.v
