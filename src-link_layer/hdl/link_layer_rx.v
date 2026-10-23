@@ -111,7 +111,8 @@ module link_layer_rx #(
     reg [FL_PROT_W-1:0]  d2_fixed;
     reg                  d2_unc, d2_cor;
 
-    integer jj, bb, kk;
+    integer jj, bb, kk;             // combinational correction loop only
+    integer js;                     // X.3: own index for the clocked D1 loop (one integer in two always blocks = two drivers)
     reg [10:0] sp_c, p_c;
     reg [9:0]  c_rx_c;
     reg        ovr_rx_c;
@@ -124,7 +125,9 @@ module link_layer_rx #(
     reg                 unc_c, cor_c, found_c;
     always @(*) begin
         fix_c = d1_d; unc_c = 1'b0; cor_c = 1'b0;
+        p_c = 11'd2; found_c = 1'b0;     // X.3: assigned on every path, so no latch / logic loop
         for (jj = 0; jj < 3; jj = jj + 1) begin
+            p_c = 11'd2; found_c = 1'b0;
             if (d1_s[jj] == 10'd0 && !d1_o[jj]) begin
                 // clean
             end else if (d1_o[jj]) begin
@@ -176,12 +179,12 @@ module link_layer_rx #(
             d1_v <= raw_v;
             if (raw_v) begin
                 d1_d <= raw_r[FL_PROT_W-1:0];
-                for (jj = 0; jj < 3; jj = jj + 1) begin
-                    sp_c     = raw_sp[11*jj +: 11];
-                    c_rx_c   = raw_r[FL_FEC_LO + jj*FEC_CW_BITS +: 10];
-                    ovr_rx_c = raw_r[FL_FEC_LO + jj*FEC_CW_BITS + 10];
-                    d1_s[jj] <= sp_c[9:0] ^ c_rx_c;
-                    d1_o[jj] <= sp_c[10] ^ (^c_rx_c) ^ ovr_rx_c;
+                for (js = 0; js < 3; js = js + 1) begin
+                    sp_c     = raw_sp[11*js +: 11];
+                    c_rx_c   = raw_r[FL_FEC_LO + js*FEC_CW_BITS +: 10];
+                    ovr_rx_c = raw_r[FL_FEC_LO + js*FEC_CW_BITS + 10];
+                    d1_s[js] <= sp_c[9:0] ^ c_rx_c;
+                    d1_o[js] <= sp_c[10] ^ (^c_rx_c) ^ ovr_rx_c;
                 end
             end
             d2_v <= d1_v;
