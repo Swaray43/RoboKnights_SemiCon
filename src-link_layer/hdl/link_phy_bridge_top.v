@@ -329,6 +329,10 @@ module link_phy_bridge_top #(
  
     link_layer_top #(
         .MERGE_EN    (MERGE_EN),
+        // Wave C: with the wide PHY a Flit takes 9 clocks, ACKs come back within
+        // ~100 clocks, so a lost NAK/replay is retried after 2 K clocks (8 us)
+        // instead of 16 K (65 us). The narrow PHY needs the long timer.
+        .REPLAY_TIMEOUT(PHY_WIDE ? 2048 : 16384),
         .DATA_W      (DATA_W),
         .KEEP_W      (KEEP_W),
         .TUSER_W     (TUSER_W),
