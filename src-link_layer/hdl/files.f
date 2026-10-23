@@ -7,6 +7,8 @@
 rtl flit_defs.vh
 rtl tlp_packetizer.v
 rtl tlp_tx_wide.v
+rtl flit_crc64_parts.v
+rtl flit_fec_syn.v
 rtl replay_buffer.v
 rtl link_layer_tx.v
 rtl link_layer_rx.v
