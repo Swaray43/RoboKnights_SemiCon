@@ -72,7 +72,7 @@ def main():
             a, b = vals[0], vals[-1]
             if a not in (None, 0) and b is not None:
                 r = b / a
-                ch = f"{r:.1f}x" if r >= 10 or r <= 0.1 else f"{(r - 1) * 100:+.1f}%"
+                ch = f"{r:.1f}x" if r >= 10 else (f"1/{1 / r:.0f}" if 0 < r <= 0.1 else f"{(r - 1) * 100:+.1f}%")
                 lim = thr.get(key)
                 if lim is not None and better != 0:
                     worse = (b < a * (1 - lim)) if better > 0 else (b > a * (1 + lim))
