@@ -84,7 +84,9 @@ module stream_tx_path_top #(
     parameter AXIS_DATA_W    = 512,
     parameter REPLAY_DEPTH   = 32,
     parameter REPLAY_TIMEOUT = 16384,
-    parameter FLIT_IDLE_FLUSH = 8      // idle clocks before a part-filled Flit is sent
+    parameter FLIT_IDLE_FLUSH = 8,     // idle clocks before a part-filled Flit is sent
+    parameter MERGE_EN       = 1,      // Step 4 item 2: merge contiguous beats up to MAX_PAYLOAD_DW
+    parameter MERGE_IDLE     = 8       // idle clocks before an open (merging) TLP is closed
 )(
     input  wire clk,
     input  wire rst_n,
@@ -141,6 +143,7 @@ module stream_tx_path_top #(
     output wire  fec_err,
     output wire  fec_corrected,
     output wire  replay_event,
+    output wire  nak_sent_evt,
 
     // G2: flow-control status (from data_link_layer_top)
     output wire  fc_credits_valid,   // far-end InitFC recorded (FC_INIT1 done)
@@ -157,42 +160,6 @@ module stream_tx_path_top #(
     wire               wdb_tvalid;
     wire               wdb_tready;
 
-    wire [ADDR_W-1:0]  sdg_addr;
-    wire [LEN_W-1:0]   sdg_len_dw;
-    wire [TUSER_W-1:0] sdg_tuser;
-    wire               sdg_split_flag;
-    wire [1:0]         sdg_sub_index;
-    wire               sdg_valid_unused;
-    wire               sdg_ready_unused;
-
-    wire [ADDR_W-1:0]  xlat_addr;
-    wire [LEN_W-1:0]   xlat_len_dw;
-    wire               xlat_stream_id;
-    wire               xlat_split_flag;
-    wire [1:0]         xlat_sub_index;
-    wire               xlat_tlast_flag;
-    wire               xlat_valid;
-    wire               xlat_ready;
-    wire               xlat_ready_from_splitter;
-
-    wire [ADDR_W-1:0]  split_addr;
-    wire [LEN_W-1:0]   split_len_dw;
-    wire [TUSER_W-1:0] split_tuser;
-    wire               split_split_flag;
-    wire [1:0]         split_sub_index;
-    wire               split_valid;
-    wire               split_ready;
-
-    wire               tlp_out_valid;
-    wire [31:0]        tlp_out_data;
-    wire               tlp_out_sof;
-    wire               tlp_out_eof;
-    wire               tlp_out_ready;
-
-    wire               wdata_tvalid;
-    wire [31:0]        wdata_tdata;
-    wire               wdata_tready;
-
     wire                     pack_tvalid;
     wire [AXIS_DATA_W-1:0]   pack_tdata;
     wire [AXIS_DATA_W/8-1:0] pack_tkeep;
@@ -203,32 +170,16 @@ module stream_tx_path_top #(
     wire fifo_full;
     wire fifo_hwm;
     wire err_burst_interleave_unused;
-    wire xlat_busy_unused;
 
-    // ---- S6: credit_manager (Posted pool) gating ---------------------
-    // Inserted between ar_request_splitter's output and tlp_packetizer's
-    // request input, on the existing split_valid/split_ready handshake.
-    // Every MWr sub-TLP (post-split, one TLP each) must be granted a
-    // Posted header+data credit before it is allowed to fire into the
-    // packetizer; the grant is what actually drives req_valid, and
-    // split_ready (fed back to the splitter) is gated the same way so
-    // back-pressure matches reality instead of just hiding it.
-    wire        pkt_req_ready;
-    wire        credit_alloc_valid = split_valid && pkt_req_ready;
-    wire        credit_grant;
-    wire        credit_stall_unused;
-    wire        gated_req_valid    = split_valid && credit_grant;
-
-    // G2 (P2-2): credits come from the link partner's FC DLLPs.
-    // data_link_layer_top runs FC_INIT1/FC_INIT2 over control Flits and
-    // forwards each type's InitFC (first value) and later UpdateFCs here.
-    // 0 = infinite is decided inside credit_manager; the old one-shot
-    // 0x7F/0xFFF "infinite" bootstrap is gone. Until the far end's InitFC-P
-    // arrives the Posted pool grants nothing, so no MWr leaves before FC init.
+    // ---- Posted credits (S6 / G2): one allocation per TLP -------------
     wire        fc_upd_valid;
     wire [1:0]  fc_upd_type;
     wire [7:0]  fc_upd_hdr;
     wire [11:0] fc_upd_data;
+    wire        credit_alloc_valid;
+    wire [9:0]  credit_alloc_len;
+    wire        credit_grant;
+    wire        credit_stall_unused;
 
     credit_manager u_credit_manager (
         .clk                 (clk),
@@ -239,7 +190,7 @@ module stream_tx_path_top #(
         .update_fc_data_limit(fc_upd_data),
         .alloc_req_valid     (credit_alloc_valid),
         .alloc_req_type      (2'b00),            // Posted (MWr-only TX path)
-        .alloc_req_dw_len    (split_len_dw[9:0]),
+        .alloc_req_dw_len    (credit_alloc_len),
         .alloc_req_grant     (credit_grant),
         .stall               (credit_stall_unused)
     );
@@ -277,191 +228,29 @@ module stream_tx_path_top #(
     );
 
     // ==================================================================
-    // 2. stream_descriptor_gen -- used purely for its combinational
-    //    TKEEP -> len_dw conversion. Valid/ready are handled by the
-    //    beat-source mux below (L2).
-    // ==================================================================
-    stream_descriptor_gen #(
-        .DATA_W  (DATA_W),
-        .KEEP_W  (KEEP_W),
-        .TUSER_W (TUSER_W),
-        .LEN_W   (LEN_W),
-        .ADDR_W  (ADDR_W)
-    ) u_stream_descriptor_gen (
-        .clk         (clk),
-        .rst_n       (rst_n),
-        .s_tdata     (wdb_tdata),
-        .s_tkeep     (wdb_tkeep),
-        .s_tuser     (wdb_tuser),
-        .s_tlast     (wdb_tlast),
-        .s_tvalid    (wdb_tvalid),
-        .s_tready    (sdg_ready_unused),
-        .m_addr      (sdg_addr),
-        .m_len_dw    (sdg_len_dw),
-        .m_tuser     (sdg_tuser),
-        .m_split_flag(sdg_split_flag),
-        .m_sub_index (sdg_sub_index),
-        .m_valid     (sdg_valid_unused),
-        .m_ready     (xlat_ready)
-    );
-
-    // ==================================================================
-    // 3. Beat-source mux: WDB beat or MSI-X request (L2, L10)
-    //
-    //    One handshake ("src_fire") does both halves at once:
-    //      - the descriptor goes into address_translation, and
-    //      - the data goes into the 512->32 serialiser.
-    //    It can only happen when the serialiser is empty AND address
-    //    translation is ready, so the two halves can never drift.
+    // 2. Beat source: WDB beat or MSI-X (L10, strictly in order)
     // ==================================================================
     localparam DWS_PER_BEAT = DATA_W / 32;
-    localparam DW_CNT_W     = $clog2(DWS_PER_BEAT) + 1;
 
     reg                 msix_pend;
     reg  [ADDR_W-1:0]   msix_addr_r;
     reg  [31:0]         msix_data_r;
-
-    reg  [DATA_W-1:0]   wdata_shift_reg;
-    reg  [DW_CNT_W-1:0] wdata_dw_cnt;       // DWs still to emit
-    reg                 wdata_ser_busy;
-
     assign msix_req_ready = !msix_pend;
 
-    wire                beat_zero_len = (sdg_len_dw == {LEN_W{1'b0}});
-    wire                src_is_msix   = msix_pend;
-    wire                src_valid     = msix_pend || wdb_tvalid;
-    wire                src_zero_len  = !src_is_msix && beat_zero_len;
-
-    // descriptor presented to address_translation
-    wire [ADDR_W-1:0]   src_addr       = src_is_msix ? msix_addr_r : sdg_addr;
-    wire [LEN_W-1:0]    src_len_dw     = src_is_msix ? {{(LEN_W-1){1'b0}}, 1'b1} : sdg_len_dw;
-    wire [TUSER_W-1:0]  src_tuser      = src_is_msix ? {TUSER_W{1'b0}} : sdg_tuser;
-    wire                src_split_flag = src_is_msix ? 1'b1 : sdg_split_flag;   // 1 = use s_addr as-is
-    wire [1:0]          src_sub_index  = src_is_msix ? 2'd0 : sdg_sub_index;
-    wire [DATA_W-1:0]   src_data       = src_is_msix ? {{(DATA_W-32){1'b0}}, msix_data_r} : wdb_tdata;
-
-    wire xlat_s_valid = src_valid && !wdata_ser_busy && !src_zero_len;
-    wire src_fire     = src_valid && !wdata_ser_busy && (src_zero_len || xlat_ready);
-
-    assign wdb_tready = src_fire && !src_is_msix;
-
-    // ==================================================================
-    // 4. address_translation
-    // ==================================================================
-    address_translation #(
-        .ADDR_W      (ADDR_W),
-        .LEN_W       (LEN_W),
-        .TUSER_W     (TUSER_W),
-        .SOFF_W      (SOFF_W),
-        .NUM_STREAMS (NUM_STREAMS)
-    ) u_address_translation (
-        .clk               (clk),
-        .rst_n             (rst_n),
-        .s_addr            (src_addr),
-        .s_len_dw          (src_len_dw),
-        .s_tuser           (src_tuser),
-        .s_split_flag      (src_split_flag),
-        .s_sub_index       (src_sub_index),
-        .s_valid           (xlat_s_valid),
-        .s_ready           (xlat_ready),
-        .m_pcie_addr       (xlat_addr),
-        .m_len_dw          (xlat_len_dw),
-        .m_stream_id       (xlat_stream_id),
-        .m_split_flag      (xlat_split_flag),
-        .m_sub_index       (xlat_sub_index),
-        .m_tlast_flag      (xlat_tlast_flag),
-        .m_valid           (xlat_valid),
-        .m_ready           (xlat_ready_from_splitter),
-        .cfg_base_addr_wr   (cfg_base_addr_wr),
-        .cfg_base_addr_id   (cfg_base_addr_id),
-        .cfg_base_addr_data (cfg_base_addr_data),
-        .cfg_base_addr_clr  (cfg_base_addr_clr),
-        .err_xlat_miss     (err_xlat_miss),
-        .err_addr_ovf      (err_addr_ovf),
-        .xlat_busy         (xlat_busy_unused)
-    );
-
-    // Downstream of translation only stream_id and tlast_flag matter.
-    wire [TUSER_W-1:0] xlat_tuser_reconstructed = {
-        xlat_tlast_flag,
-        {(SOFF_W){1'b0}},
-        xlat_stream_id
-    };
-
-    // ==================================================================
-    // 5. ar_request_splitter (4KB)
-    // ==================================================================
-    ar_request_splitter #(
-        .ADDR_W  (ADDR_W),
-        .LEN_W   (LEN_W),
-        .TUSER_W (TUSER_W),
-        .SOFF_W  (SOFF_W)
-    ) u_ar_request_splitter (
-        .clk                (clk),
-        .rst_n              (rst_n),
-        .s_addr             (xlat_addr),
-        .s_len_dw           (xlat_len_dw),
-        .s_tuser            (xlat_tuser_reconstructed),
-        .s_valid            (xlat_valid),
-        .s_ready            (xlat_ready_from_splitter),
-        .m_addr             (split_addr),
-        .m_len_dw           (split_len_dw),
-        .m_tuser            (split_tuser),
-        .m_split_flag       (split_split_flag),
-        .m_sub_index        (split_sub_index),
-        .m_valid            (split_valid),
-        .m_ready            (split_ready),           // gated by credit_grant below
-        .stat_split_occurred(stat_split_occurred)
-    );
-
-    // Posted credit must be held before a sub-TLP is allowed to advance
-    // past the splitter: back-pressure the splitter exactly when the
-    // packetizer would otherwise have accepted but no credit is granted.
-    assign split_ready = pkt_req_ready && credit_grant;
-
-    // ==================================================================
-    // 6. 512 -> 32 write-data serialiser (L1)
-    //    Loads exactly the beat's DW count and emits that many DWs, in
-    //    order. Split sub-TLPs of one beat consume them back to back.
-    // ==================================================================
-    wire [DW_CNT_W-1:0] src_dw_cnt = src_is_msix ? {{(DW_CNT_W-1){1'b0}}, 1'b1}
-                                                 : sdg_len_dw[DW_CNT_W-1:0];
-
-    assign wdata_tvalid = wdata_ser_busy;
-    assign wdata_tdata  = wdata_shift_reg[31:0];
-
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            wdata_shift_reg <= {DATA_W{1'b0}};
-            wdata_dw_cnt    <= {DW_CNT_W{1'b0}};
-            wdata_ser_busy  <= 1'b0;
-        end else if (wdata_ser_busy) begin
-            if (err_xlat_miss || err_addr_ovf) begin
-                // address_translation dropped this beat's descriptor
-                // (the error pulses the cycle after it took it, and the
-                // serialiser cannot have reloaded in between): drop the
-                // data too so it isn't handed to the next TLP.
-                wdata_ser_busy <= 1'b0;
-                wdata_dw_cnt   <= {DW_CNT_W{1'b0}};
-            end else if (wdata_tready) begin
-                wdata_shift_reg <= wdata_shift_reg >> 32;
-                if (wdata_dw_cnt == {{(DW_CNT_W-1){1'b0}}, 1'b1}) begin
-                    wdata_ser_busy <= 1'b0;
-                    wdata_dw_cnt   <= {DW_CNT_W{1'b0}};
-                end else begin
-                    wdata_dw_cnt <= wdata_dw_cnt - 1'b1;
-                end
-            end
-        end else if (src_fire && !src_zero_len) begin
-            wdata_shift_reg <= src_data;
-            wdata_dw_cnt    <= src_dw_cnt;       // L1: real count, not 16-1
-            wdata_ser_busy  <= 1'b1;
-        end
+    reg  [4:0] beat_ndw;               // DWs in the WDB beat (TKEEP contiguous from DW 0)
+    integer bi;
+    always @(*) begin
+        beat_ndw = 5'd0;
+        for (bi = 0; bi < DWS_PER_BEAT; bi = bi + 1)
+            if (wdb_tkeep[bi*4]) beat_ndw = beat_ndw + 5'd1;
     end
 
-    // ==================================================================
-    // MSI-X holding register + session_done
-    // ==================================================================
+    wire        src_is_msix = msix_pend;
+    wire        src_valid   = msix_pend || wdb_tvalid;
+    wire        tw_ready;
+    wire        src_fire    = src_valid && tw_ready;
+    assign      wdb_tready  = src_fire && !src_is_msix;
+
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             msix_pend    <= 1'b0;
@@ -470,7 +259,6 @@ module stream_tx_path_top #(
             session_done <= {NUM_STREAMS{1'b0}};
         end else begin
             session_done <= {NUM_STREAMS{1'b0}};
-
             if (src_fire && src_is_msix)
                 msix_pend <= 1'b0;
             else if (msix_req_valid && !msix_pend) begin
@@ -478,7 +266,6 @@ module stream_tx_path_top #(
                 msix_addr_r <= msix_req_addr;
                 msix_data_r <= msix_req_data;
             end
-
             // TUSER[0] is the stream id (NUM_STREAMS = 2)
             if (src_fire && !src_is_msix && wdb_tlast)
                 session_done[wdb_tuser[0]] <= 1'b1;
@@ -486,48 +273,46 @@ module stream_tx_path_top #(
     end
 
     // ==================================================================
-    // 7. tlp_packetizer
+    // 3. 512-bit TLP engine (Step 4 items 1 + 2): translate, merge up to
+    //    Max Payload, split at 4 KB, 4-DW MWr header, one beat per clock.
     // ==================================================================
-    tlp_packetizer #(
-        .MAX_PAYLOAD_DW(MAX_PAYLOAD_DW)
-    ) u_tlp_packetizer (
-        .clk          (clk),
-        .rst_n        (rst_n),
-        .req_valid    (gated_req_valid),
-        .req_is_write (1'b1),
-        .req_addr     (split_addr),
-        .req_length   (split_len_dw[9:0]),
-        .req_rid      (REQ_ID),
-        .req_tag      (8'h00),
-        .req_ready    (pkt_req_ready),
-        .wdata_tdata  (wdata_tdata),
-        .wdata_tvalid (wdata_tvalid),
-        .wdata_tready (wdata_tready),
-        .tlp_out_valid(tlp_out_valid),
-        .tlp_out_data (tlp_out_data),
-        .tlp_out_sof  (tlp_out_sof),
-        .tlp_out_eof  (tlp_out_eof),
-        .tlp_out_ready(tlp_out_ready)
-    );
-
-    // ==================================================================
-    // 8. tlp32_to_axis_packer (now with TKEEP)
-    // ==================================================================
-    tlp32_to_axis_packer #(
-        .DW_WIDTH   (32),
-        .AXIS_WIDTH (AXIS_DATA_W)
-    ) u_tlp32_to_axis_packer (
-        .clk      (clk),
-        .rst_n    (rst_n),
-        .s_tvalid (tlp_out_valid),
-        .s_tdata  (tlp_out_data),
-        .s_tlast  (tlp_out_eof),
-        .s_tready (tlp_out_ready),
-        .m_tvalid (pack_tvalid),
-        .m_tdata  (pack_tdata),
-        .m_tkeep  (pack_tkeep),
-        .m_tlast  (pack_tlast),
-        .m_tready (pack_tready)
+    wire tw_busy_unused;
+    tlp_tx_wide #(
+        .DATA_W        (DATA_W),
+        .ADDR_W        (ADDR_W),
+        .SOFF_W        (SOFF_W),
+        .MAX_PAYLOAD_DW(MAX_PAYLOAD_DW),
+        .MERGE_EN      (MERGE_EN),
+        .MERGE_IDLE    (MERGE_IDLE),
+        .REQ_ID        (REQ_ID)
+    ) u_tlp_tx_wide (
+        .clk               (clk),
+        .rst_n             (rst_n),
+        .s_valid           (src_valid),
+        .s_ready           (tw_ready),
+        .s_data            (src_is_msix ? {{(DATA_W-32){1'b0}}, msix_data_r} : wdb_tdata),
+        .s_ndw             (src_is_msix ? 5'd1 : beat_ndw),
+        .s_sid             (wdb_tuser[0]),
+        .s_offset          (wdb_tuser[SOFF_W:1]),
+        .s_tlast           (!src_is_msix && wdb_tlast),
+        .s_msix            (src_is_msix),
+        .s_msix_addr       (msix_addr_r),
+        .cfg_base_addr_wr  (cfg_base_addr_wr),
+        .cfg_base_addr_id  (cfg_base_addr_id[0]),
+        .cfg_base_addr_data(cfg_base_addr_data),
+        .cfg_base_addr_clr (cfg_base_addr_clr),
+        .alloc_valid       (credit_alloc_valid),
+        .alloc_dw_len      (credit_alloc_len),
+        .alloc_grant       (credit_grant),
+        .m_valid           (pack_tvalid),
+        .m_data            (pack_tdata),
+        .m_keep            (pack_tkeep),
+        .m_last            (pack_tlast),
+        .m_ready           (pack_tready),
+        .err_xlat_miss     (err_xlat_miss),
+        .err_addr_ovf      (err_addr_ovf),
+        .stat_split_occurred(stat_split_occurred),
+        .busy              (tw_busy_unused)
     );
 
     // ==================================================================
@@ -569,6 +354,7 @@ module stream_tx_path_top #(
         .fec_err            (fec_err),
         .fec_corrected      (fec_corrected),
         .replay_event       (replay_event),
+        .nak_sent_evt       (nak_sent_evt),
         .fc_upd_valid       (fc_upd_valid),
         .fc_upd_type        (fc_upd_type),
         .fc_upd_hdr         (fc_upd_hdr),
@@ -577,11 +363,5 @@ module stream_tx_path_top #(
         .fc_init_done       (fc_init_done)
     );
 
-`ifdef SIMULATION
-    always @(posedge clk) begin
-        if (src_fire && !src_zero_len && wdata_ser_busy)
-            $error("[stream_tx_path_top] beat accepted while serialiser busy -- descriptor/data de-sync");
-    end
-`endif
 
 endmodule

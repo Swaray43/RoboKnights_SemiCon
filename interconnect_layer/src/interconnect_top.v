@@ -46,6 +46,10 @@ module interconnect_top #(
     output wire                     ch1_session_active,
     output wire                     ch1_session_overflow,
 
+    // ---- Step 4 item 7: 1-clock (aclk) pulse per channel when its session ends
+    //      (TLAST accepted or overflow abort: falling edge of session_active) ----
+    output wire [1:0]               session_end,
+
     // ---- Arbiter weights (host-programmable, default 1:1 = 50/50) ----
     input  wire [CREDIT_WIDTH-1:0]  weight0,
     input  wire [CREDIT_WIDTH-1:0]  weight1,
@@ -178,5 +182,12 @@ module interconnect_top #(
     assign {m_tdata, m_tkeep, m_stream_id_i, m_session_offset_i, m_tlast} = fifo_rd_data;
     assign m_tuser = tuser_pack(m_tlast, m_session_offset_i, m_stream_id_i);   // via shared/axis_tuser_defs.vh (G7)
     assign m_tvalid = !fifo_empty;
+
+    // Step 4 item 7: session_end pulses
+    reg [1:0] active_q;
+    always @(posedge aclk or negedge arstn)
+        if (!arstn) active_q <= 2'b00;
+        else        active_q <= {ch1_session_active, ch0_session_active};
+    assign session_end = active_q & ~{ch1_session_active, ch0_session_active};
 
 endmodule

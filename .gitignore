@@ -19,3 +19,4 @@ vivado_bridge/
 *.dcp
 quartus_bridge/
 ci_out/
+__pycache__/

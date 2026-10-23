@@ -46,6 +46,7 @@ module link_layer_top #(
     parameter REPLAY_DEPTH    = 32,
     parameter REPLAY_TIMEOUT  = 16384,
     parameter FLIT_IDLE_FLUSH = 8,
+    parameter MERGE_EN        = 1,      // Step 4 item 2
 
     // -- RX decode parameters (pcie_rx_engine / tlp_header_parser) --
     parameter TAG_WIDTH      = 10,
@@ -121,6 +122,7 @@ module link_layer_top #(
     output wire  fec_err,
     output wire  fec_corrected,
     output wire  replay_event,
+    output wire  nak_sent_evt,
     output wire  malformed_tlp_err,
 
     // ---- G2: flow-control status ----
@@ -176,7 +178,8 @@ module link_layer_top #(
         .AXIS_DATA_W    (AXIS_DATA_W),
         .REPLAY_DEPTH   (REPLAY_DEPTH),
         .REPLAY_TIMEOUT (REPLAY_TIMEOUT),
-        .FLIT_IDLE_FLUSH(FLIT_IDLE_FLUSH)
+        .FLIT_IDLE_FLUSH(FLIT_IDLE_FLUSH),
+        .MERGE_EN       (MERGE_EN)
     ) u_stream_tx_path_top (
         .clk               (clk),
         .rst_n             (rst_n),
@@ -224,251 +227,135 @@ module link_layer_top #(
         .fec_err           (fec_err),
         .fec_corrected     (fec_corrected),
         .replay_event      (replay_event),
+        .nak_sent_evt      (nak_sent_evt),
         .fc_credits_valid  (fc_credits_valid),
         .fc_init_done      (fc_init_done)
     );
 
     // ================================================================
-    // 2. RX wide-to-32bit unpacker, sized from TKEEP (not a fixed 16 DW)
+    // 2. Wide RX decode (Step 4 item 8). Replaces the 1-DW unpacker +
+    //    tlp_header_parser + pcie_rx_engine walk: TLPs arrive as up to 16 DWs
+    //    per clock and are never back-pressured. The first 5 DWs of each TLP
+    //    (header + first payload DW) are gathered, possibly across beats (a
+    //    TLP can straddle two Flits), then the TLP is decoded once:
+    //      * Type check (MWr, MRd/MRdLk, Msg, Cpl/CplD incl. locked (F6), Cfg);
+    //        anything else is a malformed TLP (X2).
+    //      * MWr -> pcie_address_translator: AXI write address or a counted
+    //        translation miss (G3), BAR0 hits excluded (S13).
+    //      * MWr first payload DW -> inb_mwr_* (G1, host BAR0 writes).
+    //    No MRd is ever issued on this MWr-only path, so no completion can
+    //    arrive; cpl_* stays idle (pcie_rx_engine keeps its unit tests).
     // ================================================================
-    localparam RX_WORDS_PER_BEAT = AXIS_DATA_W / 32;
-    localparam RX_WIDX_W = $clog2(RX_WORDS_PER_BEAT) + 1;
-
-    function automatic [RX_WIDX_W-1:0] dw_count_from_keep;
-        input [AXIS_DATA_W/8-1:0] keep;
-        integer i;
-        reg [RX_WIDX_W+1:0] byte_cnt;
-        begin
-            byte_cnt = 0;
-            for (i = 0; i < AXIS_DATA_W/8; i = i + 1)
-                byte_cnt = byte_cnt + keep[i];
-            dw_count_from_keep = byte_cnt[RX_WIDX_W+1:2] +
-                                  (|byte_cnt[1:0] ? 1'b1 : 1'b0);
-        end
-    endfunction
-
-    reg [AXIS_DATA_W-1:0] rx_shift;
-    reg [RX_WIDX_W-1:0]   rx_dw_total;   // valid DWs in the beat being drained
-    reg [RX_WIDX_W-1:0]   rx_dw_idx;     // DWs already emitted from this beat
-    reg                   rx_beat_last;  // this beat is the TLP's tlast beat
-    reg                   rx_busy;
-    reg                   rx_next_is_new_tlp;
-
-    assign rx_wide_ready = !rx_busy;
+    assign rx_wide_ready = 1'b1;             // the decode keeps up at line rate
 
     assign mon_rx_axis_tvalid = rx_wide_valid && rx_wide_ready;
     assign mon_rx_axis_tdata  = rx_wide_data;
     assign mon_rx_axis_tkeep  = rx_wide_keep;
     assign mon_rx_axis_tlast  = rx_wide_last;
 
-    wire rx_word_valid = rx_busy && (rx_dw_total != {RX_WIDX_W{1'b0}});
-    wire rx_word_sof   = rx_word_valid && (rx_dw_idx == {RX_WIDX_W{1'b0}}) &&
-                         rx_next_is_new_tlp;
-    wire rx_word_eof   = rx_word_valid && (rx_dw_idx == rx_dw_total - 1'b1) &&
-                         rx_beat_last;
+    reg  [31:0] hb [0:4];          // DW0..DW4 of the current TLP
+    reg  [2:0]  hcnt;              // DWs gathered (saturates at 5)
+    reg         hdone;             // this TLP already decoded
+    reg  [31:0] hn [0:4];
+    reg  [2:0]  hcnt_n;
+    integer     gi;
 
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            rx_shift            <= {AXIS_DATA_W{1'b0}};
-            rx_dw_total         <= {RX_WIDX_W{1'b0}};
-            rx_dw_idx           <= {RX_WIDX_W{1'b0}};
-            rx_beat_last        <= 1'b0;
-            rx_busy             <= 1'b0;
-            rx_next_is_new_tlp  <= 1'b1;
-        end else if (rx_busy) begin
-            if (rx_dw_total == {RX_WIDX_W{1'b0}}) begin
-                rx_busy <= 1'b0;
-                if (rx_beat_last) rx_next_is_new_tlp <= 1'b1;
-            end else begin
-                rx_shift <= rx_shift >> 32;
-                if (rx_dw_idx == rx_dw_total - 1'b1) begin
-                    rx_busy   <= 1'b0;
-                    rx_dw_idx <= {RX_WIDX_W{1'b0}};
-                    if (rx_beat_last) rx_next_is_new_tlp <= 1'b1;
-                end else begin
-                    rx_dw_idx          <= rx_dw_idx + 1'b1;
-                    rx_next_is_new_tlp <= 1'b0;
-                end
+    always @(*) begin
+        for (gi = 0; gi < 5; gi = gi + 1) hn[gi] = hb[gi];
+        hcnt_n = hcnt;
+        for (gi = 0; gi < 16; gi = gi + 1)
+            if (rx_wide_keep[gi*4] && hcnt_n < 3'd5) begin
+                hn[hcnt_n] = rx_wide_data[gi*32 +: 32];
+                hcnt_n = hcnt_n + 3'd1;
             end
-        end else if (rx_wide_valid) begin
-            rx_shift     <= rx_wide_data;
-            rx_dw_total  <= dw_count_from_keep(rx_wide_keep);
-            rx_dw_idx    <= {RX_WIDX_W{1'b0}};
-            rx_beat_last <= rx_wide_last;
-            rx_busy      <= 1'b1;
-        end
     end
 
-    // ================================================================
-    // 2b. G1: inbound MWr first-DW tracker (BAR0 write source)
-    //     Runs on the unpacked DW stream (rx_word_*), independent of
-    //     tlp_header_parser / pcie_address_translator timing.
-    //       DW0: Fmt/Type -> is it an MWr (with data)? 3DW or 4DW?
-    //       DW1: first-DW byte enables
-    //       DW2/DW3: address
-    //       DW at index hdr_len: first payload DW -> pulse inb_mwr_*
-    // ================================================================
-    reg  [2:0]        ib_idx;        // DW index inside the TLP, saturates at 7
-    reg               ib_is_mwr;
-    reg               ib_4dw;
-    reg               ib_done;       // first payload DW already reported
-    reg  [3:0]        ib_first_be;
-    reg  [ADDR_W-1:0] ib_addr;
-    wire [2:0]        ib_hdr_len = ib_4dw ? 3'd4 : 3'd3;
-    wire [31:0]       ib_dw      = rx_shift[31:0];
+    wire        dc_has_data = hn[0][30];
+    wire        dc_4dw      = hn[0][29];
+    wire [4:0]  dc_type     = hn[0][28:24];
+    wire [2:0]  dc_need     = dc_has_data ? (dc_4dw ? 3'd5 : 3'd4) : (dc_4dw ? 3'd4 : 3'd3);
+    wire        dc_fire     = rx_wide_valid && !hdone && ((hcnt_n >= dc_need) || rx_wide_last);
+    wire        dc_is_mwr   = (dc_type == 5'b00000) && dc_has_data;
+    wire        dc_is_mrd   = ((dc_type == 5'b00000) || (dc_type == 5'b00001)) && !dc_has_data;
+    wire        dc_is_msg   = (dc_type[4:3] == 2'b10);
+    wire        dc_is_cpl   = (dc_type[4:1] == 4'b0101);                // F6: Cpl/CplD and CplLk/CplDLk
+    wire        dc_is_cfg   = (dc_type == 5'b00100) || (dc_type == 5'b00101);
+    wire [ADDR_W-1:0] dc_addr = dc_4dw ? {hn[2][ADDR_W-33:0], hn[3][31:2], 2'b00}
+                                       : {{(ADDR_W-32){1'b0}}, hn[2][31:2], 2'b00};
+    wire [31:0] dc_data     = dc_4dw ? hn[4] : hn[3];
+
+    reg              xl_req;
+    reg [ADDR_W-1:0] xl_addr;
+    reg              malf_r;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            ib_idx        <= 3'd0;
-            ib_is_mwr     <= 1'b0;
-            ib_4dw        <= 1'b0;
-            ib_done       <= 1'b0;
-            ib_first_be   <= 4'h0;
-            ib_addr       <= {ADDR_W{1'b0}};
-            inb_mwr_valid <= 1'b0;
-            inb_mwr_addr  <= {ADDR_W{1'b0}};
-            inb_mwr_data  <= 32'h0;
-            inb_mwr_be    <= 4'h0;
+            hb[0] <= 32'd0; hb[1] <= 32'd0; hb[2] <= 32'd0; hb[3] <= 32'd0; hb[4] <= 32'd0;
+            hcnt <= 3'd0; hdone <= 1'b0;
+            xl_req <= 1'b0; xl_addr <= {ADDR_W{1'b0}}; malf_r <= 1'b0;
+            inb_mwr_valid <= 1'b0; inb_mwr_addr <= {ADDR_W{1'b0}};
+            inb_mwr_data  <= 32'h0; inb_mwr_be <= 4'h0;
         end else begin
+            xl_req        <= 1'b0;
+            malf_r        <= 1'b0;
             inb_mwr_valid <= 1'b0;
-            if (rx_word_valid) begin
-                if (rx_word_sof) begin                          // DW0
-                    ib_idx    <= 3'd1;
-                    ib_is_mwr <= ib_dw[30] && (ib_dw[28:24] == 5'b00000);
-                    ib_4dw    <= ib_dw[29];
-                    ib_done   <= 1'b0;
-                    ib_addr   <= {ADDR_W{1'b0}};
+            if (rx_wide_valid) begin
+                if (rx_wide_last) begin
+                    hcnt  <= 3'd0;
+                    hdone <= 1'b0;
                 end else begin
-                    if (ib_idx != 3'd7) ib_idx <= ib_idx + 3'd1;
-                    if (ib_idx == 3'd1)
-                        ib_first_be <= ib_dw[3:0];
-                    if (ib_idx == 3'd2) begin
-                        if (ib_4dw) ib_addr[ADDR_W-1:32] <= ib_dw[ADDR_W-33:0];
-                        else        ib_addr <= {{(ADDR_W-32){1'b0}}, ib_dw[31:2], 2'b00};
-                    end
-                    if (ib_idx == 3'd3 && ib_4dw)
-                        ib_addr[31:0] <= {ib_dw[31:2], 2'b00};
-                    if (ib_is_mwr && !ib_done && ib_idx == ib_hdr_len) begin
-                        inb_mwr_valid <= 1'b1;
-                        inb_mwr_addr  <= ib_addr;
-                        inb_mwr_data  <= ib_dw;
-                        inb_mwr_be    <= ib_first_be;
-                        ib_done       <= 1'b1;
-                    end
+                    hcnt  <= hcnt_n;
+                    hb[0] <= hn[0]; hb[1] <= hn[1]; hb[2] <= hn[2]; hb[3] <= hn[3]; hb[4] <= hn[4];
+                    if (dc_fire) hdone <= 1'b1;
+                end
+            end
+            if (dc_fire) begin
+                malf_r <= !(dc_is_mwr || dc_is_mrd || dc_is_msg || dc_is_cpl || dc_is_cfg);
+                if (dc_is_mwr) begin
+                    xl_req        <= 1'b1;               // request on header done (P1)
+                    xl_addr       <= dc_addr;
+                    inb_mwr_valid <= (hcnt_n >= dc_need);
+                    inb_mwr_addr  <= dc_addr;
+                    inb_mwr_data  <= dc_data;
+                    inb_mwr_be    <= hn[1][3:0];
                 end
             end
         end
     end
 
-    // ================================================================
-    // 3. TLP header parser
-    // ================================================================
-    wire        parsed_rx_valid, parsed_rx_sof, parsed_rx_eof;
-    wire [31:0] parsed_rx_data;
-    wire [4:0]  parsed_type;
-    wire [9:0]  parsed_length_dw;
-    wire [TAG_WIDTH-1:0] parsed_tag;
-    wire [6:0]  parsed_lower_addr;
-    wire [2:0]  parsed_cpl_status;
-    wire [ADDR_W-1:0] parsed_addr;
-    wire        parsed_hdr_done;
-    wire        parsed_has_data;   // G4
+    assign malformed_tlp_err = malf_r;
 
-    tlp_header_parser #(
-        .TAG_WIDTH  (TAG_WIDTH),
-        .PCIE_ADDR_W(ADDR_W)
-    ) u_tlp_header_parser (
+    // ================================================================
+    // 3. Inbound address translation (window -> AXI write address), G3 miss
+    //    counter, S13 BAR0 exclusion
+    // ================================================================
+    pcie_address_translator #(
+        .PCIE_ADDR_WIDTH(ADDR_W),
+        .AXI_ADDR_WIDTH (AXI_ADDR_W)
+    ) u_rx_xlat (
         .clk              (clk),
         .rst_n            (rst_n),
-        .rx_tlp_valid     (rx_word_valid),
-        .rx_tlp_data      (rx_shift[31:0]),
-        .rx_tlp_sof       (rx_word_sof),
-        .rx_tlp_eof       (rx_word_eof),
-        .parsed_rx_valid  (parsed_rx_valid),
-        .parsed_rx_sof    (parsed_rx_sof),
-        .parsed_rx_eof    (parsed_rx_eof),
-        .parsed_rx_data   (parsed_rx_data),
-        .parsed_type      (parsed_type),
-        .parsed_length_dw (parsed_length_dw),
-        .parsed_tag       (parsed_tag),
-        .parsed_lower_addr(parsed_lower_addr),
-        .parsed_cpl_status(parsed_cpl_status),
-        .parsed_addr      (parsed_addr),
-        .parsed_hdr_done  (parsed_hdr_done),
-        .parsed_has_data  (parsed_has_data)
+        .trans_window_base(cfg_window_base),
+        .trans_window_mask(cfg_window_mask),
+        .trans_axi_base   (cfg_axi_base),
+        .excl_en          (cfg_excl_en),
+        .excl_base        (cfg_excl_base),
+        .excl_mask        (cfg_excl_mask),
+        .req_valid        (xl_req),
+        .req_pcie_addr    (xl_addr),
+        .axi_addr_ready   (m_axi_awready),
+        .axi_addr_valid   (m_axi_awvalid),
+        .axi_addr         (m_axi_awaddr),
+        .translation_err  (m_axi_awerr),
+        .err_xlat_miss_cnt(err_xlat_miss_cnt),
+        .err_xlat_miss_clr(err_xlat_miss_clr)
     );
 
-    // ================================================================
-    // 4. pcie_rx_engine -- MWr decode to AXI BAR0
-    // ================================================================
-    pcie_rx_engine #(
-        .TAG_WIDTH     (TAG_WIDTH),
-        .MAX_DW_PER_REQ(MAX_DW_PER_REQ),
-        .PCIE_ADDR_W   (ADDR_W),
-        .AXI_ADDR_W    (AXI_ADDR_W),
-        .REQ_ON_HDR_DONE(1)
-    ) u_pcie_rx_engine (
-        .clk               (clk),
-        .rst_n             (rst_n),
-
-        .tlp_rx_valid      (parsed_rx_valid),
-        .tlp_rx_sof        (parsed_rx_sof),
-        .tlp_rx_eof        (parsed_rx_eof),
-        .tlp_rx_data       (parsed_rx_data),
-
-        .tlp_type          (parsed_type),
-        .tlp_length_dw     (parsed_length_dw),
-        .tlp_tag           (parsed_tag),
-        .tlp_lower_addr    (parsed_lower_addr),
-        .tlp_cpl_status    (parsed_cpl_status),
-        .tlp_addr          (parsed_addr),
-        .tlp_hdr_done      (parsed_hdr_done),
-        .tlp_has_data      (parsed_has_data),
-
-        // No MRd source on this (MWr-only) path
-        .req_alloc_valid   (1'b0),
-        .req_alloc_tag     ({TAG_WIDTH{1'b0}}),
-        .req_alloc_len     (10'd0),
-        .req_alloc_ready   (),
-
-        .m_axis_cpl_tvalid (cpl_tvalid),
-        .m_axis_cpl_tdata  (cpl_tdata),
-        .m_axis_cpl_tlast  (cpl_tlast),
-        .m_axis_cpl_tkeep  (cpl_tkeep),
-        .m_axis_cpl_tuser  (cpl_tuser),
-        .m_axis_cpl_tready (cpl_tready),
-
-        .m_axi_awvalid     (m_axi_awvalid),
-        .m_axi_awready     (m_axi_awready),
-        .m_axi_awaddr      (m_axi_awaddr),
-        .m_axi_awerr       (m_axi_awerr),
-
-        .cfg_window_base   (cfg_window_base),
-        .cfg_window_mask   (cfg_window_mask),
-        .cfg_axi_base      (cfg_axi_base),
-        .cfg_excl_en       (cfg_excl_en),          // S13
-        .cfg_excl_base     (cfg_excl_base),
-        .cfg_excl_mask     (cfg_excl_mask),
-
-        .cfg_req_valid     (),
-        .cfg_req_type1     (),
-        .cfg_req_tag       (),
-        .cfg_req_len_dw    (),
-        .cfg_req_addr      (),
-
-        .malformed_tlp_err (malformed_tlp_err),
-
-        .err_xlat_miss_cnt (err_xlat_miss_cnt),
-        .err_xlat_miss_clr (err_xlat_miss_clr)
-    );
-
-`ifdef SIMULATION
-    always @(posedge clk) begin
-        if (rx_word_sof && !rx_word_valid)
-            $error("[link_layer_top] RX sof without valid");
-        if (rx_word_eof && !rx_word_valid)
-            $error("[link_layer_top] RX eof without valid");
-    end
-`endif
+    // no completion source on this MWr-only path
+    assign cpl_tvalid = 1'b0;
+    assign cpl_tdata  = 32'd0;
+    assign cpl_tlast  = 1'b0;
+    assign cpl_tkeep  = 4'h0;
+    assign cpl_tuser  = 1'b0;
 
 endmodule

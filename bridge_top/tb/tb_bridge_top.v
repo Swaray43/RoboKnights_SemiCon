@@ -37,7 +37,7 @@ module tb_bridge_top;
     reg cfg_wr_en = 0; reg [11:0] cfg_addr = 0; reg [31:0] cfg_wdata = 0;
     reg tbl_wr_en = 0; reg [2:0] tbl_wr_vec = 0; reg [63:0] tbl_wr_addr = 0; reg [31:0] tbl_wr_data = 0;
 
-    wire [11:0] lvl; wire [3:0] lvl_v;
+    wire [383:0] lvl; wire [3:0] lvl_v;   // wide PHY (bridge_top PHY_WIDE=1)
     wire err_xlat_miss, err_addr_ovf, crc_err, fec_err, phy_framing_err, phy_lane_err;
 
     bridge_top dut (
@@ -64,12 +64,14 @@ module tb_bridge_top;
 
     // ---------------- reference model ----------------
     localparam Q = 4096;
-    reg [63:0] exp_addr [0:1][0:Q-1];
-    integer    exp_ndw  [0:1][0:Q-1];
-    integer    exp_sess [0:1][0:Q-1];
-    reg [511:0] exp_data [0:1][0:Q-1];
+    // DW-stream reference (Step 4 item 2: the bridge merges beats into TLPs
+    // up to Max Payload and splits at 4 KB; a TLP is checked DW by DW)
+    localparam QD = Q * 16;
+    reg [63:0] exp_addr [0:1][0:QD-1];
+    reg [31:0] exp_dw   [0:1][0:QD-1];
+    integer    exp_sess [0:1][0:QD-1];
     integer exp_wr [0:1], exp_rd [0:1];
-    integer msix_seen = 0, msix_bad = 0, msix_early = 0;
+    integer msix_seen = 0, msix_bad = 0, msix_early = 0, pe;
     integer last_sess_sent [0:1];     // highest session whose data the fabric has finished sending
 
     function [63:0] base_of(input integer ch, input integer s);
@@ -83,7 +85,7 @@ module tb_bridge_top;
     endfunction
 
     // ---------------- RX checker ----------------
-    reg  [31:0] got [0:63];
+    reg  [31:0] got [0:127];
     integer got_n = 0, ok = 0, bad = 0, extra = 0, k;
     always @(posedge clk) if (rx_tvalid) begin
         for (k = 0; k < 16; k = k + 1)
@@ -97,26 +99,26 @@ module tb_bridge_top;
                 msix_seen = msix_seen + 1;
                 if (got[4] !== msix_data_of(ch)) msix_bad = msix_bad + 1;
                 // every data TLP of sessions already completed on this channel must be in
-                for (i = exp_rd[ch]; i < exp_wr[ch]; i = i + 1)
-                    if (exp_sess[ch][i] < msix_seen_ch(ch)) msix_early = msix_early + 1;
+                if (exp_rd[ch] < exp_wr[ch] && exp_sess[ch][exp_rd[ch]] < msix_seen_ch(ch)) msix_early = msix_early + 1;
                 bump_msix(ch);
             end else begin
                 ch = (a[39:32] == 8'hAB) ? 0 : (a[39:32] == 8'hCD) ? 1 : -1;
-                if (ch < 0 || exp_rd[ch] >= exp_wr[ch]) begin
+                if (ch < 0 || exp_rd[ch] + ndw > exp_wr[ch]) begin
                     extra = extra + 1;
                     if (extra < 5) $display("[%0t] UNEXPECTED TLP addr=%h ndw=%0d", $time, a, ndw);
                 end else begin
                     i = exp_rd[ch];
-                    b = (a !== exp_addr[ch][i]) || (ndw != exp_ndw[ch][i]) || (got_n != 4 + ndw)
-                        || (got[0][31:29] !== 3'b011);
-                    for (m = 0; m < ndw && m < 16; m = m + 1)
-                        if (got[4+m] !== exp_data[ch][i][m*32 +: 32]) b = 1;
+                    b = (got_n != 4 + ndw) || (got[0][31:29] !== 3'b011) || (ndw > 64) || (ndw < 1)
+                        || ((a % 4096) + 4 * ndw > 4096);
+                    for (m = 0; m < ndw && m < 124; m = m + 1)
+                        if (got[4+m] !== exp_dw[ch][i+m] || (a + 4*m) !== exp_addr[ch][i+m]
+                            || exp_sess[ch][i+m] != exp_sess[ch][i]) b = 1;
                     if (b) begin
                         bad = bad + 1;
-                        if (bad < 6) $display("[%0t] ch%0d TLP %0d MISMATCH: got addr %h ndw %0d / exp addr %h ndw %0d (sess %0d)",
-                                              $time, ch, i, a, ndw, exp_addr[ch][i], exp_ndw[ch][i], exp_sess[ch][i]);
+                        if (bad < 6) $display("[%0t] ch%0d DW %0d MISMATCH: got TLP addr %h ndw %0d / exp addr %h (sess %0d)",
+                                              $time, ch, i, a, ndw, exp_addr[ch][i], exp_sess[ch][i]);
                     end else ok = ok + 1;
-                    exp_rd[ch] = i + 1;
+                    exp_rd[ch] = i + ndw;
                 end
             end
             got_n = 0;
@@ -166,11 +168,12 @@ module tb_bridge_top;
                 @(posedge aclk);
                 while (!(ch == 0 ? s0_tready : s1_tready)) @(posedge aclk);
                 nbytes = 0; for (d = 0; d < 64; d = d + 1) nbytes = nbytes + kp[d];
-                exp_addr[ch][exp_wr[ch]] = base_of(ch, s) + off;
-                exp_ndw [ch][exp_wr[ch]] = nbytes / 4;
-                exp_sess[ch][exp_wr[ch]] = s;
-                exp_data[ch][exp_wr[ch]] = dat;
-                exp_wr[ch] = exp_wr[ch] + 1;
+                for (pe = 0; pe < nbytes / 4; pe = pe + 1) begin
+                    exp_addr[ch][exp_wr[ch]] = base_of(ch, s) + off + 4 * pe;
+                    exp_dw  [ch][exp_wr[ch]] = dat[pe*32 +: 32];
+                    exp_sess[ch][exp_wr[ch]] = s;
+                    exp_wr[ch] = exp_wr[ch] + 1;
+                end
                 off = off + nbytes;
                 @(negedge aclk);
                 if (ch == 0) s0_tvalid = 0; else s1_tvalid = 0;
@@ -233,8 +236,8 @@ module tb_bridge_top;
 
         $display("------------------------------------------------------------");
         $display(" sessions x channels    : %0d x 2, %0d beats each (last beat 40 B)", SESS, BEATS);
-        $display(" data TLPs expected     : ch0 %0d  ch1 %0d", exp_wr[0], exp_wr[1]);
-        $display(" data TLPs received ok  : %0d   mismatched: %0d   unexpected: %0d   still missing: %0d",
+        $display(" data DWs expected      : ch0 %0d  ch1 %0d", exp_wr[0], exp_wr[1]);
+        $display(" data TLPs received ok  : %0d   mismatched: %0d   unexpected: %0d   still missing DWs: %0d",
                  ok, bad, extra, (exp_wr[0]-exp_rd[0]) + (exp_wr[1]-exp_rd[1]));
         $display(" MSI-X received         : %0d of %0d   bad data: %0d   arrived before its data: %0d",
                  msix_seen, 2*SESS, msix_bad, msix_early);

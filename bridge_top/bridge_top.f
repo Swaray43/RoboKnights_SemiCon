@@ -10,6 +10,7 @@ interconnect_layer/src/rr_arbiter_2ch.v
 protocol_PHY_layer/rtl/bar0_dma_regs.v
 protocol_PHY_layer/rtl/byte_to_symbol.v
 protocol_PHY_layer/rtl/elastic_fifo.v
+protocol_PHY_layer/rtl/err_counters.v
 protocol_PHY_layer/rtl/flit_lane_destriper.v
 protocol_PHY_layer/rtl/flit_lane_striper.v
 protocol_PHY_layer/rtl/flit_sof_strip.v
@@ -28,6 +29,9 @@ protocol_PHY_layer/rtl/pcie_ltssm.v
 protocol_PHY_layer/rtl/pcie_phy_rx.v
 protocol_PHY_layer/rtl/pcie_phy_top.v
 protocol_PHY_layer/rtl/pcie_phy_tx.v
+protocol_PHY_layer/rtl/pcie_phy_tx_w.v
+protocol_PHY_layer/rtl/pcie_phy_rx_w.v
+protocol_PHY_layer/rtl/ts_os_detector_w.v
 protocol_PHY_layer/rtl/pcie_reset_controller.v
 protocol_PHY_layer/rtl/pulse_sync.v
 protocol_PHY_layer/rtl/rst_sync.v
@@ -57,5 +61,6 @@ src-link_layer/hdl/stream_tx_path_top.v
 src-link_layer/hdl/tlp32_to_axis_packetizer.v
 src-link_layer/hdl/tlp_header_parser.v
 src-link_layer/hdl/tlp_packetizer.v
+src-link_layer/hdl/tlp_tx_wide.v
 src-link_layer/hdl/write_data_buffer.v
 bridge_top/rtl/bridge_top.v

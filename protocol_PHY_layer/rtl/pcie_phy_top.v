@@ -52,7 +52,9 @@ module pcie_phy_top #(
     parameter LTSSM_LOSS_CLKS    = 64,    // K6: lost-signal clocks in L0 -> link down
     parameter LTSSM_GAP_ERR_MAX  = 512,   // K6: unframed between-Flit lane cycles -> link down
     parameter LTSSM_L0_TS1_EXIT  = 2,     // K6: TS1s received in L0 -> link down
-    parameter L0_IDLE_FILL       = 1      // K6: TX logical idle in L0; 0 = lanes quiet when idle
+    parameter L0_IDLE_FILL       = 1,     // K6: TX logical idle in L0; 0 = lanes quiet when idle
+    parameter PHY_WIDE           = 0,     // Step 4 item 3: 1 = 32 symbols (8 bytes) per lane per clock
+    parameter LVL_W              = PHY_WIDE ? 384 : 12   // level bus width (do not override)
                                           //     (old behaviour; also turns L0 exits 1/2 off)
 )(
     input  wire         clk,
@@ -113,9 +115,9 @@ module pcie_phy_top #(
     input  wire         phy_tx_eof,
     output wire         phy_tx_ready,            // link layer must stall when low (Seam C)
     // 4-lane PAM4 symbol bus (lane i = [3*i +: 3], signed -3/-1/+1/+3)
-    output wire [11:0]  tx_level,
+    output wire [LVL_W-1:0] tx_level,        // narrow: lane i = [3*i +: 3]; wide: lane i symbol s = [96*i + 3*s +: 3]
     output wire [3:0]   tx_level_valid,
-    input  wire [11:0]  rx_level,
+    input  wire [LVL_W-1:0] rx_level,
     input  wire [3:0]   rx_level_valid,
     // to link_layer_rx
     output wire [255:0] phy_rx_data,
@@ -170,7 +172,9 @@ module pcie_phy_top #(
     input  wire [1:0]   session_overflow_aclk,   // sticky overflow flags (level), shown in BAR0 STATUS
     output wire [WW-1:0] arb_weight_ch0,         // quasi-static: only change between sessions
     output wire [WW-1:0] arb_weight_ch1,
-    output wire [LW-1:0] session_limit
+    output wire [LW-1:0] session_limit,          // ch0
+    output wire [LW-1:0] session_limit_ch1,      // Step 4 item 7
+    input  wire [5:0]   link_err_evt             // Step 4 item 6: {malformed, nak_sent, replay, fec_unc, fec_corr, crc} pulses
 );
 
 // -----------------------------------------------------------------------------
@@ -190,6 +194,8 @@ wire train_rst_n = datapath_rst_n;
 // Detector input: injected bytes when ts_byte_valid, else the received lane
 // bytes (pre-swap, so physical lane numbers reach the reversal detector).
 wire [31:0] rx_lane_bytes;
+wire [255:0] rx_lane_words;          // Step 4 item 3 (wide PHY)
+wire         rx_lw_valid;
 wire [3:0]  rx_lane_bytes_valid;
 wire [3:0]  det_valid = ts_byte_valid ? 4'b1111 : rx_lane_bytes_valid;
 wire [3:0]  osv, ost2;
@@ -198,6 +204,7 @@ wire [7:0]  det_b1    = ts_byte_valid ? ts_byte_l1 : rx_lane_bytes[15:8];
 wire [7:0]  det_b2    = ts_byte_valid ? ts_byte_l2 : rx_lane_bytes[23:16];
 wire [7:0]  det_b3    = ts_byte_valid ? ts_byte_l3 : rx_lane_bytes[31:24];
 
+generate if (PHY_WIDE == 0) begin : g_det_n
 ts_ordered_set_detector u_ts0 (.clk(clk), .rst_n(train_rst_n), .byte_valid(det_valid[0]), .byte_in(det_b0), .lane_num_valid(lnv0), .lane_num_out(lnout0),
                               .os_valid(osv[0]), .os_ts2(ost2[0]));
 ts_ordered_set_detector u_ts1 (.clk(clk), .rst_n(train_rst_n), .byte_valid(det_valid[1]), .byte_in(det_b1), .lane_num_valid(lnv1), .lane_num_out(lnout1),
@@ -206,6 +213,18 @@ ts_ordered_set_detector u_ts2 (.clk(clk), .rst_n(train_rst_n), .byte_valid(det_v
                               .os_valid(osv[2]), .os_ts2(ost2[2]));
 ts_ordered_set_detector u_ts3 (.clk(clk), .rst_n(train_rst_n), .byte_valid(det_valid[3]), .byte_in(det_b3), .lane_num_valid(lnv3), .lane_num_out(lnout3),
                               .os_valid(osv[3]), .os_ts2(ost2[3]));
+
+end else begin : g_det_w
+  // Step 4 item 3: wide detectors on the deskewed lane words (ts_byte_* injection unused)
+  ts_os_detector_w u_tw0 (.clk(clk), .rst_n(train_rst_n), .word_valid(rx_lw_valid), .word_in(rx_lane_words[63:0]),
+                          .lane_num_valid(lnv0), .lane_num_out(lnout0), .os_valid(osv[0]), .os_ts2(ost2[0]));
+  ts_os_detector_w u_tw1 (.clk(clk), .rst_n(train_rst_n), .word_valid(rx_lw_valid), .word_in(rx_lane_words[127:64]),
+                          .lane_num_valid(lnv1), .lane_num_out(lnout1), .os_valid(osv[1]), .os_ts2(ost2[1]));
+  ts_os_detector_w u_tw2 (.clk(clk), .rst_n(train_rst_n), .word_valid(rx_lw_valid), .word_in(rx_lane_words[191:128]),
+                          .lane_num_valid(lnv2), .lane_num_out(lnout2), .os_valid(osv[2]), .os_ts2(ost2[2]));
+  ts_os_detector_w u_tw3 (.clk(clk), .rst_n(train_rst_n), .word_valid(rx_lw_valid), .word_in(rx_lane_words[255:192]),
+                          .lane_num_valid(lnv3), .lane_num_out(lnout3), .os_valid(osv[3]), .os_ts2(ost2[3]));
+end endgenerate
 
 wire reversal_detected_valid, lane_reversed;
 wire lanes_identified;   // lane order decided (lane_reversal_latch)
@@ -258,6 +277,7 @@ pcie_reset_controller u_rst (
 // -----------------------------------------------------------------------------
 // Datapath
 // -----------------------------------------------------------------------------
+generate if (PHY_WIDE == 0) begin : g_dp_n
 pcie_phy_tx #(.FIFO_DEPTH(TX_FIFO_DEPTH), .WORDS_PER_FLIT(WORDS_PER_FLIT),
               .L0_IDLE_FILL(L0_IDLE_FILL)) u_tx (
   .clk(clk), .rst_n(datapath_rst_n),
@@ -280,6 +300,34 @@ pcie_phy_rx #(.WORDS_PER_FLIT(WORDS_PER_FLIT)) u_rx (
   .deskew_locked(phy_deskew_locked),
   .gap_ok(rx_gap_ok), .gap_bad(rx_gap_bad)
 );
+
+assign rx_lane_words = 256'd0;
+assign rx_lw_valid   = 1'b0;
+end else begin : g_dp_w
+pcie_phy_tx_w #(.FIFO_DEPTH(TX_FIFO_DEPTH), .WORDS_PER_FLIT(WORDS_PER_FLIT),
+                .L0_IDLE_FILL(L0_IDLE_FILL)) u_tx (
+  .clk(clk), .rst_n(datapath_rst_n),
+  .os_mode(tx_os_mode), .data_en(link_trained), .ts_sending(phy_ts_sending), .os_done(tx_os_done),
+  .flit_data(phy_tx_data), .flit_valid(phy_tx_valid), .flit_sof(phy_tx_sof), .flit_eof(phy_tx_eof),
+  .flit_ready(phy_tx_ready),
+  .tx_level(tx_level), .tx_level_valid(tx_level_valid),
+  .tx_idle(phy_tx_idle), .framing_err(phy_framing_err)
+);
+pcie_phy_rx_w #(.WORDS_PER_FLIT(WORDS_PER_FLIT)) u_rx (
+  .clk(clk), .rst_n(datapath_rst_n),
+  .rx_level(rx_level), .rx_level_valid(rx_level_valid),
+  .lane_reversed(lane_reversed_locked),
+  .align_en(!link_trained),
+  .flit_out_data(phy_rx_data), .flit_out_valid(phy_rx_valid),
+  .flit_out_sof(phy_rx_sof), .flit_out_eof(phy_rx_eof),
+  .lane_err(phy_lane_err),
+  .deskew_locked(phy_deskew_locked),
+  .gap_ok(rx_gap_ok), .gap_bad(rx_gap_bad),
+  .lane_words(rx_lane_words), .lane_words_valid(rx_lw_valid)
+);
+assign rx_lane_bytes       = 32'd0;
+assign rx_lane_bytes_valid = 4'b0000;
+end endgenerate
 
 // -----------------------------------------------------------------------------
 // Config space (unchanged block)
@@ -317,14 +365,30 @@ end
 wire        bar0_ok     = mem_space_en;
 wire        sel_regs    = (bar0_addr[15:12] == 4'h0);
 wire        sel_msix    = (bar0_addr[15:12] == 4'h1);   // bit 11: 0 = table, 1 = PBA
-wire        regs_wr     = bar0_ok && bar0_wr_en && sel_regs;
-wire        regs_rd     = bar0_ok && bar0_rd_en && sel_regs;
+wire        regs_wr     = bar0_ok && bar0_wr_en && sel_regs && (bar0_addr[11:6] != 6'd1);
+wire        regs_rd     = bar0_ok && bar0_rd_en && sel_regs && (bar0_addr[11:6] != 6'd1);
 wire        msix_mm_wr  = bar0_ok && bar0_wr_en && sel_msix;
 wire        msix_mm_rd  = bar0_ok && bar0_rd_en && sel_msix;
 wire [31:0] regs_rdata, msix_mm_rdata;
 wire        regs_rd_valid, msix_mm_rd_valid;
-assign bar0_rdata    = msix_mm_rd_valid ? msix_mm_rdata : regs_rdata;
-assign bar0_rd_valid = regs_rd_valid | msix_mm_rd_valid;
+
+// ---- Step 4 item 6: sticky error counters at BAR0 0x040-0x064 (PERST#-only reset) ----
+wire        sel_ec   = sel_regs && (bar0_addr[11:6] == 6'd1);          // 0x040-0x07F
+wire [31:0] ec_rdata;
+wire        ec_rd_valid;
+reg  [1:0]  ovf_q;
+reg         hr_q;
+always @(posedge clk or negedge perst_n)
+  if (!perst_n) begin ovf_q <= 2'b00; hr_q <= 1'b0; end
+  else          begin ovf_q <= ovf_s2; hr_q <= hot_reset_request; end
+err_counters #(.N(10)) u_errcnt (
+  .clk(clk), .perst_n(perst_n),
+  .evt({ovf_s2[1] & ~ovf_q[1], ovf_s2[0] & ~ovf_q[0], hot_reset_request & ~hr_q, ltssm_l0_exit, link_err_evt}),
+  .wr_en(bar0_ok && bar0_wr_en && sel_ec), .rd_en(bar0_ok && bar0_rd_en && sel_ec),
+  .idx(bar0_addr[5:2]), .rdata(ec_rdata), .rd_valid(ec_rd_valid)
+);
+assign bar0_rdata    = msix_mm_rd_valid ? msix_mm_rdata : ec_rd_valid ? ec_rdata : regs_rdata;
+assign bar0_rd_valid = regs_rd_valid | msix_mm_rd_valid | ec_rd_valid;
 
 reg  [1:0]  ic_end_seen;     // OPT-5: declared before u_bar0 uses it (was declared after: implicit net)
 bar0_dma_regs #(.WW(WW), .LW(LW)) u_bar0 (
@@ -334,7 +398,7 @@ bar0_dma_regs #(.WW(WW), .LW(LW)) u_bar0 (
   .arm_pulse(arm_pulse),
   .base_addr_ch0(base_ch0), .base_addr_ch1(base_ch1),
   .weight_ch0(arb_weight_ch0), .weight_ch1(arb_weight_ch1),
-  .session_limit(session_limit),
+  .session_limit(session_limit), .session_limit_ch1(session_limit_ch1),
   .msix_vec_ch0(msix_vec_ch0), .msix_vec_ch1(msix_vec_ch1),
   .tc_ch0(tc_ch0), .tc_ch1(tc_ch1),
   .session_valid(session_valid), .status_in(ovf_s2), .ic_end_seen(ic_end_seen),

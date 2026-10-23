@@ -156,7 +156,7 @@ module tb_credit_gate_proof;
         stall_cycles = 0;
         repeat (200) begin
             @(posedge clk);
-            if (dut.split_valid) begin
+            if (dut.credit_alloc_valid) begin
                 stall_cycles = stall_cycles + 1;
                 if (dut.credit_grant) begin
                     $display("FAIL Phase2: credit_grant asserted with ph credits exhausted (cyc %0d)", stall_cycles);

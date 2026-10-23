@@ -17,7 +17,7 @@
 //   * Sequencing, duplicate filtering and NAK generation live in
 //     data_link_layer_top, because they need the TX side.
 //
-// Latency: 1 cycle after the 8th word to decode/check, output registered.
+// Latency: 3 cycles after the 8th word (Step 4 T1 decode pipeline), output registered.
 // No ready on this side: the PHY cannot be stalled. The consumer must
 // take rx_flit_valid pulses when they come; data_link_layer_top NAKs a
 // Flit it has no room for and the sender replays it.
@@ -95,13 +95,88 @@ module link_layer_rx #(
     end
 
     // ---------------- FEC decode + CRC check ----------------
-    wire [FL_PROT_W+1:0] dec      = flit_fec_decode(raw_r[FL_PROT_W-1:0], raw_r[FLIT_W-1:FL_FEC_LO]);
-    wire                 dec_unc  = dec[FL_PROT_W+1];
-    wire                 dec_cor  = dec[FL_PROT_W];
-    wire [FL_PROT_W-1:0] fixed    = dec[FL_PROT_W-1:0];
-    wire [63:0]          crc_calc = flit_crc64(fixed[FL_BODY_W-1:0]);
-    wire                 crc_ok   = (crc_calc == fixed[FL_PROT_W-1:FL_CRC_LO]);
-    wire [FL_DLP_W-1:0]  dlp      = fixed[FL_BODY_W-1:FL_DLP_LO];
+    // Step 4 T1: the old single-cycle decode (syndrome -> correction -> CRC
+    // over the corrected data) was the worst path of the design (17 logic
+    // levels, -4.4 ns at 250 MHz). It is now three register stages:
+    //   D1  per-interleave syndrome and overall parity vs the received FEC bits
+    //   D2  single-bit correction (or flag uncorrectable)
+    //   D3  CRC-64 over the corrected body, compare, decode the DLP
+    // Same results as flit_fec_decode / flit_crc64, two clocks later.
+    // A Flit arrives at most every 8 clocks; the pipeline takes one per clock.
+    reg                  d1_v;
+    reg [FL_PROT_W-1:0]  d1_d;
+    reg [9:0]            d1_s  [0:2];
+    reg                  d1_o  [0:2];
+    reg                  d2_v;
+    reg [FL_PROT_W-1:0]  d2_fixed;
+    reg                  d2_unc, d2_cor;
+
+    integer jj, bb, kk;
+    reg [10:0] sp_c, p_c;
+    reg [9:0]  c_rx_c;
+    reg        ovr_rx_c;
+
+    // D2 combinational correction from the D1 registers
+    reg [FL_PROT_W-1:0] fix_c;
+    reg                 unc_c, cor_c, found_c;
+    always @(*) begin
+        fix_c = d1_d; unc_c = 1'b0; cor_c = 1'b0;
+        for (jj = 0; jj < 3; jj = jj + 1) begin
+            if (d1_s[jj] == 10'd0 && !d1_o[jj]) begin
+                // clean
+            end else if (d1_o[jj]) begin
+                if (d1_s[jj] == 10'd0 || fl_is_pow2({1'b0, d1_s[jj]})) begin
+                    cor_c = 1'b1;                       // error in a check bit / overall bit
+                end else begin
+                    p_c = 11'd2; found_c = 1'b0;
+                    for (bb = jj; bb < FL_FEC_BYTES; bb = bb + 3) begin
+                        for (kk = 0; kk < 8; kk = kk + 1) begin
+                            p_c = p_c + 11'd1;
+                            if (fl_is_pow2(p_c)) p_c = p_c + 11'd1;
+                            if (p_c[9:0] == d1_s[jj] && p_c[10] == 1'b0) begin
+                                fix_c[bb*8+kk] = ~fix_c[bb*8+kk];
+                                found_c = 1'b1;
+                            end
+                        end
+                    end
+                    if (found_c) cor_c = 1'b1; else unc_c = 1'b1;
+                end
+            end else begin
+                unc_c = 1'b1;                           // s != 0, even parity: double error
+            end
+        end
+    end
+
+    wire [63:0]          crc_calc = flit_crc64(d2_fixed[FL_BODY_W-1:0]);
+    wire                 crc_ok   = (crc_calc == d2_fixed[FL_PROT_W-1:FL_CRC_LO]);
+    wire [FL_DLP_W-1:0]  dlp      = d2_fixed[FL_BODY_W-1:FL_DLP_LO];
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            d1_v <= 1'b0; d1_d <= {FL_PROT_W{1'b0}};
+            d1_s[0] <= 10'd0; d1_s[1] <= 10'd0; d1_s[2] <= 10'd0;
+            d1_o[0] <= 1'b0;  d1_o[1] <= 1'b0;  d1_o[2] <= 1'b0;
+            d2_v <= 1'b0; d2_fixed <= {FL_PROT_W{1'b0}}; d2_unc <= 1'b0; d2_cor <= 1'b0;
+        end else begin
+            d1_v <= raw_v;
+            if (raw_v) begin
+                d1_d <= raw_r[FL_PROT_W-1:0];
+                for (jj = 0; jj < 3; jj = jj + 1) begin
+                    sp_c     = fl_cw_syn(raw_r[FL_PROT_W-1:0], jj);
+                    c_rx_c   = raw_r[FL_FEC_LO + jj*FEC_CW_BITS +: 10];
+                    ovr_rx_c = raw_r[FL_FEC_LO + jj*FEC_CW_BITS + 10];
+                    d1_s[jj] <= sp_c[9:0] ^ c_rx_c;
+                    d1_o[jj] <= sp_c[10] ^ (^c_rx_c) ^ ovr_rx_c;
+                end
+            end
+            d2_v <= d1_v;
+            if (d1_v) begin
+                d2_fixed <= fix_c;
+                d2_unc   <= unc_c;
+                d2_cor   <= cor_c;
+            end
+        end
+    end
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -118,18 +193,18 @@ module link_layer_rx #(
             fec_err       <= 1'b0;
             fec_corrected <= 1'b0;
         end else begin
-            rx_flit_valid <= raw_v;
-            crc_err       <= raw_v && !dec_unc && !crc_ok;
-            fec_err       <= raw_v && dec_unc;
-            fec_corrected <= raw_v && dec_cor && !dec_unc;
-            if (raw_v) begin
-                rx_flit_ok   <= !dec_unc && crc_ok;
+            rx_flit_valid <= d2_v;
+            crc_err       <= d2_v && !d2_unc && !crc_ok;
+            fec_err       <= d2_v && d2_unc;
+            fec_corrected <= d2_v && d2_cor && !d2_unc;
+            if (d2_v) begin
+                rx_flit_ok   <= !d2_unc && crc_ok;
                 rx_kind      <= dlp[13:12];
                 rx_seq       <= dlp[11:0];
                 rx_ack_valid <= dlp[14];
                 rx_nak_valid <= dlp[15];
                 rx_ackn_seq  <= dlp[27:16];
-                rx_payload   <= fixed[FL_TLP_W-1:0];
+                rx_payload   <= d2_fixed[FL_TLP_W-1:0];
                 rx_fc_dllp   <= dlp[FL_DLP_FC_BIT];
             end
         end

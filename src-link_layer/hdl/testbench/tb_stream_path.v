@@ -56,7 +56,7 @@ module tb_stream_path #(parameter IDLE_FLUSH = 8);
     wire err_xlat_miss, err_addr_ovf, stat_split, err_tkeep_gap;
     wire crc_err, fec_err, fec_corr, replay_ev;
 
-    stream_tx_path_top #(.REPLAY_TIMEOUT(4096), .FLIT_IDLE_FLUSH(IDLE_FLUSH)) dut (
+    stream_tx_path_top #(.REPLAY_TIMEOUT(4096), .FLIT_IDLE_FLUSH(IDLE_FLUSH), .MERGE_EN(0)) dut (   // exact one-TLP-per-beat model; merging is checked by the bridge benches
         .clk(clk), .rst_n(rst_n),
         .s_axis_tdata(s_tdata), .s_axis_tkeep(s_tkeep), .s_axis_tuser(s_tuser),
         .s_axis_tlast(s_tlast), .s_axis_tvalid(s_tvalid), .s_axis_tready(s_tready),

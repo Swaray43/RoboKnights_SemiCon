@@ -100,163 +100,41 @@ module link_layer_tx #(
 
     `include "flit_defs.vh"
 
-    localparam ST_IDLE = 2'd0;
-    localparam ST_CALC = 2'd1;
-    localparam ST_SEND = 2'd2;
-
-    reg [1:0]            state;
-    reg [FL_BODY_W-1:0]  body_r;      // TLP area + DLP
-    reg [FLIT_W-1:0]     flit_r;      // complete protected Flit
+    // ---- Step 4 T3: full-width 3-stage pipeline (replaces OPT-4's 9-cycle
+    // chunked walk). One Flit can be loaded every cycle; the 8-word send
+    // is the only rate limit (8 clocks per Flit, was 18).
+    //   L  (load)   body = DLP + TLP area, from the replay buffer / ACK / FC
+    //   C1 (crc)    crc64 over the body, FEC syndromes of the body bytes
+    //   C2 (fec)    FEC syndromes of the CRC bytes added, check bits formed
+    //   S  (send)   8 x 256-bit words to the PHY, ready-stalled
+    // Bit-exact with flit_defs.vh's flit_crc64 / flit_fec_encode (the FEC is
+    // linear, so syndrome(body + crc) = syndrome(body) ^ syndrome(crc)).
+    reg                  l_v;          // loaded body waiting for C1
+    reg [FL_BODY_W-1:0]  l_body;
+    reg                  c1_v;
+    reg [FL_BODY_W-1:0]  c1_body;
+    reg [63:0]           c1_crc;
+    reg [32:0]           c1_sp;        // {sp2, sp1, sp0}, 11 bits each, body bytes only
+    reg                  c2_v;
+    reg [FLIT_W-1:0]     c2_flit;
+    reg                  snd;          // sending
+    reg [FLIT_W-1:0]     flit_r;
     reg [2:0]            word_idx;
 
-    // ---- OPT-4 pipeline state ----
-    reg [3:0]  calc_idx;              // 0..8 across ST_CALC
-    reg [63:0] crc_acc;               // running CRC-64 state (pre-xorout)
-    reg [9:0]  fec_s   [0:2];         // running Hamming syndrome, per interleave
-    reg        fec_par [0:2];         // running overall parity, per interleave
-    reg [63:0] body_crc_r;            // latched final CRC (post ~, i.e. xorout applied)
-
-    // one incremental CRC-64/ECMA-182 step over the low `len` bits of
-    // `chunk` -- identical per-bit update to flit_defs.vh's flit_crc64,
-    // just resumable via c_in/returned state instead of a single 1936-bit
-    // sweep. `len` must be a literal at the call site (see OPT-4 note above).
-    function [63:0] flit_crc64_step;
-        input [63:0]  c_in;
-        input [255:0] chunk;
-        input integer len;
-        integer i;
-        reg [63:0] c;
-        begin
-            c = c_in;
-            // constant loop bound (Yosys/LibreLane need one); len gates the step
-            for (i = 0; i < 256; i = i + 1) begin
-                if (i < len) begin
-                    if (c[63] ^ chunk[i])
-                        c = (c << 1) ^ 64'h42F0E1EBA9EA3693;
-                    else
-                        c = c << 1;
-                end
-            end
-            flit_crc64_step = c;
-        end
-    endfunction
-
-    // Hamming position counter after `n` data bits of one interleave have
-    // already been placed -- purely structural (same skip-the-powers-of-2
-    // sequence as flit_defs.vh's fl_cw_syn, starting at p=2), so it can be
-    // evaluated with constant inputs at each call site below; no running
-    // position counter needs to be carried in hardware, only the
-    // syndrome/parity accumulator (fec_s/fec_par above).
-    function [10:0] calc_p_at;
-        input integer n;
-        integer i;
-        reg [10:0] p;
-        begin
-            p = 11'd2;
-            for (i = 0; i < n; i = i + 1) begin
-                p = p + 11'd1;
-                if (fl_is_pow2(p)) p = p + 11'd1;
-            end
-            calc_p_at = p;
-        end
-    endfunction
-
-    // number of interleave-j bytes strictly before global byte `byte_lo`
-    function integer calc_j_cnt;
-        input integer byte_lo;
-        input integer j;
-        integer b, c;
-        begin
-            c = 0;
-            for (b = 0; b < byte_lo; b = b + 1)
-                if ((b % 3) == j) c = c + 1;
-            calc_j_cnt = c;
-        end
-    endfunction
-
-    // incremental partial Hamming syndrome/parity contribution of one
-    // chunk's bytes belonging to interleave j. byte_lo/len_bits/j must be
-    // literals at the call site (see OPT-4 note above); p_start is then a
-    // genuine elaboration-time constant via calc_p_at/calc_j_cnt.
-    function [10:0] calc_fec_chunk;
-        input [255:0] chunk;
-        input integer byte_lo;
-        input integer len_bits;
-        input integer j;
-        integer b, k, bb, last_byte;
-        reg [10:0] p;
-        reg [9:0]  s;
-        reg        par;
-        begin
-            p = calc_p_at(calc_j_cnt(byte_lo, j) * 8);
-            s = 10'd0; par = 1'b0;
-            last_byte = byte_lo + (len_bits / 8) - 1;
-            // constant loop bound (Yosys/LibreLane need one): walk the 32
-            // bytes of the 256-bit chunk, skipping those past len_bits
-            for (bb = 0; bb < 256; bb = bb + 8) begin
-                b = byte_lo + (bb / 8);
-                if ((b <= last_byte) && ((b % 3) == j)) begin
-                    for (k = 0; k < 8; k = k + 1) begin
-                        p = p + 11'd1;
-                        if (fl_is_pow2(p)) p = p + 11'd1;
-                        if (chunk[bb+k]) begin
-                            s   = s ^ p[9:0];
-                            par = ~par;
-                        end
-                    end
-                end
-            end
-            calc_fec_chunk = {par, s};
-        end
-    endfunction
-
-    // thin wrappers so no call site ever part-selects a function call's
-    // return value directly (kept portable across simulators)
-    function [9:0] calc_fec_chunk_s;
-        input [255:0] chunk;
-        input integer byte_lo;
-        input integer len_bits;
-        input integer j;
-        reg [10:0] r;
-        begin
-            r = calc_fec_chunk(chunk, byte_lo, len_bits, j);
-            calc_fec_chunk_s = r[9:0];
-        end
-    endfunction
-
-    function calc_fec_chunk_par;
-        input [255:0] chunk;
-        input integer byte_lo;
-        input integer len_bits;
-        input integer j;
-        reg [10:0] r;
-        begin
-            r = calc_fec_chunk(chunk, byte_lo, len_bits, j);
-            calc_fec_chunk_par = r[10];
-        end
-    endfunction
-
-    // calc_idx==8's chunk is the (now-finalized) CRC field -- needs the
-    // final per-interleave accumulate done combinationally in that same
-    // cycle (there's no calc_idx==9 to read the updated fec_s/fec_par
-    // registers back from), so compute it here rather than in the always
-    // block below.
-    wire [10:0] fec8_0 = calc_fec_chunk({192'd0, body_crc_r}, 242, 64, 0);
-    wire [10:0] fec8_1 = calc_fec_chunk({192'd0, body_crc_r}, 242, 64, 1);
-    wire [10:0] fec8_2 = calc_fec_chunk({192'd0, body_crc_r}, 242, 64, 2);
-    wire [9:0]  fec_s0_final   = fec_s[0]   ^ fec8_0[9:0];
-    wire        fec_par0_final = fec_par[0] ^ fec8_0[10];
-    wire [9:0]  fec_s1_final   = fec_s[1]   ^ fec8_1[9:0];
-    wire        fec_par1_final = fec_par[1] ^ fec8_1[10];
-    wire [9:0]  fec_s2_final   = fec_s[2]   ^ fec8_2[9:0];
-    wire        fec_par2_final = fec_par[2] ^ fec8_2[10];
+    wire snd_last  = snd && m_sys_bus_ready && (word_idx == 3'd7);
+    wire snd_free  = !snd || snd_last;
+    wire c2_take   = c2_v && snd_free;
+    wire c2_free   = !c2_v || c2_take;
+    wire c1_take   = c1_v && c2_free;
+    wire c1_free   = !c1_v || c1_take;
+    wire l_take    = l_v && c1_free;
+    wire l_free    = !l_v || l_take;
 
     wire have_ackn = ack_req || nak_req;
 
-    // Accept a payload Flit only when idle
-    assign s_ready = (state == ST_IDLE) && !dllp_req;   // a DLLP Flit wins the slot: do not also consume the payload
+    // A DLLP Flit wins the slot: do not also consume the payload
+    assign s_ready = l_free && !dllp_req;
 
-    // DLP for whatever is loaded this cycle
     function [FL_DLP_W-1:0] make_dlp;
         input [1:0]       kind;
         input [SEQ_W-1:0] seq;
@@ -280,176 +158,86 @@ module link_layer_tx #(
 
     // Combinational so the scheduler clears exactly the request that was
     // sampled; a newer request arriving on the same edge wins over the clear.
-    assign ackn_taken = (state == ST_IDLE) && have_ackn;
-    assign dllp_taken = (state == ST_IDLE) && dllp_req;
+    assign ackn_taken = l_free && have_ackn;
+    assign dllp_taken = l_free && dllp_req;
 
-    // G2: DLP of an FC DLLP control Flit
     reg [FL_DLP_W-1:0] fc_dlp;
     always @(*) begin
         fc_dlp = make_dlp(FLIT_KIND_CONTROL, {SEQ_W{1'b0}}, send_ack, send_nak, ackn_seq);
         fc_dlp[FL_DLP_FC_BIT] = 1'b1;
     end
 
+    // FEC syndrome helpers on the full 2000-bit protected area
+    function [32:0] fec_sp3;
+        input [FL_PROT_W-1:0] d;
+        begin
+            fec_sp3 = {fl_cw_syn(d, 2), fl_cw_syn(d, 1), fl_cw_syn(d, 0)};
+        end
+    endfunction
+    function [10:0] cw_bits;           // check bits + overall parity from {par, syn}
+        input [10:0] sp;
+        begin
+            cw_bits = {sp[10] ^ (^sp[9:0]), sp[9:0]};
+        end
+    endfunction
+
+    wire [32:0] sp_crc = fec_sp3({c1_crc, {FL_BODY_W{1'b0}}});
+    wire [32:0] sp_all = c1_sp ^ sp_crc;
+
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state      <= ST_IDLE;
-            body_r     <= {FL_BODY_W{1'b0}};
-            flit_r     <= {FLIT_W{1'b0}};
-            word_idx   <= 3'd0;
-            calc_idx   <= 4'd0;
-            crc_acc    <= {64{1'b1}};
-            body_crc_r <= 64'd0;
-            fec_s[0]   <= 10'd0; fec_par[0] <= 1'b0;
-            fec_s[1]   <= 10'd0; fec_par[1] <= 1'b0;
-            fec_s[2]   <= 10'd0; fec_par[2] <= 1'b0;
+            l_v <= 1'b0; l_body <= {FL_BODY_W{1'b0}};
+            c1_v <= 1'b0; c1_body <= {FL_BODY_W{1'b0}}; c1_crc <= 64'd0; c1_sp <= 33'd0;
+            c2_v <= 1'b0; c2_flit <= {FLIT_W{1'b0}};
+            snd <= 1'b0; flit_r <= {FLIT_W{1'b0}}; word_idx <= 3'd0;
         end else begin
-            case (state)
-                ST_IDLE: begin
-                    if (dllp_req) begin
-                        body_r   <= {fc_dlp, {(FL_TLP_W-96){1'b0}}, dllp_data};
-                        state    <= ST_CALC;
-                        calc_idx <= 4'd0;
-                        crc_acc  <= {64{1'b1}};
-                        fec_s[0] <= 10'd0; fec_par[0] <= 1'b0;
-                        fec_s[1] <= 10'd0; fec_par[1] <= 1'b0;
-                        fec_s[2] <= 10'd0; fec_par[2] <= 1'b0;
-                    end else if (s_valid) begin
-                        body_r   <= {make_dlp(FLIT_KIND_PAYLOAD, s_seq, send_ack, send_nak, ackn_seq),
-                                     s_payload};
-                        state    <= ST_CALC;
-                        calc_idx <= 4'd0;
-                        crc_acc  <= {64{1'b1}};
-                        fec_s[0] <= 10'd0; fec_par[0] <= 1'b0;
-                        fec_s[1] <= 10'd0; fec_par[1] <= 1'b0;
-                        fec_s[2] <= 10'd0; fec_par[2] <= 1'b0;
-                    end else if (have_ackn) begin
-                        body_r   <= {make_dlp(FLIT_KIND_CONTROL, {SEQ_W{1'b0}}, send_ack, send_nak, ackn_seq),
-                                     {FL_TLP_W{1'b0}}};
-                        state    <= ST_CALC;
-                        calc_idx <= 4'd0;
-                        crc_acc  <= {64{1'b1}};
-                        fec_s[0] <= 10'd0; fec_par[0] <= 1'b0;
-                        fec_s[1] <= 10'd0; fec_par[1] <= 1'b0;
-                        fec_s[2] <= 10'd0; fec_par[2] <= 1'b0;
-                    end
+            // ---- L: load (same priority as before: FC DLLP, payload, ACK/NAK) ----
+            if (l_take) l_v <= 1'b0;
+            if (l_free) begin
+                if (dllp_req) begin
+                    l_body <= {fc_dlp, {(FL_TLP_W-96){1'b0}}, dllp_data};
+                    l_v    <= 1'b1;
+                end else if (s_valid) begin
+                    l_body <= {make_dlp(FLIT_KIND_PAYLOAD, s_seq, send_ack, send_nak, ackn_seq), s_payload};
+                    l_v    <= 1'b1;
+                end else if (have_ackn) begin
+                    l_body <= {make_dlp(FLIT_KIND_CONTROL, {SEQ_W{1'b0}}, send_ack, send_nak, ackn_seq),
+                               {FL_TLP_W{1'b0}}};
+                    l_v    <= 1'b1;
                 end
-                // ---- OPT-4: one 256-bit (or shorter, final) chunk per cycle ----
-                ST_CALC: begin
-                    case (calc_idx)
-                        4'd0: begin
-                            crc_acc    <= flit_crc64_step(crc_acc, body_r[0*256 +: 256], 256);
-                            fec_s[0]   <= fec_s[0]   ^ calc_fec_chunk_s(body_r[0*256 +: 256], 0*32, 256, 0);
-                            fec_par[0] <= fec_par[0] ^ calc_fec_chunk_par(body_r[0*256 +: 256], 0*32, 256, 0);
-                            fec_s[1]   <= fec_s[1]   ^ calc_fec_chunk_s(body_r[0*256 +: 256], 0*32, 256, 1);
-                            fec_par[1] <= fec_par[1] ^ calc_fec_chunk_par(body_r[0*256 +: 256], 0*32, 256, 1);
-                            fec_s[2]   <= fec_s[2]   ^ calc_fec_chunk_s(body_r[0*256 +: 256], 0*32, 256, 2);
-                            fec_par[2] <= fec_par[2] ^ calc_fec_chunk_par(body_r[0*256 +: 256], 0*32, 256, 2);
-                            calc_idx   <= 4'd1;
-                        end
-                        4'd1: begin
-                            crc_acc    <= flit_crc64_step(crc_acc, body_r[1*256 +: 256], 256);
-                            fec_s[0]   <= fec_s[0]   ^ calc_fec_chunk_s(body_r[1*256 +: 256], 1*32, 256, 0);
-                            fec_par[0] <= fec_par[0] ^ calc_fec_chunk_par(body_r[1*256 +: 256], 1*32, 256, 0);
-                            fec_s[1]   <= fec_s[1]   ^ calc_fec_chunk_s(body_r[1*256 +: 256], 1*32, 256, 1);
-                            fec_par[1] <= fec_par[1] ^ calc_fec_chunk_par(body_r[1*256 +: 256], 1*32, 256, 1);
-                            fec_s[2]   <= fec_s[2]   ^ calc_fec_chunk_s(body_r[1*256 +: 256], 1*32, 256, 2);
-                            fec_par[2] <= fec_par[2] ^ calc_fec_chunk_par(body_r[1*256 +: 256], 1*32, 256, 2);
-                            calc_idx   <= 4'd2;
-                        end
-                        4'd2: begin
-                            crc_acc    <= flit_crc64_step(crc_acc, body_r[2*256 +: 256], 256);
-                            fec_s[0]   <= fec_s[0]   ^ calc_fec_chunk_s(body_r[2*256 +: 256], 2*32, 256, 0);
-                            fec_par[0] <= fec_par[0] ^ calc_fec_chunk_par(body_r[2*256 +: 256], 2*32, 256, 0);
-                            fec_s[1]   <= fec_s[1]   ^ calc_fec_chunk_s(body_r[2*256 +: 256], 2*32, 256, 1);
-                            fec_par[1] <= fec_par[1] ^ calc_fec_chunk_par(body_r[2*256 +: 256], 2*32, 256, 1);
-                            fec_s[2]   <= fec_s[2]   ^ calc_fec_chunk_s(body_r[2*256 +: 256], 2*32, 256, 2);
-                            fec_par[2] <= fec_par[2] ^ calc_fec_chunk_par(body_r[2*256 +: 256], 2*32, 256, 2);
-                            calc_idx   <= 4'd3;
-                        end
-                        4'd3: begin
-                            crc_acc    <= flit_crc64_step(crc_acc, body_r[3*256 +: 256], 256);
-                            fec_s[0]   <= fec_s[0]   ^ calc_fec_chunk_s(body_r[3*256 +: 256], 3*32, 256, 0);
-                            fec_par[0] <= fec_par[0] ^ calc_fec_chunk_par(body_r[3*256 +: 256], 3*32, 256, 0);
-                            fec_s[1]   <= fec_s[1]   ^ calc_fec_chunk_s(body_r[3*256 +: 256], 3*32, 256, 1);
-                            fec_par[1] <= fec_par[1] ^ calc_fec_chunk_par(body_r[3*256 +: 256], 3*32, 256, 1);
-                            fec_s[2]   <= fec_s[2]   ^ calc_fec_chunk_s(body_r[3*256 +: 256], 3*32, 256, 2);
-                            fec_par[2] <= fec_par[2] ^ calc_fec_chunk_par(body_r[3*256 +: 256], 3*32, 256, 2);
-                            calc_idx   <= 4'd4;
-                        end
-                        4'd4: begin
-                            crc_acc    <= flit_crc64_step(crc_acc, body_r[4*256 +: 256], 256);
-                            fec_s[0]   <= fec_s[0]   ^ calc_fec_chunk_s(body_r[4*256 +: 256], 4*32, 256, 0);
-                            fec_par[0] <= fec_par[0] ^ calc_fec_chunk_par(body_r[4*256 +: 256], 4*32, 256, 0);
-                            fec_s[1]   <= fec_s[1]   ^ calc_fec_chunk_s(body_r[4*256 +: 256], 4*32, 256, 1);
-                            fec_par[1] <= fec_par[1] ^ calc_fec_chunk_par(body_r[4*256 +: 256], 4*32, 256, 1);
-                            fec_s[2]   <= fec_s[2]   ^ calc_fec_chunk_s(body_r[4*256 +: 256], 4*32, 256, 2);
-                            fec_par[2] <= fec_par[2] ^ calc_fec_chunk_par(body_r[4*256 +: 256], 4*32, 256, 2);
-                            calc_idx   <= 4'd5;
-                        end
-                        4'd5: begin
-                            crc_acc    <= flit_crc64_step(crc_acc, body_r[5*256 +: 256], 256);
-                            fec_s[0]   <= fec_s[0]   ^ calc_fec_chunk_s(body_r[5*256 +: 256], 5*32, 256, 0);
-                            fec_par[0] <= fec_par[0] ^ calc_fec_chunk_par(body_r[5*256 +: 256], 5*32, 256, 0);
-                            fec_s[1]   <= fec_s[1]   ^ calc_fec_chunk_s(body_r[5*256 +: 256], 5*32, 256, 1);
-                            fec_par[1] <= fec_par[1] ^ calc_fec_chunk_par(body_r[5*256 +: 256], 5*32, 256, 1);
-                            fec_s[2]   <= fec_s[2]   ^ calc_fec_chunk_s(body_r[5*256 +: 256], 5*32, 256, 2);
-                            fec_par[2] <= fec_par[2] ^ calc_fec_chunk_par(body_r[5*256 +: 256], 5*32, 256, 2);
-                            calc_idx   <= 4'd6;
-                        end
-                        4'd6: begin
-                            crc_acc    <= flit_crc64_step(crc_acc, body_r[6*256 +: 256], 256);
-                            fec_s[0]   <= fec_s[0]   ^ calc_fec_chunk_s(body_r[6*256 +: 256], 6*32, 256, 0);
-                            fec_par[0] <= fec_par[0] ^ calc_fec_chunk_par(body_r[6*256 +: 256], 6*32, 256, 0);
-                            fec_s[1]   <= fec_s[1]   ^ calc_fec_chunk_s(body_r[6*256 +: 256], 6*32, 256, 1);
-                            fec_par[1] <= fec_par[1] ^ calc_fec_chunk_par(body_r[6*256 +: 256], 6*32, 256, 1);
-                            fec_s[2]   <= fec_s[2]   ^ calc_fec_chunk_s(body_r[6*256 +: 256], 6*32, 256, 2);
-                            fec_par[2] <= fec_par[2] ^ calc_fec_chunk_par(body_r[6*256 +: 256], 6*32, 256, 2);
-                            calc_idx   <= 4'd7;
-                        end
-                        4'd7: begin
-                            // last body chunk: 144 bits = bytes 224..241
-                            // (TLP tail + DLP); finishes the CRC.
-                            crc_acc    <= flit_crc64_step(crc_acc, {112'd0, body_r[1935:1792]}, 144);
-                            body_crc_r <= ~flit_crc64_step(crc_acc, {112'd0, body_r[1935:1792]}, 144);
-                            fec_s[0]   <= fec_s[0]   ^ calc_fec_chunk_s({112'd0, body_r[1935:1792]}, 224, 144, 0);
-                            fec_par[0] <= fec_par[0] ^ calc_fec_chunk_par({112'd0, body_r[1935:1792]}, 224, 144, 0);
-                            fec_s[1]   <= fec_s[1]   ^ calc_fec_chunk_s({112'd0, body_r[1935:1792]}, 224, 144, 1);
-                            fec_par[1] <= fec_par[1] ^ calc_fec_chunk_par({112'd0, body_r[1935:1792]}, 224, 144, 1);
-                            fec_s[2]   <= fec_s[2]   ^ calc_fec_chunk_s({112'd0, body_r[1935:1792]}, 224, 144, 2);
-                            fec_par[2] <= fec_par[2] ^ calc_fec_chunk_par({112'd0, body_r[1935:1792]}, 224, 144, 2);
-                            calc_idx   <= 4'd8;
-                        end
-                        4'd8: begin
-                            // CRC-bytes chunk: finishes FEC (body_crc_r was
-                            // latched by the 4'd7 arm above). fec*_final
-                            // are the already-combined "next" values (see
-                            // the wires above this always block).
-                            flit_r   <= { 15'd0,
-                                          {fec_par2_final ^ (^fec_s2_final), fec_s2_final},
-                                          {fec_par1_final ^ (^fec_s1_final), fec_s1_final},
-                                          {fec_par0_final ^ (^fec_s0_final), fec_s0_final},
-                                          body_crc_r, body_r };
-                            word_idx <= 3'd0;
-                            state    <= ST_SEND;
-                        end
-                        default: calc_idx <= 4'd0;
-                    endcase
-                end
-                ST_SEND: begin
-                    if (m_sys_bus_ready) begin
-                        if (word_idx == 3'd7) state <= ST_IDLE;
-                        word_idx <= word_idx + 3'd1;
-                    end
-                end
-                default: state <= ST_IDLE;
-            endcase
+            end
+            // ---- C1 ----
+            if (c1_take) c1_v <= 1'b0;
+            if (l_take) begin
+                c1_v    <= 1'b1;
+                c1_body <= l_body;
+                c1_crc  <= flit_crc64(l_body);
+                c1_sp   <= fec_sp3({64'd0, l_body});
+            end
+            // ---- C2 ----
+            if (c2_take) c2_v <= 1'b0;
+            if (c1_take) begin
+                c2_v    <= 1'b1;
+                c2_flit <= {15'd0, cw_bits(sp_all[32:22]), cw_bits(sp_all[21:11]), cw_bits(sp_all[10:0]),
+                            c1_crc, c1_body};
+            end
+            // ---- S ----
+            if (snd && m_sys_bus_ready) begin
+                word_idx <= word_idx + 3'd1;
+                if (word_idx == 3'd7) snd <= 1'b0;
+            end
+            if (c2_take) begin
+                snd      <= 1'b1;
+                flit_r   <= c2_flit;
+                word_idx <= 3'd0;
+            end
         end
     end
 
-    assign m_sys_bus_valid = (state == ST_SEND);
+    assign m_sys_bus_valid = snd;
     assign m_sys_bus_data  = flit_r[word_idx*SYS_BUS_W +: SYS_BUS_W];
-    assign m_sys_bus_sof   = (state == ST_SEND) && (word_idx == 3'd0);
-    assign m_sys_bus_eof   = (state == ST_SEND) && (word_idx == 3'd7);
+    assign m_sys_bus_sof   = snd && (word_idx == 3'd0);
+    assign m_sys_bus_eof   = snd && (word_idx == 3'd7);
 
     // synthesis translate_off
     initial begin

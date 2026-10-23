@@ -18,7 +18,10 @@
 module bridge_top #(
     parameter DATA_W = 512,
     parameter KEEP_W = DATA_W/8,
-    parameter SOFF_W = 24
+    parameter SOFF_W = 24,
+    parameter PHY_WIDE = 1,                      // Step 4 item 3: wide PHY (8 B per lane per clock)
+    parameter MERGE_EN = 1,                      // Step 4 item 2: merge beats up to Max Payload
+    parameter LVL_W  = PHY_WIDE ? 384 : 12
 )(
     input  wire              clk,       // pcie_clk: link + PHY + interconnect read side
     input  wire              perst_n,
@@ -31,6 +34,7 @@ module bridge_top #(
     input  wire              s1_tlast,  input wire s1_tvalid, output wire s1_tready,
     output wire [1:0]        session_active,
     output wire [1:0]        session_overflow,
+    output wire [1:0]        session_end,          // Step 4 item 7: aclk pulse per channel at session end
 
     // ---- inbound TLPs (host -> device) ----
     output wire              m_rx_axis_tvalid,
@@ -68,9 +72,9 @@ module bridge_top #(
     input  wire              tbl_wr_mask,
 
     // ---- SerDes symbol bus ----
-    output wire [11:0]       tx_level,
+    output wire [LVL_W-1:0]  tx_level,
     output wire [3:0]        tx_level_valid,
-    input  wire [11:0]       rx_level,
+    input  wire [LVL_W-1:0]  rx_level,
     input  wire [3:0]        rx_level_valid,
 
     // ---- status ----
@@ -89,7 +93,7 @@ module bridge_top #(
 
     wire [1:0]  session_start_aclk;
     wire [7:0]  w0, w1;
-    wire [23:0] lim;
+    wire [23:0] lim, lim1;            // Step 4 item 7: per-channel session limits
 
     interconnect_top u_ic (
         .aclk(aclk), .arstn(arstn),
@@ -97,19 +101,16 @@ module bridge_top #(
         .ch0_session_start(session_start_aclk[0]), .ch0_session_limit(lim),
         .ch0_session_active(session_active[0]), .ch0_session_overflow(session_overflow[0]),
         .s1_tdata(s1_tdata), .s1_tkeep(s1_tkeep), .s1_tlast(s1_tlast), .s1_tvalid(s1_tvalid), .s1_tready(s1_tready),
-        .ch1_session_start(session_start_aclk[1]), .ch1_session_limit(lim),
+        .ch1_session_start(session_start_aclk[1]), .ch1_session_limit(lim1),
         .ch1_session_active(session_active[1]), .ch1_session_overflow(session_overflow[1]),
-        .weight0(w0), .weight1(w1),
+        .weight0(w0), .weight1(w1), .session_end(session_end),
         .pcie_clk(clk), .pcie_rstn(datapath_rst_n),
         .m_tdata(ic_tdata), .m_tkeep(ic_tkeep), .m_tuser(ic_tuser), .m_tlast(ic_tlast),
         .m_tvalid(ic_tvalid), .m_tready(ic_tready)
     );
 
     // session end = falling edge of session_active (aclk)
-    reg [1:0] active_d;
-    always @(posedge aclk or negedge arstn)
-        if (!arstn) active_d <= 2'b00; else active_d <= session_active;
-    wire [1:0] session_end_aclk = active_d & ~session_active;
+    wire [1:0] session_end_aclk = session_end;   // from interconnect_top (Step 4 item 7)
 
     link_phy_bridge_top u_lpb (
         .clk(clk), .perst_n(perst_n), .aclk(aclk), .aclk_rst_n(arstn),
@@ -137,7 +138,7 @@ module bridge_top #(
         .session_start_aclk(session_start_aclk),
         .session_end_aclk(session_end_aclk),
         .session_overflow_aclk(session_overflow),
-        .arb_weight_ch0(w0), .arb_weight_ch1(w1), .session_limit(lim),
+        .arb_weight_ch0(w0), .arb_weight_ch1(w1), .session_limit(lim), .session_limit_ch1(lim1),
         .err_xlat_miss(err_xlat_miss), .err_addr_ovf(err_addr_ovf),
         .stat_split_occurred(), .err_tkeep_gap(),
         .crc_err(crc_err), .fec_err(fec_err), .fec_corrected(), .replay_event(),

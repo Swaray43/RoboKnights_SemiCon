@@ -8,6 +8,7 @@ rtl/axi_mrd_generator.v
 rtl/bar0_dma_regs.v
 rtl/byte_to_symbol.v
 rtl/elastic_fifo.v
+rtl/err_counters.v
 rtl/fifo_scoreboard.v
 rtl/flit_lane_destriper.v
 rtl/flit_lane_striper.v
@@ -36,6 +37,9 @@ rtl/ts_ordered_set_detector.v
 rtl/ts_os_gen.v
 rtl/tx_elastic_deskew.v
 rtl/pcie_phy_tx.v
+rtl/pcie_phy_tx_w.v
+rtl/pcie_phy_rx_w.v
+rtl/ts_os_detector_w.v
 rtl/pcie_phy_rx.v
 rtl/lane_tx.v
 rtl/lane_rx.v

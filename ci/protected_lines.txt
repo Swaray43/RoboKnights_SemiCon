@@ -29,7 +29,7 @@ G7     | src-link_layer/hdl/link_phy_bridge_top.v   | forbid  | {s_axis_tlast, i
 P1     | src-link_layer/hdl/tlp_header_parser.v     | require | output reg                     parsed_hdr_done
 P1     | src-link_layer/hdl/tlp_header_parser.v     | require | parsed_hdr_done   <= 1'b1;
 P1     | src-link_layer/hdl/pcie_rx_engine.v        | require | wire mwr_req = REQ_ON_HDR_DONE ? (tlp_hdr_done && is_mwr)
-P1     | src-link_layer/hdl/link_layer_top.v        | require | .REQ_ON_HDR_DONE(1)
+P1     | src-link_layer/hdl/link_layer_top.v        | require | xl_req        <= 1'b1;
 
 # ---- R4: RX monitor tap feeding m_rx_axis (tb_bridge_top's checker) ----
 R4     | src-link_layer/hdl/link_layer_top.v        | require | assign mon_rx_axis_tvalid = rx_wide_valid && rx_wide_ready;
@@ -44,7 +44,7 @@ G1     | src-link_layer/hdl/link_phy_bridge_top.v   | require | wire ib_bar0_hit
 G2     | src-link_layer/hdl/credit_manager.v        | require | wire upd_hdr_inf  = (update_fc_hdr_limit  == 8'd0);
 G2     | src-link_layer/hdl/stream_tx_path_top.v    | require | .update_fc_valid     (fc_upd_valid),
 G2     | src-link_layer/hdl/data_link_layer_top.v   | require | output wire                     fc_credits_valid,
-G2     | src-link_layer/hdl/link_layer_tx.v         | require | assign dllp_taken = (state == ST_IDLE) && dllp_req;
+G2     | src-link_layer/hdl/link_layer_tx.v         | require | assign dllp_taken = l_free && dllp_req;
 G2     | src-link_layer/hdl/link_phy_bridge_top.v   | require | .updatefc_received (updatefc_received | ll_fc_credits_valid),
 
 # ---- G3: sticky address-translation miss counter in BAR0 ----
@@ -55,7 +55,8 @@ G3     | protocol_PHY_layer/rtl/bar0_dma_regs.v     | require | 10'h007: bar0_rd
 # ---- G4 / F5: MWr vs MRd by Fmt[1] ----
 F5     | src-link_layer/hdl/tlp_header_parser.v     | require | parsed_has_data  <= rx_tlp_data[30];
 F5     | src-link_layer/hdl/pcie_rx_engine.v        | require | wire is_mwr  = (tlp_type == 5'b00000) && tlp_has_data;
-F5     | src-link_layer/hdl/link_layer_top.v        | require | .tlp_has_data      (parsed_has_data),
+F5     | src-link_layer/hdl/link_layer_top.v        | require | wire        dc_is_mwr   = (dc_type == 5'b00000) && dc_has_data;
+F6     | src-link_layer/hdl/link_layer_top.v        | require | wire        dc_is_cpl   = (dc_type[4:1] == 4'b0101);
 
 # ---- F6: CplLk / CplDLk are completions ----
 F6     | src-link_layer/hdl/tlp_header_parser.v     | require | is_cpl           <= (rx_tlp_data[28:25] == 4'b0101);
@@ -76,8 +77,14 @@ K6     | protocol_PHY_layer/rtl/pcie_phy_tx.v       | require | (!in_flit || (st
 K6     | protocol_PHY_layer/rtl/pcie_reset_controller.v | require | if (LINKDOWN_RESET != 0) linkdown_cnt <= LINKDOWN_PULSE;
 
 # ---- S7: a DLLP Flit wins the TX slot; the payload must not be consumed in the same cycle ----
-S7     | src-link_layer/hdl/link_layer_tx.v         | require | assign s_ready = (state == ST_IDLE) && !dllp_req;
+S7     | src-link_layer/hdl/link_layer_tx.v         | require | assign s_ready = l_free && !dllp_req;
 
 # ---- S13: an inbound MWr that hits BAR0 is not an address-translation miss ----
 S13    | src-link_layer/hdl/pcie_address_translator.v | require | wire                       proc_excl  = excl_en && ((proc_addr & excl_mask) == excl_base);
 S13    | src-link_layer/hdl/link_phy_bridge_top.v   | require | .cfg_excl_en        (ib_bar0_assigned),
+
+# ---- Step 4 (final cycle): redesigned RX decode / TX path; rules moved from the 1-DW versions ----
+# P1/F5/F6 above now point at the wide RX decode in link_layer_top (same intent).
+S4-8   | src-link_layer/hdl/link_layer_top.v        | require | assign rx_wide_ready = 1'b1;
+S4-T1  | src-link_layer/hdl/link_layer_rx.v         | require | d2_fixed <= fix_c;
+S4-1   | src-link_layer/hdl/stream_tx_path_top.v    | require | tlp_tx_wide #(
