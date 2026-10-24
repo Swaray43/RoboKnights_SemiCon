@@ -24,3 +24,6 @@ __pycache__/
 !gds/**
 !gds/**/runs/
 !gds/**/runs/**
+gds/*/runs/
+gds/*/*/runs/
+gds/*/runs/
