@@ -20,3 +20,7 @@ vivado_bridge/
 quartus_bridge/
 ci_out/
 __pycache__/
+!gds/
+!gds/**
+!gds/**/runs/
+!gds/**/runs/**

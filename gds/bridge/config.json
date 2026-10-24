@@ -84,7 +84,9 @@
   "CLOCK_PERIOD": 30.0,
   "PNR_SDC_FILE": "dir::bridge.sdc",
   "SIGNOFF_SDC_FILE": "dir::bridge.sdc",
-  "FP_CORE_UTIL": 30,
-  "PL_TARGET_DENSITY_PCT": 40,
-  "RUN_LINTER": false
+  "FP_CORE_UTIL": 20,
+  "PL_TARGET_DENSITY_PCT": 30,
+  "RUN_LINTER": false,
+  "RUN_ANTENNA_REPAIR": false,
+  "DRT_THREADS": 4
 }
