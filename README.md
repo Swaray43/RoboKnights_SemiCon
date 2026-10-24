@@ -1,54 +1,82 @@
-# RoboKnights SemiCon — AXI4-Stream to PCIe 6 bridge
+# GDSII flow (LibreLane + SKY130)
 
-Three layers, one top:
+RTL → GDSII for the RoboKnights AXI4-Stream → PCIe 6 bridge using
+LibreLane (OpenROAD-based) on the
+SkyWater **SKY130A** PDK with the **sky130_fd_sc_hd** standard-cell library.
 
-    fabric AXI4-Stream (2 ch) → interconnect_layer → src-link_layer → protocol_PHY_layer → 4-lane PAM4
-                                  (Aditya)            (Swaray)          (Kshitij)
+## Configurations
 
-| Folder | What's in it |
-|---|---|
-| `bridge_top/` | Full-stack top (`bridge_top.v`), end-to-end benches, `bridge_top.f`, Vivado/Quartus project scripts, constraints. **Start here.** |
-| `interconnect_layer/` | `src/`: ingest ports, weighted round-robin arbiter, CDC FIFO + unit benches. `docs/`: spec and DMA addressing. `sim_logs/`: bench output. |
-| `src-link_layer/hdl/` | `link_layer_top`: stream TX path, credit gate, Flit framing, replay/ACK-NAK, CRC-64/FEC, RX TLP decode to AXI BAR0 writes. `link_phy_bridge_top`: link + PHY glue. `files.f` + `run_all_link.py`: active RTL and benches. `legacy/`: retired blocks. `testbench/wcfg/`: Vivado waveform configs. |
-| `protocol_PHY_layer/` | `rtl/` (one module per file, `files.f`), `tb/`, `formal/`, `cocotb/`, `run_all.py`. `legacy/`: pre-restructure snapshot. |
-| `docs/` | Problem statement, figures, round-1 report, glossary, work distribution, `TICKETS.md`. |
-| `asic/` | LibreLane (OpenLane 2) configs + SDCs per block and flat, ASIC-profile sim params. |
+| Folder | Top | What | Clocks |
+| --- | --- | --- | --- |
+| `gds/interconnect/` | `interconnect_top` | Interconnect layer alone | aclk 30 ns, pcie_clk 15 ns |
+| `gds/bridge/` | `bridge_top` | Full bridge, **narrow GDS build** (X.2): `PHY_WIDE=0`, `REPLAY_DEPTH=4`, `IC_FIFO_AW=2`, `WDB_FIFO_D=4`, `WDB_HWM=3`, `PHY_TX_FIFO_D=8` | clk, aclk 30 ns |
+| `gds/rxcheck/` | `link_layer_rx` | 2-minute synthesis-check run (`--to Checker.YosysSynthChecks`) | clk 30 ns |
 
-## Run everything
+Each folder has `config.json` (explicit RTL file list, include dirs,
+`RUN_LINTER: false`) and an SDC with both clocks in
+`set_clock_groups -asynchronous`, explicit port-name I/O delays and false paths
+on the resets. The FPGA build uses the same RTL with the parameter defaults
+(wide PHY, replay 32, FIFOs 16).
 
-```sh
-# full stack (from repo root)
-iverilog -g2012 -DSIMULATION -s tb_bridge_top -o b.vvp -c bridge_top/bridge_top.f -c bridge_top/bridge_top_tb.f && vvp b.vvp
-iverilog -g2012 -DSIMULATION -s tb_bridge_ovf -o o.vvp -c bridge_top/bridge_top.f -c bridge_top/bridge_top_tb.f && vvp o.vvp
+## Running
 
-# per layer
-python3 src-link_layer/hdl/run_all_link.py              # 16 link benches (files.f)
-cd protocol_PHY_layer && python3 run_all.py             # 24 PHY benches
-cd protocol_PHY_layer/cocotb && make                    # 9 cocotb tests
-# interconnect: each tb in interconnect_layer/src/ with the 4 RTL files there
+```bash
+# from the repository root (Docker mounts only $HOME and the current folder)
+librelane --dockerized --pdk sky130A --scl sky130_fd_sc_hd gds/bridge/config.json
+
+# resume a run from a step instead of restarting
+librelane --dockerized --pdk sky130A --scl sky130_fd_sc_hd gds/bridge/config.json \
+  --run-tag <RUN_TAG> --from OpenROAD.DetailedRouting
+
+# quick synthesis-check of link_layer_rx
+librelane --dockerized --pdk sky130A --scl sky130_fd_sc_hd gds/rxcheck/config.json \
+  --to Checker.YosysSynthChecks
 ```
 
-Vivado: `source bridge_top/vivado_create_project.tcl` · Quartus: `quartus_sh -t bridge_top/quartus_create_project.tcl` ·
-LibreLane: see `asic/README.md`.
+A run passes when `flow.log` ends with “Flow complete.” and DRC, LVS and
+antenna are clean in the manufacturability report.
 
-## Interface between interconnect and link (Phase 2)
+## GDS patches (X.n)
 
-`interconnect_top.m_tuser[25:0] = {tlast_flag, session_offset[23:0], stream_id}`, the link layer's
-native TUSER. It connects straight to `link_phy_bridge_top.s_axis_tuser`; there is no remap module.
+Each X patch is applied separately with `git am` to the FPGA line
+(`phase2/X`) and the GDS branch (`phase3/gds`); the branches are not merged.
 
-## Status (this snapshot)
+| Patch | Problem | Fix |
+| --- | --- | --- |
+| X.1 | Interconnect setup −12 ns at slow corner: TKEEP → popcount → offset add → limit compare → TREADY → FIFO write ≈ 27 ns in one cycle | Offset = `off_base + bytes_q`; full beats accepted without TKEEP; a beat within 64 B of the limit is held one cycle while its size is checked |
+| X.2 | Full bridge too large for laptop place-and-route | Buffer-size parameters plumbed through `bridge_top` (defaults = FPGA); narrow GDS build + matching ASIC sim profile in CI |
+| X.3 | 230 Yosys check errors (latches, logic loops) in `link_layer_rx` | Defaults at top of the correction block; separate loop index for the clocked loop |
+| X.4 | Newer Yosys still found 192 logic loops | FEC correction as constant-position gates (Hamming positions computed at elaboration) |
 
-| Suite | Result |
-|---|---|
-| `tb_bridge_top` (144 and 600 TLPs), `tb_bridge_ovf`, `tb_ingest_overflow_leak` | PASS (Icarus 12) |
-| Same benches with the ASIC buffer sizes (`asic/sim/`) | PASS |
-| Link benches (`run_all_link.py`) | 15/16 (`tx_engine` has no self-check) |
-| Interconnect unit benches | 4/4 |
-| PHY benches / cocotb | 24/24, 9/9 |
-| Yosys elaboration of `bridge_top` | 0 latches |
-| Vivado/Quartus synthesis and timing | Re-run after this snapshot |
+Flow fixes: Verilator linter off (cell-model timescales), explicit file lists
+(testbenches broke synthesis), exact port names in SDC, run from the repo root
+when it lives outside `$HOME`.
 
-Open work is tracked in `docs/TICKETS.md` (round 2); round 1 is in `docs/TICKETS_round1.md`.
+## Results (24 Oct 2026)
 
-**Legacy rule:** anything under a `legacy/` folder is kept for reference, isn't on any file list, and
-may redefine active modules. Fix it, then move it back.
+**Interconnect (`interconnect_top`), before X.1 — GDS produced**
+
+- DRC, LVS and antenna **clean**; hold met at all corners
+- Die 1.20 mm² at 41% utilisation, ~49k cells (9.8k flip-flops), 104 mW
+- Setup −0.95 ns at ss_100C_1v60 (−0.52 ns after X.1; that rerun was stopped before stream-out)
+
+**`link_layer_rx` alone, after X.4** — “Check for Yosys check errors clear”; 1.12 mm² of cells
+
+**Full bridge, narrow build — placed and clock-tree-synthesised, not routed**
+(run `RUN_2026-10-23_22-24-44`)
+
+- Completed: synthesis, floorplan, PDN, placement, CTS, global routing (41 of ~80 steps)
+- Die 13.17 mm² (~3.6 × 3.6 mm), core 13.05 mm²
+- Standard cells 4.15 mm² (~32%): logic 2.40, flip-flops 1.51, taps 0.23 mm²
+- 431,956 instances
+- Pre-route hold: ss +0.46 ns, tt +0.10 ns, ff −0.036 ns
+- Pre-route setup at ss −1,014 ns: timing repair was off and 100+-pin nets
+were unbuffered, so this is not a real path delay; **ASIC timing closure not done**
+- Detailed routing: killed once out of memory (~14 GB), resumed run stopped at
+the deadline. **No full-bridge GDS.**
+
+## Next steps
+
+1. Detailed routing on a machine with ≥ 32 GB RAM, with `DRT_THREADS` limited to 4.
+2. Timing repair on (post-CTS / post-GRT resizer) and buffering of the high-fanout nets.
+3. Or harden `link_layer_top` as a separate macro and integrate it at the top.
