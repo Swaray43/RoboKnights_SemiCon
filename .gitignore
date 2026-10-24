@@ -28,3 +28,6 @@ gds/*/runs/
 gds/*/*/runs/
 gds/*/runs/
 gds/*/runs/
+gds/*/runs/
+gds/interconnect/runs/
+gds/bridge/runs/
