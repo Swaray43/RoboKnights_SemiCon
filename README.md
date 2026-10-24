@@ -10,7 +10,7 @@
 
 A synthesizable RTL bridge that moves data from two FPGA-fabric AXI4-Stream producers — a **SmartNIC** (channel 0) and an **ML inference accelerator** (channel 1) — into host memory over a PCIe 6.0 Flit-mode link. It was built in two rounds, verified with directed, randomized, formal and coverage-driven testbenches under GitHub Actions, optimised to **255 MHz on a Xilinx xcu250** with timing fully met, and taken through **RTL → GDSII on SkyWater SKY130** with LibreLane.
 
-> **This branch (`main`) holds documentation only.** All RTL, testbenches, CI and build scripts live on the code branches listed in [Branches](#branches). Start with [`docs/report_round2.pdf`](docs/report_round2.pdf) for the full technical report and [`docs/LEDGER.md`](docs/LEDGER.md) for every bug, ticket, patch and optimisation.
+> **This branch (`main`) holds documentation only.** All RTL, testbenches, CI and build scripts live on the code branches listed in [Branches](#branches). Start with [`docs/report_round2.pdf`](docs/report_round2.pdf) for the full technical report and [`docs/team/LEDGER.md`](docs/team/LEDGER.md) for every bug, ticket, patch and optimisation.
 
 ---
 
@@ -238,7 +238,7 @@ Report: [`docs/report_round1.pdf`](docs/report_round1.pdf).
 | Step 5 | 23 Oct | In-house traffic analyser | ML 0.06 → 6.17 GB/s; NIC p99 58 → 0.59 µs |
 | GDS | 23–24 Oct | LibreLane on SKY130, patches X.1–X.4 | Interconnect GDSII clean; FPGA 255 MHz with timing met |
 
-In total **44 design bugs and 21 testbench bugs** were found and fixed in Round 2. Every one, with what found it, who fixed it and which patch carries it, is in [`docs/LEDGER.md`](docs/LEDGER.md).
+In total **44 design bugs and 21 testbench bugs** were found and fixed in Round 2. Every one, with what found it, who fixed it and which patch carries it, is in [`docs/team/LEDGER.md`](docs/team/LEDGER.md).
 
 **What the 19 Oct review found (worst first):** a duplicate `axi4s_ingest_port` that stopped the layers compiling together; a serialiser emitting 15 DWs to a 16-DW packetizer; a replay buffer with no ACK source (stopped after 31 beats); no ready between link and PHY (PHY 32× slower); TUSER bit order mismatched between interconnect and link (every beat routed as channel 0); sequence numbers written over data bits; 40 bits of every fourth beat dropped; FEC with no correction.
 
@@ -439,13 +439,13 @@ Run from the repository root; LibreLane writes `runs/` next to each config (neve
 |---|---|
 | [`docs/report_round2.pdf`](docs/report_round2.pdf) | Round 2 technical report: integration, verification, optimisation, FPGA, GDSII, schematics |
 | [`docs/report_round1.pdf`](docs/report_round1.pdf) | Stage 1 report: per-layer RTL and unit verification |
-| [`docs/LEDGER.md`](docs/LEDGER.md) | Complete ledger: every bug, ticket, patch, optimisation and test, by round and step, with chains of what led to what |
+| [`docs/team/LEDGER.md`](docs/team/LEDGER.md) | Complete ledger: every bug, ticket, patch, optimisation and test, by round and step, with chains of what led to what |
 | [`docs/supporting/Round1_Report_Stage1.pdf`](docs/supporting/Round1_Report_Stage1.pdf) | Round 1 narrative: scope decisions, per-layer modules and bugs, Stage 1 test results, how each open item closed |
 | [`docs/supporting/Round2_Report_Integration_to_GDSII.pdf`](docs/supporting/Round2_Report_Integration_to_GDSII.pdf) | Round 2 narrative: review findings, Steps 1–5, GDS patches, open items and lessons |
 | [`docs/supporting/Bridge_Results_and_Deliverables.pdf`](docs/supporting/Bridge_Results_and_Deliverables.pdf) | All results in one place: build points, FPGA per-run tables, CI checks, coverage, Step 5 scenarios, GDS runs, deliverables index |
 | [`docs/PS/`](docs/PS/) | SARCathon problem statement |
-| `docs/Glossary_Semicon - Sheet1.pdf` | Glossary of PCIe / AXI terms used |
-| `docs/work_distribution.md` | Original per-member work split (Round 1 plan) |
+| [`docs/supporting/Glossary_Semicon.pdf`](docs/supporting/Glossary_Semicon.pdf) | Glossary of PCIe / AXI terms used |
+| `docs/team/work_distribution.md` | Original per-member work split (Round 1 plan) |
 
 On the code branches: `docs/STEP4_ROADMAP.md` (Step 4 plan, as-built notes, register map), `protocol_PHY_layer/CHANGELOG.md`, `asic/README.md`.
 
