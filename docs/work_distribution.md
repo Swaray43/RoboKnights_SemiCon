@@ -1,4 +1,4 @@
-## Aaditya — Interconnect layer (AXI host interfaces + crossbar + CDC)
+## Aditya — Interconnect layer (AXI host interfaces + crossbar + CDC)
 
 **Goal: Accept all traffic from the FPGA fabric and deliver a clean, clock-crossed 512-bit AXI4-Stream to Swaray's link layer input.**
 
