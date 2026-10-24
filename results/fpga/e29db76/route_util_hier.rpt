@@ -1,0 +1,59 @@
+Copyright 1986-2022 Xilinx, Inc. All Rights Reserved. Copyright 2022-2026 Advanced Micro Devices, Inc. All Rights Reserved.
+---------------------------------------------------------------------------------------------------------------------------------------------
+| Tool Version : Vivado v.2026.1 (win64) Build 6511674 Tue Jun 16 11:02:23 MDT 2026
+| Date         : Sat Oct 24 04:44:53 2026
+| Host         : LAPTOP-N3AM2GTH running 64-bit major release  (build 9200)
+| Command      : report_utilization -hierarchical -hierarchical_depth 5 -file C:/work/rk_fpga/vivado_bridge/baseline/route_util_hier.rpt
+| Design       : bridge_top
+| Device       : xcu250-figd2104-2L-e
+| Speed File   : -2L
+| Design State : Routed
+---------------------------------------------------------------------------------------------------------------------------------------------
+
+Utilization Design Information
+
+Table of Contents
+-----------------
+1. Utilization by Hierarchy
+
+1. Utilization by Hierarchy
+---------------------------
+
++-----------------------------------+----------------------+------------+------------+---------+------+-------+--------+--------+------+------------+
+|              Instance             |        Module        | Total LUTs | Logic LUTs | LUTRAMs | SRLs |  FFs  | RAMB36 | RAMB18 | URAM | DSP Blocks |
++-----------------------------------+----------------------+------------+------------+---------+------+-------+--------+--------+------+------------+
+| bridge_top                        |                (top) |      57245 |      54105 |    3140 |    0 | 39269 |      0 |      0 |    0 |          0 |
+|   (bridge_top)                    |                (top) |          0 |          0 |       0 |    0 |     0 |      0 |      0 |    0 |          0 |
+|   u_ic                            |     interconnect_top |       1233 |        889 |     344 |    0 |   186 |      0 |      0 |    0 |          0 |
+|     u_fifo                        |       cdc_fifo_async |        468 |        124 |     344 |    0 |    44 |      0 |      0 |    0 |          0 |
+|     u_arb                         |       rr_arbiter_2ch |        344 |        344 |       0 |    0 |    56 |      0 |      0 |    0 |          0 |
+|     u_ch0                         |    axi4s_ingest_port |        249 |        249 |       0 |    0 |    42 |      0 |      0 |    0 |          0 |
+|     u_ch1                         |  axi4s_ingest_port_7 |        173 |        173 |       0 |    0 |    42 |      0 |      0 |    0 |          0 |
+|   u_lpb                           |  link_phy_bridge_top |      56078 |      53282 |    2796 |    0 | 39081 |      0 |      0 |    0 |          0 |
+|     u_pcie_phy_top                |         pcie_phy_top |       8865 |       8557 |     308 |    0 |  2891 |      0 |      0 |    0 |          0 |
+|       u_sess1                     |   session_arm_ctrl_4 |         11 |         11 |       0 |    0 |    76 |      0 |      0 |    0 |          0 |
+|       g_dp_w.u_rx                 |        pcie_phy_rx_w |       7089 |       6929 |     160 |    0 |   835 |      0 |      0 |    0 |          0 |
+|       g_dp_w.u_tx                 |        pcie_phy_tx_w |        297 |        149 |     148 |    0 |   283 |      0 |      0 |    0 |          0 |
+|       u_bar0                      |        bar0_dma_regs |        148 |        148 |       0 |    0 |   240 |      0 |      0 |    0 |          0 |
+|       u_cfg                       |    pcie_config_space |         68 |         68 |       0 |    0 |    71 |      0 |      0 |    0 |          0 |
+|       u_errcnt                    |         err_counters |        216 |        216 |       0 |    0 |   177 |      0 |      0 |    0 |          0 |
+|       u_ltssm                     |           pcie_ltssm |        156 |        156 |       0 |    0 |    60 |      0 |      0 |    0 |          0 |
+|       u_msix                      |      msix_controller |        747 |        747 |       0 |    0 |   914 |      0 |      0 |    0 |          0 |
+|       u_sess0                     |     session_arm_ctrl |         76 |         76 |       0 |    0 |    76 |      0 |      0 |    0 |          0 |
+|     u_link_layer_top              |       link_layer_top |      47215 |      44727 |    2488 |    0 | 36142 |      0 |      0 |    0 |          0 |
+|       (u_link_layer_top)          |       link_layer_top |       1309 |       1309 |       0 |    0 |   380 |      0 |      0 |    0 |          0 |
+|       u_stream_tx_path_top        |   stream_tx_path_top |      45862 |      43374 |    2488 |    0 | 35754 |      0 |      0 |    0 |          0 |
+|         (u_stream_tx_path_top)    |   stream_tx_path_top |          1 |          1 |       0 |    0 |    99 |      0 |      0 |    0 |          0 |
+|         u_data_link_layer_top     |  data_link_layer_top |      38788 |      36628 |    2160 |    0 | 27842 |      0 |      0 |    0 |          0 |
+|           (u_data_link_layer_top) |  data_link_layer_top |       1133 |         53 |    1080 |    0 |   159 |      0 |      0 |    0 |          0 |
+|           u_flit_payload_builder  | flit_payload_builder |       6110 |       6110 |       0 |    0 |  4354 |      0 |      0 |    0 |          0 |
+|           u_link_layer_rx         |        link_layer_rx |      12694 |      12694 |       0 |    0 | 12414 |      0 |      0 |    0 |          0 |
+|           u_link_layer_tx         |        link_layer_tx |       9116 |       9116 |       0 |    0 |  8420 |      0 |      0 |    0 |          0 |
+|           u_replay_buffer         |        replay_buffer |       2787 |       1707 |    1080 |    0 |    57 |      0 |      0 |    0 |          0 |
+|           u_rx_tlp_delimiter      |     rx_tlp_delimiter |       6965 |       6965 |       0 |    0 |  2438 |      0 |      0 |    0 |          0 |
+|         u_tlp_tx_wide             |          tlp_tx_wide |       6320 |       6320 |       0 |    0 |  7193 |      0 |      0 |    0 |          0 |
+|         u_write_data_buffer       |    write_data_buffer |        740 |        412 |     328 |    0 |   577 |      0 |      0 |    0 |          0 |
++-----------------------------------+----------------------+------------+------------+---------+------+-------+--------+--------+------+------------+
+* Note: The sum of lower-level cells may be larger than their parent cells total, due to cross-hierarchy LUT combining
+
+

@@ -1,0 +1,14 @@
+Bridge baseline  part xcu250-figd2104-2L-e  stage route  2026-10-24 04:45
+  LUTs            57245 of  1728000  (3.31%)
+  Registers       39269 of  3456000  (1.14%)
+  BRAM_tiles          0 of     2688  (0.00%)
+  URAM                0 of     1280  (0.00%)
+  DSPs                0 of    12288  (0.00%)
+  clk  WNS   0.072 ns at 4.000 ns  -> Fmax ~ 255 MHz   levels 11
+       from u_lpb/u_link_layer_top/u_stream_tx_path_top/u_tlp_tx_wide/b_left_reg[2]/C
+       to   u_lpb/u_link_layer_top/u_stream_tx_path_top/u_tlp_tx_wide/a_data_reg[84]/CE
+  aclk WNS   0.872 ns at 5.400 ns  -> Fmax ~ 221 MHz   levels 12
+       from u_ic/u_ch0/bytes_q_reg[1]/C
+       to   u_ic/u_fifo/mem_reg_0_15_182_195/RAMA/WE
+  WHS   0.019 ns
+Per-module area: C:/work/rk_fpga/vivado_bridge/baseline/route_util_hier.rpt   Simulation numbers: PERF lines in sim_tb_bridge_top.log
