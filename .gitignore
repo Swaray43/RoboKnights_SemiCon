@@ -31,3 +31,16 @@ gds/*/runs/
 gds/*/runs/
 gds/interconnect/runs/
 gds/bridge/runs/
+*.odb
+*.mag
+*.ext
+*.spice
+*.vh
+gds/interconnect/results/interconnect_top.gds
+gds/*/runs/
+gds/*/runs/
+*.odb
+*.mag
+*.ext
+*.spice
+*.vh
